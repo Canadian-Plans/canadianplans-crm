@@ -67,6 +67,8 @@ export const simOrderLeadPayloadSchema = z
     /** Where a mailed SIM goes (`delivery: 'pickup'`). */
     shippingAddress: optional(400),
     canadaAddress: optional(300),
+    /** The country the customer is in when ordering, as typed (Canadian Plans' pre-arrival form). */
+    currentCountry: optional(80),
     /** Who referred the customer, as they typed it (a partner's email or name). */
     reference: optional(120),
   })

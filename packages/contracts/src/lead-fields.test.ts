@@ -131,6 +131,13 @@ const expectedLeadFieldCatalog: Readonly<Record<string, readonly LeadFieldDefini
       editable: true,
       maxLength: 300,
     },
+    {
+      key: 'currentCountry',
+      label: 'Current country',
+      kind: 'text',
+      editable: true,
+      maxLength: 80,
+    },
     { key: 'reference', label: 'Reference', kind: 'text', editable: true, maxLength: 120 },
     { key: 'customerNotes', label: 'Customer notes', kind: 'longText' },
     {
@@ -188,6 +195,7 @@ describe('lead field definitions and shared property catalogue', () => {
       'flightBooked',
       'shippingAddress',
       'canadaAddress',
+      'currentCountry',
       'reference',
       'customerNotes',
       'simNumber',

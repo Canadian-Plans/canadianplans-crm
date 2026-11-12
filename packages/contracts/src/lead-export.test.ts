@@ -188,6 +188,7 @@ describe('leadExportFields', () => {
       'prop.flightBooked',
       'prop.shippingAddress',
       'prop.canadaAddress',
+      'prop.currentCountry',
       'prop.reference',
       'prop.customerNotes',
       'prop.simNumber',
