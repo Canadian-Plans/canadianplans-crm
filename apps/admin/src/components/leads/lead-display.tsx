@@ -1,0 +1,179 @@
+import { leadCountdownField, leadStageLabel, type LeadContact } from '@canadian-plans/contracts';
+import { Avatar, AvatarFallback, cn } from '@canadian-plans/ui';
+
+import { countdown, dayLabel } from '../../lib/dates';
+import { initials } from '../../lib/people';
+
+/**
+ * Small pieces every lead screen shares: the stage badge (the colours of
+ * CanadaWide's old admin, so the board reads the way staff are used to), the
+ * person chip, and the lead's display name.
+ */
+
+const STAGE_TONES: Record<string, string> = {
+  new: 'border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300',
+  contacted: 'border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  replied: 'border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  qualified: 'border-violet-500/30 bg-violet-500/15 text-violet-700 dark:text-violet-300',
+  existing_shaw: 'border-orange-500/30 bg-orange-500/15 text-orange-700 dark:text-orange-300',
+  non_serviceable_address: 'border-rose-500/30 bg-rose-500/15 text-rose-700 dark:text-rose-300',
+  old_due: 'border-yellow-500/30 bg-yellow-500/15 text-yellow-700 dark:text-yellow-300',
+  installed: 'border-cyan-500/30 bg-cyan-500/15 text-cyan-700 dark:text-cyan-300',
+  activated: 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  // A SIM order's stages (an order's lifecycle, its payment kept apart).
+  incomplete: 'border-gray-500/30 bg-gray-500/15 text-gray-700 dark:text-gray-300',
+  pending: 'border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  verified: 'border-blue-500/30 bg-blue-500/15 text-blue-700 dark:text-blue-300',
+  on_hold: 'border-slate-500/30 bg-slate-500/15 text-slate-700 dark:text-slate-300',
+  delivered: 'border-violet-500/30 bg-violet-500/15 text-violet-700 dark:text-violet-300',
+  completed: 'border-green-500/30 bg-green-500/15 text-green-700 dark:text-green-300',
+  cancelled: 'border-rose-500/30 bg-rose-500/15 text-rose-700 dark:text-rose-300',
+  won: 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  approved: 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  lost: 'border-zinc-500/30 bg-zinc-500/15 text-zinc-700 dark:text-zinc-300',
+  declined: 'border-zinc-500/30 bg-zinc-500/15 text-zinc-700 dark:text-zinc-300',
+  closed: 'border-zinc-500/30 bg-zinc-500/15 text-zinc-700 dark:text-zinc-300',
+};
+
+const STAGE_DOTS: Record<string, string> = {
+  new: 'bg-sky-400',
+  contacted: 'bg-amber-400',
+  replied: 'bg-amber-400',
+  qualified: 'bg-violet-400',
+  existing_shaw: 'bg-orange-400',
+  non_serviceable_address: 'bg-rose-400',
+  old_due: 'bg-yellow-400',
+  installed: 'bg-cyan-400',
+  activated: 'bg-emerald-400',
+  incomplete: 'bg-gray-400',
+  pending: 'bg-amber-400',
+  verified: 'bg-blue-400',
+  on_hold: 'bg-slate-400',
+  delivered: 'bg-violet-400',
+  completed: 'bg-green-400',
+  cancelled: 'bg-rose-400',
+  won: 'bg-emerald-400',
+  approved: 'bg-emerald-400',
+  lost: 'bg-zinc-400',
+  declined: 'bg-zinc-400',
+  closed: 'bg-zinc-400',
+};
+
+export function stageDotClass(stage: string): string {
+  return STAGE_DOTS[stage] ?? 'bg-muted-foreground';
+}
+
+const COUNTDOWN_TONE_CLASS = {
+  today: 'text-rose-700 dark:text-rose-300',
+  soon: 'text-amber-700 dark:text-amber-300',
+  upcoming: 'text-muted-foreground',
+} as const;
+
+/** `6 days left` to a counted-down day (a SIM order's arrival); nothing once it has passed. */
+export function CountdownLabel({
+  day,
+  className,
+}: {
+  day: string | null | undefined;
+  className?: string;
+}) {
+  const left = day ? countdown(day) : undefined;
+  if (!left) return null;
+  return (
+    <span className={cn('text-xs font-medium', COUNTDOWN_TONE_CLASS[left.tone], className)}>
+      {left.label}
+    </span>
+  );
+}
+
+/** `Arrival in Canada Nov 2 · 6 days left` on a board card: the type's countdown field. */
+export function CountdownDay({
+  leadType,
+  day,
+  className,
+}: {
+  leadType: string;
+  day: string | null | undefined;
+  className?: string;
+}) {
+  const field = leadCountdownField(leadType);
+  if (!field || !day) return null;
+  const left = countdown(day);
+  return (
+    <p className={cn('truncate text-xs text-muted-foreground', className)}>
+      {field.label} {dayLabel(day)}
+      {left ? ' · ' : null}
+      <CountdownLabel day={day} />
+    </p>
+  );
+}
+
+/**
+ * A lead no one who works leads has opened yet: a small dot rather than a pill,
+ * so a page of new leads does not become a wall of badges. Screen readers hear
+ * "New"; a pointer shows what the dot means.
+ */
+export function NewBadge({ className }: { className?: string }) {
+  return (
+    <span
+      title="New: not opened yet"
+      className={cn('inline-flex shrink-0 items-center', className)}
+    >
+      <span aria-hidden="true" className="size-2 rounded-full bg-primary" />
+      <span className="sr-only">New</span>
+    </span>
+  );
+}
+
+export function StageBadge({
+  leadType,
+  stage,
+  className,
+}: {
+  leadType: string;
+  stage: string;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium whitespace-nowrap',
+        STAGE_TONES[stage] ?? 'border-border bg-muted text-muted-foreground',
+        className,
+      )}
+    >
+      {leadStageLabel(leadType, stage)}
+    </span>
+  );
+}
+
+export function PersonChip({
+  name,
+  size = 'sm',
+  className,
+}: {
+  name: string;
+  size?: 'sm' | 'xs';
+  className?: string;
+}) {
+  return (
+    <span className={cn('inline-flex min-w-0 items-center gap-2', className)}>
+      <Avatar className={size === 'xs' ? 'size-5' : 'size-6'}>
+        <AvatarFallback
+          className={cn(
+            'bg-accent font-semibold text-accent-foreground',
+            size === 'xs' ? 'text-[9px]' : 'text-[10px]',
+          )}
+        >
+          {initials(name)}
+        </AvatarFallback>
+      </Avatar>
+      <span className="truncate">{name}</span>
+    </span>
+  );
+}
+
+/** Name, else email, else phone, else a placeholder for a lead with no contact (or hidden ones). */
+export function leadDisplayName(contact: LeadContact): string {
+  return contact.fullName ?? contact.email ?? contact.phone ?? 'Unnamed lead';
+}

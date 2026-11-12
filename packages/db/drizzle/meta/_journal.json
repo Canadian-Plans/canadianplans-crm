@@ -1,0 +1,244 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1792904895435,
+      "tag": "0000_app_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1792904896632,
+      "tag": "0001_runtime_functions",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793042297882,
+      "tag": "0002_canadawide_legacy_mirror",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793049061874,
+      "tag": "0003_lead_stages_and_staff_names",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793071632834,
+      "tag": "0004_staff_access_snapshot",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793080995362,
+      "tag": "0005_lead_identities",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793082645098,
+      "tag": "0006_legacy_identity_mirror_result",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793273916007,
+      "tag": "0007_backup_reader",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1793273993722,
+      "tag": "0008_backup_reader_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793296569722,
+      "tag": "0009_properties",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1793296580888,
+      "tag": "0010_properties_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793326396341,
+      "tag": "0011_plans",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1793326400817,
+      "tag": "0012_plans_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1793349931483,
+      "tag": "0013_order_tools",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1793349941965,
+      "tag": "0014_order_tools_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1793380650712,
+      "tag": "0015_order_numbers",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1793380656599,
+      "tag": "0016_order_numbers_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1793385700370,
+      "tag": "0017_customer_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1793385701352,
+      "tag": "0018_customer_tracking_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1793450665432,
+      "tag": "0019_automation_flows",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1793450690795,
+      "tag": "0020_automation_flows_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1793789490235,
+      "tag": "0021_ai_automation_proposals",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1793789491385,
+      "tag": "0022_ai_automation_proposals_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1793899404943,
+      "tag": "0023_lead_activity_clock_time",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1793902088184,
+      "tag": "0024_ai_turns",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1793902130131,
+      "tag": "0025_ai_turns_and_automation_overdue_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1793908019352,
+      "tag": "0026_automation_run_chain",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1794117979433,
+      "tag": "0027_plan_commission",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1794159298930,
+      "tag": "0028_email_style",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1794336266083,
+      "tag": "0029_task_in_progress",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1794348226604,
+      "tag": "0030_restricted_lead_erasure",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1794351038728,
+      "tag": "0031_invitation_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1794351039747,
+      "tag": "0032_workspaces_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1794351040645,
+      "tag": "0033_workspaces_rls_force",
+      "breakpoints": true
+    }
+  ]
+}

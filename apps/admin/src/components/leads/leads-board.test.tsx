@@ -1,0 +1,430 @@
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { LeadBoardResponse, LeadListItem } from '@canadian-plans/contracts';
+
+import { LeadsBoard } from './leads-board';
+
+const WORKSPACE = '10000000-0000-4000-8000-000000000001';
+const NOW = '2026-10-26T12:00:00.000Z';
+
+const mocks = vi.hoisted(() => ({
+  getLeadBoard: vi.fn(),
+  updateStaffLead: vi.fn(),
+}));
+
+vi.mock('../../lib/api', () => ({
+  ...mocks,
+  BackendError: class extends Error {
+    constructor(readonly code: string) {
+      super(code);
+    }
+  },
+}));
+
+const card: LeadListItem = {
+  id: '90000000-0000-4000-8000-000000000001',
+  workspaceId: WORKSPACE,
+  leadType: 'internet',
+  status: 'submitted',
+  stage: 'new',
+  contact: { fullName: 'Avery Example', phone: '403 555 0101' },
+  contactId: null,
+  assignedActorId: null,
+  externalRef: null,
+  source: 'direct',
+  attribution: {},
+  consentVersion: null,
+  openTaskCount: 0,
+  nextTaskDueAt: null,
+  deletedAt: null,
+  createdAt: NOW,
+  updatedAt: NOW,
+};
+
+function board(manage: boolean): LeadBoardResponse {
+  return {
+    leadType: 'internet',
+    columns: [
+      { stage: 'new', total: 1, leads: [card] },
+      { stage: 'contacted', total: 0, leads: [] },
+      { stage: 'won', total: 4, leads: [] },
+    ],
+    access: { contacts: true, manage },
+    requestId: '00000000-0000-4000-8000-000000000001',
+  };
+}
+
+function renderBoard(type = 'internet') {
+  return render(
+    <LeadsBoard
+      workspaceSlug="canadawide"
+      workspaceId={WORKSPACE}
+      accessToken="staff-token"
+      members={[]}
+      query={{ type, archived: false, due: false, layout: 'board', hide: [], page: 1 }}
+    />,
+  );
+}
+
+/** A SIM order board: the Avery Example order is Verified. */
+function orderBoard(): LeadBoardResponse {
+  return {
+    leadType: 'sim_order',
+    columns: [
+      { stage: 'pending', total: 0, leads: [] },
+      {
+        stage: 'verified',
+        total: 1,
+        leads: [{ ...card, leadType: 'sim_order', stage: 'verified' }],
+      },
+      { stage: 'on_hold', total: 0, leads: [] },
+      { stage: 'delivered', total: 0, leads: [] },
+    ],
+    access: { contacts: true, manage: true },
+    requestId: '00000000-0000-4000-8000-000000000001',
+  };
+}
+
+function column(name: RegExp) {
+  return screen.getByRole('region', { name });
+}
+
+/** Drags the Avery Example card onto a column, as the browser would. */
+async function moveTo(stageLabel: string) {
+  const items = new Map<string, string>();
+  const dataTransfer = {
+    get types() {
+      return [...items.keys()];
+    },
+    setData: (type: string, value: string) => void items.set(type, value),
+    getData: (type: string) => items.get(type) ?? '',
+    effectAllowed: 'uninitialized',
+    dropEffect: 'none',
+  };
+  const card = (await screen.findByText('Avery Example')).closest('li');
+  if (!card) throw new Error('the Avery Example card is not on the board');
+  const target = column(new RegExp(`^${stageLabel}, \\d+ leads$`));
+  fireEvent.dragStart(card, { dataTransfer });
+  fireEvent.dragOver(target, { dataTransfer });
+  fireEvent.drop(target, { dataTransfer });
+}
+
+describe('LeadsBoard', () => {
+  beforeEach(() => {
+    mocks.getLeadBoard.mockReset();
+    mocks.updateStaffLead.mockReset();
+    window.localStorage.clear();
+  });
+
+  it('lays out a column per stage with its count', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    renderBoard();
+    expect(await screen.findByRole('region', { name: 'New, 1 leads' })).toBeTruthy();
+    expect(column(/^Won, 4 leads$/)).toBeTruthy();
+    expect(within(column(/^Won/)).getByText('4 more in the table')).toBeTruthy();
+    expect(mocks.getLeadBoard).toHaveBeenCalledWith('staff-token', WORKSPACE, {
+      type: 'internet',
+      assignee: undefined,
+      q: undefined,
+      perStage: 50,
+    });
+  });
+
+  it('drags the card itself, never its name link', async () => {
+    // A link grabbed by the name would be the drag source, and hiding the card's
+    // contents on dragstart would make Chromium cancel that drag at once.
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    renderBoard();
+    const link = await screen.findByRole('link', { name: 'Avery Example' });
+    expect(link.getAttribute('draggable')).toBe('false');
+    expect(link.closest('li')?.getAttribute('draggable')).toBe('true');
+  });
+
+  it('opens the panel from a card or its name while leaving move controls and modifier clicks alone', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    const onOpen = vi.fn();
+    render(
+      <LeadsBoard
+        workspaceSlug="canadawide"
+        workspaceId={WORKSPACE}
+        accessToken="staff-token"
+        members={[]}
+        query={{
+          type: 'internet',
+          archived: false,
+          due: false,
+          layout: 'board',
+          hide: [],
+          page: 1,
+        }}
+        panel={{
+          openId: card.id,
+          href: (id) => `/w/canadawide/leads?type=internet&layout=board&lead=${id}`,
+          onOpen,
+        }}
+      />,
+    );
+    const link = await screen.findByRole('link', { name: 'Avery Example' });
+    expect(link.getAttribute('href')).toContain(`layout=board&lead=${card.id}`);
+    expect(link.closest('li')?.getAttribute('aria-current')).toBe('true');
+    fireEvent.click(screen.getByText('403 555 0101'));
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith(card.id);
+    onOpen.mockClear();
+    fireEvent.click(link);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith(card.id);
+    onOpen.mockClear();
+    fireEvent.click(link, { ctrlKey: true });
+    fireEvent.click(screen.getByRole('button', { name: 'Move Avery Example to another stage' }));
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('moves a card at once and keeps it there when the backend agrees', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    mocks.updateStaffLead.mockResolvedValue({
+      lead: { ...card, stage: 'contacted', form: null },
+      activities: [],
+      allowedMoves: [],
+      requestId: NOW,
+    });
+    renderBoard();
+    await moveTo('Contacted');
+
+    await waitFor(() =>
+      expect(within(column(/^Contacted, 1 leads$/)).getByText('Avery Example')).toBeTruthy(),
+    );
+    expect(within(column(/^New, 0 leads$/)).queryByText('Avery Example')).toBeNull();
+    expect(mocks.updateStaffLead).toHaveBeenCalledWith('staff-token', WORKSPACE, card.id, {
+      stage: 'contacted',
+    });
+  });
+
+  it('moves a card through its "Move to" menu, the keyboard and touch path', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    mocks.updateStaffLead.mockResolvedValue({
+      lead: { ...card, stage: 'won', form: null },
+      activities: [],
+      allowedMoves: [],
+      requestId: NOW,
+    });
+    renderBoard();
+    fireEvent.pointerDown(
+      await screen.findByRole('button', { name: 'Move Avery Example to another stage' }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Won' }));
+
+    await waitFor(() =>
+      expect(within(column(/^Won, 5 leads$/)).getByText('Avery Example')).toBeTruthy(),
+    );
+    expect(mocks.updateStaffLead).toHaveBeenCalledWith('staff-token', WORKSPACE, card.id, {
+      stage: 'won',
+    });
+  });
+
+  it('puts the card back and says why when the backend refuses', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    const { BackendError } = await import('../../lib/api');
+    mocks.updateStaffLead.mockRejectedValue(new BackendError('lead_trashed', 409, NOW));
+    renderBoard();
+    await moveTo('Won');
+
+    expect(await screen.findByRole('alert')).toHaveProperty(
+      'textContent',
+      'The lead could not be moved. Reason: lead_trashed.',
+    );
+    expect(within(column(/^New, 1 leads$/)).getByText('Avery Example')).toBeTruthy();
+    expect(column(/^Won, 4 leads$/)).toBeTruthy();
+  });
+
+  it('collapses a column to a strip and expands it again', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    renderBoard();
+    await screen.findByText('Avery Example');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse New column' }));
+    expect(screen.queryByText('Avery Example')).toBeNull();
+    expect(window.localStorage.getItem('gt-board-collapsed:' + WORKSPACE + ':internet')).toBe(
+      '["new"]',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand New column' }));
+    expect(screen.getByText('Avery Example')).toBeTruthy();
+  });
+
+  it('hides a column via the options menu and restores it from Hidden columns', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    renderBoard();
+    await screen.findByText('Avery Example');
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Contacted column options' }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Hide column' }));
+    expect(screen.queryByRole('region', { name: /^Contacted/ })).toBeNull();
+    expect(window.localStorage.getItem('gt-board-hidden:' + WORKSPACE + ':internet')).toBe(
+      '["contacted"]',
+    );
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Hidden columns (1)' }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Contacted \(0\)/ }));
+    expect(column(/^Contacted, 0 leads$/)).toBeTruthy();
+  });
+
+  it('offers no move controls to a role that cannot manage leads', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(false));
+    renderBoard();
+    await screen.findByText('Avery Example');
+    expect(screen.queryByRole('button', { name: /Move Avery Example/ })).toBeNull();
+    expect(screen.getByText('Avery Example').closest('li')?.getAttribute('draggable')).toBe(
+      'false',
+    );
+  });
+
+  it('refuses a drop on a stage that needs details, without asking the backend', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    renderBoard('sim_order');
+    await moveTo('Delivered');
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'Open the lead to move it to Delivered: it needs details.',
+    );
+    expect(mocks.updateStaffLead).not.toHaveBeenCalled();
+    expect(within(column(/^Verified, 1 leads$/)).getByText('Avery Example')).toBeTruthy();
+    expect(column(/^Delivered, 0 leads$/)).toBeTruthy();
+  });
+
+  it('offers only the moves the order allows from its stage', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    renderBoard('sim_order');
+    fireEvent.pointerDown(
+      await screen.findByRole('button', { name: 'Move Avery Example to another stage' }),
+      { button: 0, ctrlKey: false },
+    );
+    const items = await screen.findAllByRole('menuitem');
+    expect(items.map((item) => item.textContent)).toEqual(['On hold', 'Delivered', 'Cancelled']);
+  });
+
+  it('says which customer mails a move did not send, one line each', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    mocks.updateStaffLead.mockResolvedValue({
+      lead: { ...card, leadType: 'sim_order', stage: 'on_hold', form: null },
+      activities: [],
+      allowedMoves: [],
+      emailSkipped: [
+        {
+          automation: 'sim_order_information_needed',
+          template: 'information_needed',
+          reason: 'missing_fill_in',
+          missing: ['tracking number'],
+        },
+        {
+          automation: 'sim_order_information_needed',
+          template: 'information_needed',
+          reason: 'no_customer_email',
+        },
+      ],
+      requestId: NOW,
+    });
+    renderBoard('sim_order');
+    await moveTo('On hold');
+
+    const notices = await screen.findByRole('list', { name: 'Customer emails' });
+    expect(
+      within(notices)
+        .getAllByRole('listitem')
+        .map((item) => item.textContent),
+    ).toEqual([
+      'The Information needed email was not sent: it needs the tracking number.',
+      'The Information needed email was not sent: the customer has no email address.',
+    ]);
+  });
+
+  it('clears the customer mail lines when the next move has none', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    mocks.updateStaffLead
+      .mockResolvedValueOnce({
+        lead: { ...card, leadType: 'sim_order', stage: 'on_hold', form: null },
+        activities: [],
+        allowedMoves: [],
+        emailSkipped: [
+          {
+            automation: 'sim_order_information_needed',
+            template: 'information_needed',
+            reason: 'no_customer_email',
+          },
+        ],
+        requestId: NOW,
+      })
+      .mockResolvedValueOnce({
+        lead: { ...card, leadType: 'sim_order', stage: 'pending', form: null },
+        activities: [],
+        allowedMoves: [],
+        requestId: NOW,
+      });
+    renderBoard('sim_order');
+    await moveTo('On hold');
+    await screen.findByRole('list', { name: 'Customer emails' });
+
+    await moveTo('Pending');
+    await waitFor(() => expect(screen.queryByRole('list', { name: 'Customer emails' })).toBeNull());
+  });
+
+  it('says when a move queued an email to the customer', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    mocks.updateStaffLead.mockResolvedValue({
+      lead: { ...card, leadType: 'sim_order', stage: 'on_hold', form: null },
+      activities: [
+        {
+          id: '92000000-0000-4000-8000-000000000001',
+          actorId: null,
+          createdAt: NOW,
+          kind: 'system',
+          event: 'customer_emailed',
+          template: 'information_needed',
+          automation: 'sim_order_information_needed',
+          templateVersion: 0,
+        },
+      ],
+      allowedMoves: [],
+      requestId: NOW,
+    });
+    renderBoard('sim_order');
+    await moveTo('On hold');
+
+    const notices = await screen.findByRole('list', { name: 'Customer emails' });
+    expect(within(notices).getByRole('listitem').textContent).toBe('Customer email queued.');
+  });
+
+  it('says nothing of customer mail when a move sends none', async () => {
+    mocks.getLeadBoard.mockResolvedValue(board(true));
+    mocks.updateStaffLead.mockResolvedValue({
+      lead: { ...card, stage: 'contacted', form: null },
+      activities: [],
+      allowedMoves: [],
+      requestId: NOW,
+    });
+    renderBoard();
+    await moveTo('Contacted');
+    await waitFor(() =>
+      expect(within(column(/^Contacted, 1 leads$/)).getByText('Avery Example')).toBeTruthy(),
+    );
+    expect(screen.queryByRole('list', { name: 'Customer emails' })).toBeNull();
+  });
+
+  it('says from where a move is not allowed when the backend refuses it', async () => {
+    mocks.getLeadBoard.mockResolvedValue(orderBoard());
+    const { BackendError } = await import('../../lib/api');
+    mocks.updateStaffLead.mockRejectedValue(new BackendError('illegal_stage_move', 409, NOW));
+    renderBoard('sim_order');
+    await moveTo('Pending');
+
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'That move is not allowed from Verified.',
+    );
+    expect(within(column(/^Verified, 1 leads$/)).getByText('Avery Example')).toBeTruthy();
+  });
+});

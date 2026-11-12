@@ -1,0 +1,646 @@
+/**
+ * Browser-test harness for the admin's lead journeys
+ * (apps/admin/e2e/leads.spec.ts). Runs the REAL backend (`createApp`, the real
+ * staff routes, authorization store, lead stores and RLS) against a
+ * disposable Postgres. One seam only: a stub staff-session verifier that
+ * admits one seeded owner for a fixed bearer token, because CI has no Supabase
+ * Auth project. Everything past the verifier is the production code path.
+ *
+ * Each start resets the e2e sites and seeds them: CanadaWide with two staff
+ * (the signed-in owner and a colleague), internet and mobility leads in a few
+ * stages, and one open task (every lead came through `utm:google/cpc`, Casey
+ * Demo's under the campaign `fall_promo`, except Blake Sample's, which carries
+ * no attribution and counts as direct in the source report); plus Get Canada Sim with SIM orders for property
+ * filter, sort and column checks, two plans ("Rogers 60GB", payment required,
+ * and "Fido 75GB", none) and one more SIM order that ordered Rogers 60GB, so
+ * its order details carry the frozen plan. Rogers 60GB requires a passport,
+ * and Nadia Khan's order has one, attached and not yet reviewed. Nadia Khan
+ * also has a pending change request (#1) asking for a new phone and arrival
+ * date, made through `DatabaseChangeRequestStore.requestChange` as the
+ * website's credential (`WEBSITE_ACTOR_ID`), the store call the tracking route
+ * `POST /website/tracking/orders/:reference/changes` makes once it has checked
+ * the site's key and the customer's grant. Get Canada
+ * Sim has its email settings saved and its Dispatched email saved once
+ * (version 1); Leila Ahmadi, a second submitted order of Rogers 60GB; Omar
+ * Haddad, an abandoned checkout (Incomplete, never submitted) with a name, an
+ * email and the Fido plan; and one custom flow, "Verified follow-up", made,
+ * drafted and activated through `DatabaseFlowStore` as the owner (when a SIM
+ * order moves to Verified: if its plan is Rogers 60GB, a task "Call {first
+ * name} about {order number}" due in a day for the lead's owner; else wait two
+ * days, then the Activated email). No flow is switched on. All of it is written
+ * through the real stores: the plans through the plan store, the ordered SIM
+ * order through `createLead` with `order` and `submit: true`, the call the
+ * website route `POST /website/leads` makes once it has checked the site's
+ * key, and the email settings through the email settings store. Only the
+ * passport's file row is inserted directly, as the upload's finalize leaves
+ * it: no object store runs here, so documents are reviewed against an
+ * in-memory one.
+ *
+ * Never imported by the deployed server: tsup bundles only `src/server.ts`.
+ */
+import postgres from 'postgres';
+import { z } from 'zod';
+import { DatabaseAiReadService } from '../../src/ai/read-service.js';
+import { DatabaseAiSiteContextStore } from '../../src/ai/site-context.js';
+import { createFakeEngine, type AssistantEngine } from '../../src/ai/engine.js';
+import { InMemoryR2DocumentStore } from '@canadian-plans/adapters';
+import { codePropertyCatalog, type FlowDraft } from '@canadian-plans/contracts';
+import { createDatabaseClient } from '@canadian-plans/db';
+import { applyMigrations } from '@canadian-plans/db/migrations';
+import {
+  assertDisposableDatabaseUrl,
+  setTestRuntimePassword,
+} from '@canadian-plans/db/test-helpers';
+
+import { createApp } from '../../src/app.js';
+import type { StaffSessionVerifier, VerifiedStaffSession } from '../../src/auth/session.js';
+import { DatabaseFlowStore } from '../../src/automations/flow-store.js';
+import { DatabaseDocumentContextResolver } from '../../src/documents/resolver.js';
+import { DocumentService } from '../../src/documents/service.js';
+import { DatabaseDocumentStore } from '../../src/documents/store.js';
+import { DatabaseEmailSettingsStore } from '../../src/email/settings-store.js';
+import { STARTER_TEMPLATES } from '../../src/email/starters.js';
+import { DatabaseLeadStore } from '../../src/leads/store.js';
+import { DatabaseLeadWorkStore } from '../../src/leads/work-store.js';
+import { DatabasePlanStore } from '../../src/plans/store.js';
+import { createDefaultStaffRouteDependencies } from '../../src/routes/staff.js';
+import { DatabaseChangeRequestStore } from '../../src/tracking/change-requests.js';
+
+const PORT = Number(process.env['E2E_HARNESS_PORT'] ?? 4100);
+const WORKSPACE_ID = '10000000-0000-4000-8000-0000000e2e01';
+const SIM_WORKSPACE_ID = '10000000-0000-4000-8000-0000000e2e02';
+const OWNER_ID = '20000000-0000-4000-8000-0000000e2e01';
+const COLLEAGUE_ID = '20000000-0000-4000-8000-0000000e2e02';
+const WEBSITE_ACTOR_ID = '20000000-0000-4000-8000-0000000e2e09';
+const PASSPORT_FILE_ID = '50000000-0000-4000-8000-0000000e2e01';
+const STAFF_BEARER = process.env['E2E_STAFF_BEARER'] ?? 'e2e-staff-session-owner';
+const ADMIN_URL = process.env['TEST_MIGRATION_DATABASE_URL'];
+const RUNTIME_URL = process.env['DATABASE_URL'];
+
+if (!ADMIN_URL || !RUNTIME_URL) {
+  process.stderr.write('TEST_MIGRATION_DATABASE_URL and DATABASE_URL are required.\n');
+  process.exit(1);
+}
+try {
+  // The harness deletes a site and resets app_runtime's password.
+  assertDisposableDatabaseUrl(ADMIN_URL);
+  assertDisposableDatabaseUrl(RUNTIME_URL);
+} catch (error) {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+}
+
+// Customer email through the fake provider; the site's saved settings are its sender.
+process.env['EMAIL_PROVIDER'] ??= 'fake';
+process.env['EMAIL_CONTACT_HASH_SECRET'] ??= 'e2e-email-contact-hash-secret-0123';
+
+const internetPayload = (planLabel: string, city: string) => ({
+  planId: 'ab-1gbps',
+  planLabel,
+  dateOfBirth: '1990-04-12',
+  streetAddress: '12 Example Street',
+  city,
+  postalCode: 'T2P 1J9',
+  currentProvider: 'Shaw',
+  consent: true,
+  consentedAt: '2026-10-20T10:00:00.000Z',
+});
+
+const mobilityPayload = (firstName: string, lastName: string) => ({
+  planId: 'cw-100gb',
+  planLabel: '100 GB $40',
+  lineCount: 2,
+  firstName,
+  lastName,
+  keepNumber: true,
+  simType: 'esim',
+  currentProvider: 'Rogers',
+  streetAddress: '9 Sample Road',
+  city: 'Edmonton',
+  postalCode: 'T5J 0N3',
+});
+
+async function seed(): Promise<void> {
+  let nadiaLeadId: string | undefined;
+  const admin = postgres(ADMIN_URL ?? '', { max: 1, prepare: false, ssl: false });
+  try {
+    await setTestRuntimePassword(admin);
+    // The cascade clears the sites' leads, tasks, timeline and memberships.
+    await admin`delete from app.workspaces where id in (${WORKSPACE_ID}, ${SIM_WORKSPACE_ID})`;
+    await admin`
+      insert into app.workspaces (id, slug, name, domain)
+      values
+        (${WORKSPACE_ID}, 'canadawide', 'CanadaWide', 'canadawideinternet.com'),
+        (${SIM_WORKSPACE_ID}, 'getcanadasim', 'Get Canada Sim', 'getcanadasim.com')
+    `;
+    await admin`
+      insert into app.roles (workspace_id, name)
+      select ${WORKSPACE_ID}, r from unnest(enum_range(null::app.role_name)) as r
+    `;
+    await admin`
+      insert into app.roles (workspace_id, name)
+      select ${SIM_WORKSPACE_ID}, r from unnest(enum_range(null::app.role_name)) as r
+    `;
+    await admin`
+      insert into app.memberships (workspace_id, user_id, membership_type, status, accepted_at, display_name)
+      values
+        (${WORKSPACE_ID}, ${OWNER_ID}, 'staff', 'active', now(), 'Takib'),
+        (${WORKSPACE_ID}, ${COLLEAGUE_ID}, 'staff', 'active', now(), 'Sam'),
+        (${SIM_WORKSPACE_ID}, ${OWNER_ID}, 'staff', 'active', now(), 'Takib')
+    `;
+    await admin`
+      insert into app.membership_roles (workspace_id, membership_id, role_id)
+      select m.workspace_id, m.id, r.id
+      from app.memberships m
+      join app.roles r on r.workspace_id = m.workspace_id
+        and r.name = case when m.user_id = ${OWNER_ID} then 'owner'::app.role_name else 'leads'::app.role_name end
+      where m.workspace_id in (${WORKSPACE_ID}, ${SIM_WORKSPACE_ID})
+    `;
+  } finally {
+    await admin.end();
+  }
+
+  const database = createDatabaseClient({
+    connectionString: RUNTIME_URL ?? '',
+    maxConnections: 1,
+    ssl: false,
+  });
+  try {
+    const leads = new DatabaseLeadStore(database);
+    const work = new DatabaseLeadWorkStore(database);
+    const website = {
+      workspaceId: WORKSPACE_ID,
+      actorId: WEBSITE_ACTOR_ID,
+      requestId: '40000000-0000-4000-8000-0000000e2e01',
+    };
+    const owner = { ...website, actorId: OWNER_ID, catalog: codePropertyCatalog };
+
+    const people = [
+      ['Avery Example', 'avery@example.test', '403 555 0101', 'internet', 'new'],
+      ['Blake Sample', 'blake@example.test', '403 555 0102', 'internet', 'new'],
+      ['Casey Demo', 'casey@example.test', '403 555 0103', 'internet', 'contacted'],
+      ['Drew Testcase', 'drew@example.test', '403 555 0104', 'internet', 'won'],
+      ['Ellis Mobile', 'ellis@example.test', '780 555 0105', 'mobility', 'new'],
+    ] as const;
+    for (const [fullName, email, phone, leadType, stage] of people) {
+      const [first = fullName, last = fullName] = fullName.split(' ');
+      const created = await leads.createLead({
+        ...website,
+        leadType,
+        contact: { fullName, email, phone, countryCode: 'CA' },
+        form: {
+          schemaVersion: 1,
+          payload:
+            leadType === 'internet'
+              ? internetPayload('1Gbps', 'Calgary')
+              : mobilityPayload(first, last),
+        },
+        attribution:
+          fullName === 'Blake Sample'
+            ? {}
+            : fullName === 'Casey Demo'
+              ? { utmSource: 'google', utmMedium: 'cpc', utmCampaign: 'fall_promo' }
+              : { utmSource: 'google', utmMedium: 'cpc' },
+        consentVersion: 'cw-e2e-2026-10',
+        submit: true,
+      });
+      if (stage !== 'new') {
+        await work.updateLead({ ...owner, leadId: created.lead.id, stage });
+      }
+      if (fullName === 'Casey Demo') {
+        await work.updateLead({ ...owner, leadId: created.lead.id, assignedActorId: OWNER_ID });
+        await work.createTask({
+          ...owner,
+          leadId: created.lead.id,
+          title: 'Confirm the install window',
+          dueAt: '2026-10-20T12:00:00.000Z',
+          assignedActorId: OWNER_ID,
+        });
+      }
+    }
+
+    const simWebsite = {
+      workspaceId: SIM_WORKSPACE_ID,
+      actorId: WEBSITE_ACTOR_ID,
+      requestId: '40000000-0000-4000-8000-0000000e2e02',
+    };
+    const simOwner = { ...simWebsite, actorId: OWNER_ID, catalog: codePropertyCatalog };
+    const simOrders = [
+      ['Priya Sharma', 'priya@example.test', '647 555 0201', 'student', '2026-11-15'],
+      ['Arjun Patel', 'arjun@example.test', '647 555 0202', 'student', '2026-11-05'],
+      ['Marco Rossi', 'marco@example.test', '647 555 0203', 'worker', '2026-11-01'],
+    ] as const;
+    for (const [fullName, email, phone, permitType, arrivalDate] of simOrders) {
+      const created = await leads.createLead({
+        ...simWebsite,
+        leadType: 'sim_order',
+        contact: { fullName, email, phone, countryCode: 'IN' },
+        form: {
+          schemaVersion: 1,
+          payload: {
+            planId: 'rogers_60gb',
+            planLabel: 'Rogers 60 GB ($40/mo)',
+            permitType,
+            arrivalDate,
+            delivery: 'esim',
+            flightBooked: true,
+            gotVisa: true,
+          },
+        },
+        attribution: { utmSource: 'google', utmMedium: 'cpc' },
+        consentVersion: 'gcs-e2e-2026-10',
+        submit: true,
+      });
+      // Submitted on the website, a SIM order is Pending at once.
+      if (created.lead.status !== 'submitted') throw new Error('seed SIM order not submitted');
+    }
+
+    // Two plans, then one SIM order that names the first: submitted, so the
+    // plan is frozen on it and its payment is pending.
+    const plansStore = new DatabasePlanStore(database);
+    const planIds: string[] = [];
+    for (const [name, priceMinor, paymentRequired] of [
+      ['Rogers 60GB', 4000, true],
+      ['Fido 75GB', 3500, false],
+    ] as const) {
+      const outcome = await plansStore.create(simOwner, {
+        leadType: 'sim_order',
+        name,
+        priceMinor,
+        billingPeriod: 'month',
+        paymentRequired,
+        active: true,
+        requiredDocuments: name === 'Rogers 60GB' ? ['passport'] : [],
+        customValues: {},
+      });
+      if (outcome.kind !== 'created') throw new Error(`seed plan ${name}: ${outcome.kind}`);
+      planIds.push(outcome.plan.id);
+    }
+    const [rogersPlanId] = planIds;
+    if (!rogersPlanId) throw new Error('seed plan Rogers 60GB was not created');
+    const ordered = await leads.createLead({
+      ...simWebsite,
+      leadType: 'sim_order',
+      contact: {
+        fullName: 'Nadia Khan',
+        email: 'nadia@example.test',
+        phone: '647 555 0204',
+        countryCode: 'IN',
+      },
+      form: {
+        schemaVersion: 1,
+        payload: {
+          planId: rogersPlanId,
+          planLabel: 'Rogers 60GB',
+          permitType: 'worker',
+          arrivalDate: '2026-11-20',
+          delivery: 'esim',
+          flightBooked: true,
+          gotVisa: true,
+        },
+      },
+      order: { planId: rogersPlanId, quantity: 1 },
+      attribution: { utmSource: 'google', utmMedium: 'cpc' },
+      consentVersion: 'gcs-e2e-2026-10',
+      submit: true,
+    });
+    nadiaLeadId = ordered.lead.id;
+
+    // A second order of the first plan, submitted and Pending, for the custom flow's journey.
+    const leila = await leads.createLead({
+      ...simWebsite,
+      leadType: 'sim_order',
+      contact: {
+        fullName: 'Leila Ahmadi',
+        email: 'leila@example.test',
+        phone: '647 555 0205',
+        countryCode: 'IR',
+      },
+      form: {
+        schemaVersion: 1,
+        payload: {
+          planId: rogersPlanId,
+          planLabel: 'Rogers 60GB',
+          permitType: 'worker',
+          arrivalDate: '2026-12-01',
+          delivery: 'esim',
+          flightBooked: true,
+          gotVisa: true,
+        },
+      },
+      order: { planId: rogersPlanId, quantity: 1 },
+      attribution: { utmSource: 'google', utmMedium: 'cpc' },
+      consentVersion: 'gcs-e2e-2026-10',
+      submit: true,
+    });
+    if (leila.lead.status !== 'submitted') throw new Error('seed Leila Ahmadi not submitted');
+
+    // An abandoned checkout: a name, an email and a plan, never submitted (Incomplete).
+    const [, fidoPlanId] = planIds;
+    if (!fidoPlanId) throw new Error('seed plan Fido 75GB was not created');
+    const omar = await leads.createLead({
+      ...simWebsite,
+      leadType: 'sim_order',
+      contact: { fullName: 'Omar Haddad', email: 'omar@example.test', countryCode: 'LB' },
+      order: { planId: fidoPlanId, quantity: 1 },
+      consentVersion: 'gcs-e2e-2026-10',
+    });
+    if (omar.lead.status !== 'incomplete') throw new Error('seed Omar Haddad was submitted');
+
+    // One custom flow, built through the flow store as the owner: when a SIM
+    // order moves to Verified, if its plan is the first plan, a task for the
+    // lead's owner; otherwise wait two days and send the Activated email.
+    // Activated, and left off: the journey switches it on.
+    const flows = new DatabaseFlowStore(database);
+    const flowScope = {
+      workspaceId: SIM_WORKSPACE_ID,
+      actorId: OWNER_ID,
+      requestId: '40000000-0000-4000-8000-0000000e2e03',
+    };
+    const created = await flows.create(flowScope, { name: 'Verified follow-up' });
+    if (created.status !== 'ok') throw new Error(`seed flow: ${created.status}`);
+    const definition: FlowDraft = {
+      schemaVersion: 1,
+      trigger: { kind: 'stage_entered', leadType: 'sim_order', stage: 'verified', when: null },
+      steps: [
+        {
+          id: 's_plan',
+          kind: 'if_else',
+          condition: { match: 'all', items: [{ kind: 'plan', op: 'in', planIds: [rogersPlanId] }] },
+          then: [
+            {
+              id: 's_task',
+              kind: 'create_task',
+              title: 'Call {first name} about {order number}',
+              dueInDays: 1,
+              assignee: { kind: 'lead_assignee' },
+            },
+          ],
+          else: [
+            { id: 's_wait', kind: 'wait', for: { amount: 2, unit: 'days' } },
+            { id: 's_mail', kind: 'send_email', template: 'activated' },
+          ],
+        },
+      ],
+    };
+    const drafted = await flows.saveDraft(flowScope, created.value.key, {
+      expectedRevision: created.value.revision,
+      definition,
+    });
+    if (drafted.status !== 'ok') throw new Error(`seed flow draft: ${drafted.status}`);
+    const activated = await flows.activate(flowScope, created.value.key, {
+      expectedRevision: drafted.value.flow.revision,
+      mayChangeLeads: true,
+    });
+    if (activated.status !== 'ok') throw new Error(`seed flow activation: ${activated.status}`);
+
+    // The customer asks, through tracking, for a new phone and arrival date: request #1.
+    const asked = await new DatabaseChangeRequestStore(database).requestChange({
+      ...simWebsite,
+      leadId: ordered.lead.id,
+      fields: { phone: '647 555 0299', arrivalDate: '2026-11-27' },
+      now: new Date(),
+    });
+    if (asked.status !== 'saved') throw new Error(`seed change request: ${asked.status}`);
+
+    // Get Canada Sim's sender, and its Dispatched email saved once (version 1).
+    // No flow is switched on: the journeys do that.
+    const email = new DatabaseEmailSettingsStore(database);
+    await email.putSettings(owner, {
+      fromName: 'CanadaWide',
+      fromAddress: 'staff@canadawide.example',
+      replyTo: null,
+      logoUrl: null,
+      brandColor: '#123abc',
+      footerText: 'Test footer',
+      siteUrl: 'https://canadawide.example',
+      style: 'classic',
+      accentColor: null,
+    });
+    await email.putSettings(simOwner, {
+      fromName: 'Get Canada Sim',
+      fromAddress: 'orders@getcanadasim.example',
+      replyTo: null,
+      logoUrl: null,
+      brandColor: '#123abc',
+      footerText: '',
+      siteUrl: 'https://getcanadasim.example',
+      style: 'classic',
+      accentColor: null,
+    });
+    const dispatched = await email.putTemplate(simOwner, 'dispatched', {
+      expectedVersion: 0,
+      ...STARTER_TEMPLATES.dispatched,
+    });
+    if (dispatched.kind !== 'saved') throw new Error(`seed template: ${dispatched.kind}`);
+  } finally {
+    await database.close();
+  }
+
+  // Nadia Khan's passport, as an upload's finalize leaves it: attached, not reviewed.
+  if (!nadiaLeadId) throw new Error('seed lead Nadia Khan was not created');
+  const files = postgres(ADMIN_URL ?? '', { max: 1, prepare: false, ssl: false });
+  try {
+    await files`
+      insert into app.files (
+        id, workspace_id, record_type, record_id, document_type, bucket, staging_key,
+        candidate_key, object_key, declared_content_type, detected_mime, declared_size_bytes,
+        size_bytes, checksum_sha256, status, uploaded_by, expires_at, finalized_at
+      ) values (
+        ${PASSPORT_FILE_ID}, ${SIM_WORKSPACE_ID}, 'lead', ${nadiaLeadId}, 'passport', 'documents',
+        ${`staging/${SIM_WORKSPACE_ID}/${PASSPORT_FILE_ID}`},
+        ${`candidate/${SIM_WORKSPACE_ID}/${PASSPORT_FILE_ID}`},
+        ${`candidate/${SIM_WORKSPACE_ID}/${PASSPORT_FILE_ID}`}, 'application/pdf',
+        'application/pdf', 2048, 2048, ${'a'.repeat(64)}, 'available', ${WEBSITE_ACTOR_ID},
+        now() + interval '1 hour', now()
+      )
+    `;
+  } finally {
+    await files.end();
+  }
+}
+
+class StubStaffVerifier implements StaffSessionVerifier {
+  async verify(accessToken: string): Promise<VerifiedStaffSession | undefined> {
+    return accessToken === STAFF_BEARER
+      ? { actorId: OWNER_ID, verifiedEmail: 'owner@example.test' }
+      : undefined;
+  }
+}
+
+await applyMigrations({ connectionString: ADMIN_URL, ssl: false });
+await seed();
+
+// Deterministic model only in this test entrypoint; HTTP, reads, RLS and UI are real.
+const assistantEngine: AssistantEngine = {
+  kind: 'fake',
+  async *stream(input) {
+    // With a lead open, the person's message starts with the record's labelled
+    // data block (prompt.ts `openLeadDataBlock`); the question follows it.
+    const question = (input.messages.at(-1)?.text ?? '').replace(
+      /^\[Open record[^\n]*\n[^\n]*\n\[End of open record\]\n\n/,
+      '',
+    );
+    if (question === 'Guided follow-up') {
+      if (!input.executeTool) throw new Error('executor missing');
+      await input.executeTool('askFollowUp', {
+        question: 'When should this be due?',
+        choices: ['Tomorrow', 'No due date'],
+      });
+      yield { type: 'finish', outputTokens: 0 };
+      return;
+    }
+    if (
+      question.startsWith('Create a reviewed automation') ||
+      question.startsWith('Edit the reviewed automation')
+    ) {
+      if (!input.executeTool) throw new Error('expected executor');
+      const editing = question.startsWith('Edit');
+      const flowName = 'AI browser flow ' + question.split(' ').at(-1);
+      let target;
+      let definition: unknown = {
+        schemaVersion: 1,
+        trigger: { kind: 'lead_submitted', leadTypes: ['sim_order'], when: null },
+        steps: [{ id: 's_wait', kind: 'wait', for: { amount: 2, unit: 'days' } }],
+      };
+      if (editing) {
+        const listed = z
+          .object({ flows: z.array(z.object({ key: z.string(), name: z.string() })) })
+          .parse(JSON.parse(await input.executeTool('listAutomations', { search: flowName })));
+        const flow = listed.flows[0];
+        if (!flow) throw new Error('missing flow');
+        const current = z
+          .object({
+            key: z.string(),
+            revision: z.number(),
+            draft: z.object({ definition: z.unknown() }),
+          })
+          .parse(JSON.parse(await input.executeTool('getAutomation', { key: flow.key })));
+        definition = current.draft.definition;
+        target = { key: current.key, expectedRevision: current.revision, base: 'draft' };
+      }
+      await input.executeTool('getAutomationCatalog', { leadType: 'sim_order' });
+      await input.executeTool(editing ? 'proposeAutomationEdit' : 'proposeAutomationCreate', {
+        draft: {
+          name: editing ? flowName + ' edited' : flowName,
+          description: 'Created from a reviewed AI proposal',
+          definition,
+        },
+        ...(target ? { target } : {}),
+      });
+      yield { type: 'text', text: 'Automation draft ready. Review and save it.' };
+      yield { type: 'finish', outputTokens: 10 };
+      return;
+    }
+    if (question === 'Assign new SIM orders to me') {
+      if (!input.executeTool) throw new Error('expected executor');
+      await input.executeTool('getAutomationCatalog', { section: 'members' });
+      await input.executeTool('proposeAutomationCreate', {
+        draft: {
+          name: 'Assign new SIM orders to me',
+          definition: {
+            trigger: { kind: 'lead_submitted', leadTypes: ['sim_order'] },
+            steps: [{ kind: 'assign_lead', actorId: 'me' }],
+          },
+        },
+      });
+      yield { type: 'text', text: 'Assignment draft ready for your review.' };
+      yield { type: 'finish', outputTokens: 8 };
+      return;
+    }
+    if (question.startsWith('Update lead phone:')) {
+      const leadId = /ID ([a-f0-9-]{36})/.exec(input.system)?.[1];
+      if (!leadId || !input.executeTool) throw new Error('expected context');
+      await input.executeTool('prepareLeadUpdate', {
+        leadId,
+        field: 'phone',
+        value: question.slice('Update lead phone:'.length).trim(),
+      });
+      yield { type: 'text', text: 'Lead update ready for review.' };
+      yield { type: 'finish', outputTokens: 8 };
+      return;
+    }
+    if (question.startsWith('Draft an email:')) {
+      const leadId = /ID ([a-f0-9-]{36})/.exec(input.system)?.[1];
+      if (!leadId || !input.executeTool) throw new Error('expected context');
+      await input.executeTool('prepareEmail', {
+        leadId,
+        subject: 'Your follow-up',
+        body: question.slice('Draft an email:'.length).trim(),
+      });
+      yield { type: 'text', text: 'Email draft ready. Review and Send.' };
+      yield { type: 'finish', outputTokens: 8 };
+      return;
+    }
+    if (question.startsWith('Add a note:') || question.startsWith('Create a task:')) {
+      const leadId = /ID ([a-f0-9-]{36})/.exec(input.system)?.[1];
+      if (!leadId || !input.executeTool) throw new Error('expected open lead context');
+      const note = question.startsWith('Add a note:');
+      const name = note ? 'prepareNote' : 'prepareTask';
+      yield { type: 'tool-start', toolName: name };
+      await input.executeTool(
+        name,
+        note
+          ? { leadId, body: question.slice('Add a note:'.length).trim() }
+          : {
+              leadId,
+              title: question.slice('Create a task:'.length).trim(),
+              dueDate: '2026-12-01',
+              assignee: 'me',
+            },
+      );
+      yield { type: 'tool-end', toolName: name, ok: true };
+      yield { type: 'text', text: 'Draft ready for confirmation. Nothing has been saved.' };
+      yield { type: 'finish', outputTokens: 12 };
+      return;
+    }
+    if (question === 'Slow test') {
+      yield* createFakeEngine([{ hangMs: 10000, chunks: ['Late test answer'] }]).stream(input);
+      return;
+    }
+    yield { type: 'tool-start', toolName: 'getSiteOverview' };
+    if (!input.executeTool) throw new Error('test executor missing');
+    const result = z
+      .object({ status: z.literal('ok'), data: z.object({ received: z.number() }) })
+      .parse(JSON.parse(await input.executeTool('getSiteOverview', { period: 'all_time' })));
+    yield { type: 'text', text: '## Lead overview\n\n**Synthetic model: ' };
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (input.signal.aborted) return;
+    yield {
+      type: 'text',
+      text: `${result.data.received} leads checked in this site.**\n\n| Stage | Count |\n| --- | ---: |\n| Pending | 8 |\n| Verified | 5 |\n\n- Counts include drafts.\n- Archived leads are excluded.`,
+    };
+    yield { type: 'finish', outputTokens: 12 };
+  },
+};
+
+const app = createApp({
+  staff: {
+    ...createDefaultStaffRouteDependencies(),
+    ai: {
+      config: {
+        enabled: true,
+        apiKey: 'synthetic-e2e-signing-key',
+        signingKey: 'synthetic-e2e-signing-key',
+        automationWorkspaceIds: new Set([WORKSPACE_ID, SIM_WORKSPACE_ID]),
+        workspaceIds: new Set([WORKSPACE_ID, SIM_WORKSPACE_ID]),
+      },
+      reads: new DatabaseAiReadService(),
+      siteContext: new DatabaseAiSiteContextStore(),
+      engine: assistantEngine,
+      rateLimit: async () => ({ allowed: true, retryAfterSeconds: 0 }),
+    },
+    sessionVerifier: new StubStaffVerifier(),
+    // Reviews are database rows; no document is opened, so the objects can be in memory.
+    documentService: new DocumentService(
+      new DatabaseDocumentStore(),
+      new InMemoryR2DocumentStore(),
+      new DatabaseDocumentContextResolver(),
+    ),
+    // One browser on 127.0.0.1 makes every request; the limiter is not under test here.
+    rateLimit: undefined,
+  },
+});
+app.listen(PORT, '127.0.0.1', () => {
+  process.stdout.write(`e2e harness listening on http://127.0.0.1:${PORT}\n`);
+});

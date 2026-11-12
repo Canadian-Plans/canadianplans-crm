@@ -1,0 +1,237 @@
+import { z } from 'zod';
+import { websiteBotTokenSchema } from './website-bot';
+
+import { apiErrorResponseSchema } from './staff-auth';
+import { endpoints, type EndpointAuth, type EndpointDef } from './endpoints';
+
+/**
+ * Builds an OpenAPI 3.1 document from the endpoint registry and its Zod
+ * schemas. There is no hand-written OpenAPI: the schemas are the single source
+ * (REQ 50). `scripts/generate-openapi.ts` writes the result to
+ * `docs/api/openapi.json` at build time.
+ */
+
+type JsonObject = Record<string, unknown>;
+
+/**
+ * Converts a Zod schema to a plain JSON-Schema object (draft 2020-12, the
+ * dialect OpenAPI 3.1 uses). Round-tripping through JSON yields a plain
+ * `Record` without any class instances or the top-level `$schema` marker, which
+ * OpenAPI does not want on component schemas.
+ */
+function jsonSchemaOf(schema: z.ZodType): JsonObject {
+  const converted: JsonObject = JSON.parse(
+    JSON.stringify(z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'output' })),
+  );
+  delete converted['$schema'];
+  return converted;
+}
+
+/** Same as `jsonSchemaOf`, but for a request body validated on input. */
+function jsonInputSchemaOf(schema: z.ZodType): JsonObject {
+  const converted: JsonObject = JSON.parse(
+    JSON.stringify(z.toJSONSchema(schema, { target: 'draft-2020-12', io: 'input' })),
+  );
+  delete converted['$schema'];
+  return converted;
+}
+
+function pathParamNames(path: string): string[] {
+  return [...path.matchAll(/\{([^}]+)\}/g)].map((match) => match[1] ?? '');
+}
+
+function tagFor(path: string): string {
+  return path.split('/')[3] ?? 'root';
+}
+
+const securitySchemes: JsonObject = {
+  staffSession: {
+    type: 'http',
+    scheme: 'bearer',
+    description: 'Supabase Auth access token; verified and re-authorised on every request.',
+  },
+  websiteCredential: {
+    type: 'http',
+    scheme: 'bearer',
+    description:
+      'Per-site service credential (`cpsk_…`); resolves to one workspace and its scopes.',
+  },
+  machineSignature: {
+    type: 'apiKey',
+    in: 'header',
+    name: 'X-Signature',
+    description: 'Provider HMAC signature verified through the server-only machine registry.',
+  },
+};
+
+function securityFor(auth: EndpointAuth): JsonObject[] {
+  switch (auth) {
+    case 'public':
+      return [];
+    case 'staff':
+      return [{ staffSession: [] }];
+    case 'website':
+    case 'customer':
+      return [{ websiteCredential: [] }];
+    case 'machine':
+      return [{ machineSignature: [] }];
+  }
+}
+
+function queryParameters(schema: z.ZodType): JsonObject[] {
+  const js = jsonInputSchemaOf(schema);
+  const properties = js['properties'];
+  if (!properties || typeof properties !== 'object') {
+    return [];
+  }
+  const required = Array.isArray(js['required']) ? js['required'] : [];
+  return Object.entries(properties).map(([name, sub]) => ({
+    name,
+    in: 'query',
+    required: required.includes(name),
+    schema: sub,
+  }));
+}
+
+function parametersFor(endpoint: EndpointDef): JsonObject[] {
+  const params: JsonObject[] = pathParamNames(endpoint.path).map((name) => ({
+    name,
+    in: 'path',
+    required: true,
+    schema: { type: 'string' },
+  }));
+  for (const header of endpoint.headers ?? []) {
+    params.push({
+      name: header.name,
+      in: 'header',
+      required: header.required,
+      description: header.description,
+      schema: { type: 'string' },
+    });
+  }
+  if (endpoint.auth === 'website' || endpoint.auth === 'customer') {
+    params.push({
+      name: 'X-Website-Visitor-Id',
+      in: 'header',
+      required: false,
+      description:
+        'Server-owned keyed visitor digest from the authenticated website; never raw browser forwarding headers.',
+      schema: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+    });
+    if (endpoint.method !== 'GET')
+      params.push({
+        name: 'X-Turnstile-Token',
+        in: 'header',
+        // Read only in the backend's `turnstile` mode; production runs `delegated`.
+        required: false,
+        description:
+          'Required only when the backend runs WEBSITE_BOT_CHECK=turnstile (the default mode): a fresh single-use challenge token bound to this route action, obtained anew before each request or retry. In delegated mode (production) the website screens its own visitors and the header is not read.',
+        schema: jsonInputSchemaOf(websiteBotTokenSchema),
+      });
+  }
+  if (endpoint.query) {
+    params.push(...queryParameters(endpoint.query));
+  }
+  return params;
+}
+
+function operationFor(endpoint: EndpointDef): JsonObject {
+  const responses: JsonObject = {
+    default: {
+      description: 'Error envelope `{ error: { code, message, requestId, details? } }`.',
+      content: { 'application/json': { schema: jsonSchemaOf(apiErrorResponseSchema) } },
+    },
+  };
+
+  if (endpoint.stream) {
+    // A stream's 200 body is not one JSON document, so the frame schema is
+    // published under the event-stream media type and the description spells
+    // out the framing the JSON-Schema dialect cannot express.
+    responses[String(endpoint.successStatus)] = {
+      description: endpoint.stream.summary,
+      headers: {
+        'cache-control': {
+          description: 'Always `no-store`: a chat answer is never cached.',
+          schema: { type: 'string' },
+        },
+      },
+      content: {
+        [endpoint.stream.contentType]: {
+          schema: jsonSchemaOf(endpoint.stream.schema),
+          description:
+            `Server-sent events. Each frame is \`event: ${endpoint.stream.event}\` plus one ` +
+            '`data:` line holding a JSON object of this schema; a final `done` frame ends it. ' +
+            'An error before the first frame is an ordinary JSON error response instead.',
+        },
+      },
+    };
+  } else if (endpoint.file) {
+    responses[String(endpoint.successStatus)] = {
+      description: endpoint.file.summary,
+      headers: {
+        'cache-control': {
+          description: 'Always `no-store`: an export is never cached.',
+          schema: { type: 'string' },
+        },
+        'content-disposition': {
+          description: '`attachment` with the file name.',
+          schema: { type: 'string' },
+        },
+      },
+      content: {
+        [endpoint.file.contentType]: { schema: { type: 'string', format: 'binary' } },
+      },
+    };
+  } else if (endpoint.response) {
+    responses[String(endpoint.successStatus)] = {
+      description: 'Success.',
+      content: { 'application/json': { schema: jsonSchemaOf(endpoint.response) } },
+    };
+  }
+
+  const operation: JsonObject = {
+    operationId: endpoint.operationId,
+    summary: endpoint.summary,
+    tags: [tagFor(endpoint.path)],
+    security: securityFor(endpoint.auth),
+    parameters: parametersFor(endpoint),
+    responses,
+  };
+
+  if (endpoint.request) {
+    operation['requestBody'] = {
+      required: true,
+      content: { 'application/json': { schema: jsonInputSchemaOf(endpoint.request) } },
+    };
+  }
+
+  return operation;
+}
+
+export interface BuildOpenApiOptions {
+  readonly version?: string;
+}
+
+export function buildOpenApiDocument(options: BuildOpenApiOptions = {}): JsonObject {
+  const paths: JsonObject = {};
+  for (const endpoint of endpoints) {
+    const existing = paths[endpoint.path];
+    const item: JsonObject = existing && typeof existing === 'object' ? { ...existing } : {};
+    item[endpoint.method.toLowerCase()] = operationFor(endpoint);
+    paths[endpoint.path] = item;
+  }
+
+  return {
+    openapi: '3.1.0',
+    info: {
+      title: 'Canadian Plans CRM API',
+      version: options.version ?? '1.0.0',
+      description:
+        'Generated from @canadian-plans/contracts Zod schemas. Do not edit by hand — ' +
+        'run `pnpm --filter @canadian-plans/contracts build`.',
+    },
+    servers: [{ url: '/', description: 'Backend origin; all routes are under /api/v1.' }],
+    components: { securitySchemes },
+    paths,
+  };
+}

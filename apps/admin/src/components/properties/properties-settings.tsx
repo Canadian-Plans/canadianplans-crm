@@ -1,0 +1,721 @@
+'use client';
+
+import { useState, type JSX, type KeyboardEvent } from 'react';
+import {
+  PROPERTY_LIMIT,
+  defaultPropertyLayout,
+  leadTypeCatalog,
+  leadTypeLabel,
+  propertyUsageSchema,
+  renderPropertyLayout,
+  type CreateCustomProperty,
+  type PropertyLayout,
+  type PropertyUsage,
+  type SiteProperty,
+  type UpdateProperty,
+} from '@canadian-plans/contracts';
+import {
+  Badge,
+  Button,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  FormField,
+  Input,
+  NativeSelect,
+} from '@canadian-plans/ui';
+
+import {
+  BackendError,
+  createProperty,
+  deleteProperty,
+  savePropertyLayout,
+  updateProperty,
+} from '../../lib/api';
+import { errorReason } from '../../lib/use-resource';
+import { useStaffSession } from '../staff-session-provider';
+import { LayoutEditor } from './layout-editor';
+import { PROPERTY_KIND_LABELS, PropertyEditor } from './property-editor';
+import { usePropertyModel } from './use-property-model';
+import { LoadingSkeleton } from '../crm/loading-skeleton';
+
+const LEAD_TYPES = Object.entries(leadTypeCatalog).map(([key, entry]) => ({
+  key,
+  label: entry.label,
+}));
+
+type Tab = 'properties' | 'layouts';
+const TABS: readonly { id: Tab; label: string }[] = [
+  { id: 'properties', label: 'Properties' },
+  { id: 'layouts', label: 'Layouts' },
+];
+// A plan has no record layout, so its one tab is the plan properties.
+const PLAN_TABS: readonly { id: Tab; label: string }[] = [
+  { id: 'properties', label: 'Plan properties' },
+];
+
+const leadsText = (count: number) => `${count} ${count === 1 ? 'lead' : 'leads'}`;
+
+function detailUsage(error: BackendError): PropertyUsage | undefined {
+  const usage = propertyUsageSchema.safeParse(error.details);
+  return usage.success ? usage.data : undefined;
+}
+
+/**
+ * Where the leads holding a value are, and what each group needs, e.g.
+ * "Used on 5 leads: 2 active, 2 in the archive (restore, clear the value, archive
+ * again), 1 restricted (cannot be edited)". Groups with no lead are left out.
+ */
+function usageText(usage: PropertyUsage): string {
+  const parts: string[] = [];
+  if (usage.active > 0) parts.push(`${usage.active} active`);
+  if (usage.trashed > 0) {
+    parts.push(`${usage.trashed} in the archive (restore, clear the value, archive again)`);
+  }
+  if (usage.restricted > 0) parts.push(`${usage.restricted} restricted (cannot be edited)`);
+  return `${leadsText(usage.leadCount)}: ${parts.join(', ')}`;
+}
+
+/** What went wrong with a write, in words staff can act on. */
+function writeError(
+  error: unknown,
+  subject: 'property' | 'layout',
+  object: 'lead' | 'plan',
+): string {
+  if (error instanceof BackendError) {
+    const usage = detailUsage(error);
+    switch (error.code) {
+      case 'version_conflict':
+        return `Someone else changed this ${subject}. The latest version is loaded.`;
+      case 'property_in_use':
+        if (object === 'plan') {
+          return 'Plans still hold a value for this property. Clear the value on those plans first, or hide the property instead.';
+        }
+        if (usage === undefined) {
+          return 'Leads still hold a value for this property. Clear the value on those leads first, or hide the property instead.';
+        }
+        // A restricted lead can never be cleared, so hiding is then the only way out.
+        return usage.restricted > 0
+          ? `Used on ${usageText(usage)}. Hide the property instead.`
+          : `Used on ${usageText(usage)}. Clear the value on ${usage.leadCount === 1 ? 'that lead' : 'those leads'} first, or hide the property instead.`;
+      case 'property_option_in_use': {
+        const option = error.details?.optionValue;
+        const name = typeof option === 'string' ? option : 'This option';
+        if (object === 'plan') return `${name} is used on plans. Hide it instead of removing it.`;
+        return usage === undefined
+          ? `${name} is used on leads. Hide it instead of removing it.`
+          : `Option ${name} is used on ${usageText(usage)}. Hide it instead of removing it.`;
+      }
+      case 'builtin_property_locked':
+        return 'A built-in property can only be renamed or hidden.';
+      default:
+        break;
+    }
+  }
+  return `The change was not saved. Reason: ${errorReason(error)}.`;
+}
+
+function leadTypesText(property: SiteProperty): string {
+  return property.leadTypes.length === 0
+    ? 'All lead types'
+    : property.leadTypes.map(leadTypeLabel).join(', ');
+}
+
+/**
+ * Settings → Properties: the site's built-in and custom properties, and the
+ * record layout per lead type. Every member can read it; the write controls
+ * show only when the backend says this member can manage properties.
+ *
+ * With `object` 'plan' it is the plan properties instead: custom ones only
+ * (a plan has no built-ins, lead types or layout), each with a _Show on
+ * website_ switch.
+ */
+export function PropertiesSettings({
+  workspaceSlug,
+  object = 'lead',
+}: {
+  workspaceSlug: string;
+  object?: 'lead' | 'plan';
+}): JSX.Element {
+  const staff = useStaffSession();
+  const workspaceId = staff.workspaces.find((item) => item.slug === workspaceSlug)?.id;
+  const accessToken = staff.accessToken;
+  const { model, catalog, reload, error: loadError } = usePropertyModel(workspaceId, object);
+  const isPlan = object === 'plan';
+  const tabs = isPlan ? PLAN_TABS : TABS;
+
+  const [tab, setTab] = useState<Tab>('properties');
+  const [leadType, setLeadType] = useState(LEAD_TYPES[0]?.key ?? 'internet');
+  const [renaming, setRenaming] = useState<{ key: string; label: string }>();
+  const [dialog, setDialog] = useState<{ property?: SiteProperty }>();
+  const [deleting, setDeleting] = useState<SiteProperty>();
+  const [deleteError, setDeleteError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
+  const [pending, setPending] = useState(false);
+  // A save refused because someone else got there first: the editor is rebuilt from the reloaded model
+  // (its epoch changes), so the draft is replaced by the latest saved version and a retry sends its version.
+  const [dialogEpoch, setDialogEpoch] = useState(0);
+  const [dialogNotice, setDialogNotice] = useState<string>();
+  const [layoutEpoch, setLayoutEpoch] = useState(0);
+  const [layoutNotice, setLayoutNotice] = useState<string>();
+
+  const canManage = model?.capabilities.canManage ?? false;
+  const builtins = model?.properties.filter((property) => property.origin === 'builtin') ?? [];
+  const customs = model?.properties.filter((property) => property.origin === 'custom') ?? [];
+
+  // The lead calls keep their original arguments; only a plan's carry the object.
+  const create = (token: string, id: string, input: CreateCustomProperty) =>
+    isPlan ? createProperty(token, id, input, object) : createProperty(token, id, input);
+  const update = (token: string, id: string, key: string, input: UpdateProperty) =>
+    isPlan ? updateProperty(token, id, key, input, object) : updateProperty(token, id, key, input);
+  const remove = (token: string, id: string, key: string) =>
+    isPlan ? deleteProperty(token, id, key, object) : deleteProperty(token, id, key);
+
+  /**
+   * One write, then a reload so the inbox and record read the change. Says why it failed, if it did;
+   * `conflict` means someone else changed it first and the model has been reloaded.
+   */
+  async function write(
+    action: (token: string, id: string) => Promise<unknown>,
+    subject: 'property' | 'layout',
+  ): Promise<{ reason?: string; conflict: boolean }> {
+    if (!accessToken || !workspaceId) {
+      return { reason: 'You are signed out. Sign in again to continue.', conflict: false };
+    }
+    try {
+      await action(accessToken, workspaceId);
+    } catch (caught) {
+      const conflict = caught instanceof BackendError && caught.code === 'version_conflict';
+      if (conflict) await reload();
+      return { reason: writeError(caught, subject, object), conflict };
+    }
+    await reload();
+    return { conflict: false };
+  }
+
+  async function change(property: SiteProperty, body: Omit<UpdateProperty, 'expectedVersion'>) {
+    setNotice(undefined);
+    setPending(true);
+    const { reason } = await write(
+      (token, id) =>
+        update(token, id, property.key, {
+          ...body,
+          expectedVersion: property.version ?? 1,
+        }),
+      'property',
+    );
+    setPending(false);
+    setNotice(reason);
+    return reason;
+  }
+
+  async function saveLabel() {
+    if (!renaming) return;
+    const property = builtins.find((entry) => entry.key === renaming.key);
+    const label = renaming.label.trim();
+    if (!property || label === '') {
+      setNotice('Enter a label.');
+      return;
+    }
+    if (label === property.label) {
+      setRenaming(undefined);
+      return;
+    }
+    const reason = await change(property, { label });
+    if (!reason) setRenaming(undefined);
+  }
+
+  async function saveEditor(input: CreateCustomProperty | UpdateProperty) {
+    const target = dialog?.property;
+    setDialogNotice(undefined);
+    const { reason, conflict } = await write(async (token, id) => {
+      if ('kind' in input) await create(token, id, input);
+      else if (target) await update(token, id, target.key, input);
+    }, 'property');
+    if (conflict) {
+      setDialogNotice(reason);
+      setDialogEpoch((epoch) => epoch + 1);
+      return undefined;
+    }
+    if (!reason) setDialog(undefined);
+    return reason;
+  }
+
+  async function confirmDelete() {
+    if (!deleting) return;
+    setDeleteError(undefined);
+    setPending(true);
+    const key = deleting.key;
+    const { reason } = await write((token, id) => remove(token, id, key), 'property');
+    setPending(false);
+    if (reason) setDeleteError(reason);
+    else setDeleting(undefined);
+  }
+
+  function onTabKey(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+    if (step === 0) return;
+    event.preventDefault();
+    const next = tabs[(index + step + tabs.length) % tabs.length];
+    if (!next) return;
+    setTab(next.id);
+    document.getElementById(`properties-tab-${next.id}`)?.focus();
+  }
+
+  if (!model) {
+    return loadError ? (
+      <p role="alert" className="text-sm text-destructive">
+        The properties could not be loaded. Reason: {loadError}.
+      </p>
+    ) : (
+      <LoadingSkeleton label="Loading the properties…" variant="list" />
+    );
+  }
+
+  // The dialog edits the property as the model has it now, not as it was when the dialog opened.
+  const editing = dialog?.property
+    ? (customs.find((entry) => entry.key === dialog.property?.key) ?? dialog.property)
+    : undefined;
+
+  const layoutRow = model.layouts[leadType];
+  const seeded = defaultPropertyLayout(leadType, catalog);
+  const layoutStart: PropertyLayout =
+    layoutRow?.layout ??
+    (seeded.sections.length > 0
+      ? seeded
+      : { sections: [{ id: 'request', label: 'Request', keys: [] }] });
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div
+        role="tablist"
+        aria-label="Property settings"
+        className="flex gap-1 border-b border-border/70"
+      >
+        {tabs.map((entry, index) => (
+          <button
+            key={entry.id}
+            id={`properties-tab-${entry.id}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === entry.id}
+            aria-controls={`properties-panel-${entry.id}`}
+            tabIndex={tab === entry.id ? 0 : -1}
+            className="-mb-px border-b-2 border-transparent px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground aria-selected:border-foreground aria-selected:text-foreground"
+            onClick={() => setTab(entry.id)}
+            onKeyDown={(event) => onTabKey(event, index)}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'properties' || isPlan ? (
+        <div
+          role="tabpanel"
+          id="properties-panel-properties"
+          aria-labelledby="properties-tab-properties"
+          className="flex flex-col gap-6"
+        >
+          {notice ? (
+            <p role="alert" className="text-xs text-destructive">
+              {notice}
+            </p>
+          ) : null}
+
+          <section
+            aria-labelledby="custom-heading"
+            className="overflow-hidden rounded-xl border border-border/80 bg-card/30"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/70 px-5 py-3.5">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 id="custom-heading" className="text-sm font-medium text-foreground">
+                    Custom properties
+                  </h2>
+                  <Badge variant="secondary" className="text-xs font-normal">
+                    {customs.length} / {PROPERTY_LIMIT}
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {isPlan
+                    ? 'Extra details this site keeps on each plan. Choose which ones the website shows.'
+                    : 'Extra details this site tracks on its leads.'}
+                </p>
+              </div>
+              {canManage ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={customs.length >= PROPERTY_LIMIT}
+                  onClick={() => {
+                    setNotice(undefined);
+                    setDialogNotice(undefined);
+                    setDialog({});
+                  }}
+                >
+                  Add property
+                </Button>
+              ) : null}
+            </div>
+            {customs.length >= PROPERTY_LIMIT ? (
+              <p className="border-b border-border/70 bg-muted/20 px-5 py-2.5 text-xs text-muted-foreground">
+                This site has reached the limit of {PROPERTY_LIMIT} custom properties.
+              </p>
+            ) : null}
+            {customs.length === 0 ? (
+              <p className="px-5 py-8 text-center text-sm text-muted-foreground">
+                No custom properties yet.
+              </p>
+            ) : (
+              <ul aria-label="Custom properties" className="divide-y divide-border/70">
+                {customs.map((property) => (
+                  <li
+                    key={property.key}
+                    className="flex flex-wrap items-center gap-x-3 gap-y-2 px-5 py-3.5 transition-colors hover:bg-muted/20"
+                  >
+                    <div className="mr-auto min-w-0">
+                      <p className="text-sm font-medium text-foreground">
+                        {property.label}
+                        {property.hidden ? (
+                          <Badge variant="secondary" className="ml-2 text-[11px] font-normal">
+                            Hidden
+                          </Badge>
+                        ) : null}
+                        {property.websiteVisible ? (
+                          <Badge variant="outline" className="ml-2 text-[11px] font-normal">
+                            On website
+                          </Badge>
+                        ) : null}
+                        {property.staffOnly ? (
+                          <Badge variant="outline" className="ml-2 text-[11px] font-normal">
+                            Staff only
+                          </Badge>
+                        ) : null}
+                        {property.sensitive ? (
+                          <Badge variant="outline" className="ml-2 text-[11px] font-normal">
+                            Sensitive
+                          </Badge>
+                        ) : null}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {isPlan
+                          ? PROPERTY_KIND_LABELS[property.kind]
+                          : `${PROPERTY_KIND_LABELS[property.kind]} · ${leadTypesText(property)}`}
+                      </p>
+                    </div>
+                    {canManage ? (
+                      <div className="flex gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={pending}
+                          aria-label={`Edit ${property.label}`}
+                          onClick={() => {
+                            setNotice(undefined);
+                            setDialogNotice(undefined);
+                            setDialog({ property });
+                          }}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={pending}
+                          aria-label={`${property.hidden ? 'Show' : 'Hide'} ${property.label}`}
+                          onClick={() => void change(property, { hidden: !property.hidden })}
+                        >
+                          {property.hidden ? 'Show' : 'Hide'}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={pending}
+                          aria-label={`Delete ${property.label}`}
+                          onClick={() => {
+                            setDeleteError(undefined);
+                            setDeleting(property);
+                          }}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {isPlan ? null : (
+            <section
+              aria-labelledby="builtin-heading"
+              className="overflow-hidden rounded-xl border border-border/80 bg-card/30"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/70 px-5 py-3.5">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 id="builtin-heading" className="text-sm font-medium text-foreground">
+                      Built-in properties
+                    </h2>
+                    <Badge variant="secondary" className="text-xs font-normal">
+                      {builtins.length}
+                    </Badge>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    These come with every site. You can rename one or hide it from records, filters
+                    and columns.
+                  </p>
+                </div>
+              </div>
+              <ul aria-label="Built-in properties" className="divide-y divide-border/70">
+                {builtins.map((property) => (
+                  <li
+                    key={property.key}
+                    className="flex flex-wrap items-center gap-x-3 gap-y-2 px-5 py-3 transition-colors hover:bg-muted/20"
+                  >
+                    {renaming?.key === property.key ? (
+                      <div className="flex flex-1 flex-wrap items-center gap-2">
+                        <Input
+                          className="min-w-40 flex-1"
+                          aria-label={`Label for ${property.label}`}
+                          maxLength={80}
+                          value={renaming.label}
+                          onChange={(event) =>
+                            setRenaming({ key: property.key, label: event.target.value })
+                          }
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={pending}
+                          onClick={() => void saveLabel()}
+                        >
+                          Save label
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setRenaming(undefined)}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="mr-auto min-w-0">
+                          <p className="text-sm font-medium text-foreground">
+                            {property.label}
+                            {property.hidden ? (
+                              <Badge variant="secondary" className="ml-2 text-[11px] font-normal">
+                                Hidden
+                              </Badge>
+                            ) : null}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            {PROPERTY_KIND_LABELS[property.kind]} · {leadTypesText(property)}
+                          </p>
+                        </div>
+                        {canManage ? (
+                          <div className="flex gap-1">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              disabled={pending}
+                              aria-label={`Rename ${property.label}`}
+                              onClick={() => {
+                                setNotice(undefined);
+                                setRenaming({ key: property.key, label: property.label });
+                              }}
+                            >
+                              Rename
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              disabled={pending}
+                              aria-label={`${property.hidden ? 'Show' : 'Hide'} ${property.label}`}
+                              onClick={() => void change(property, { hidden: !property.hidden })}
+                            >
+                              {property.hidden ? 'Show' : 'Hide'}
+                            </Button>
+                          </div>
+                        ) : null}
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
+      ) : (
+        <div
+          role="tabpanel"
+          id="properties-panel-layouts"
+          aria-labelledby="properties-tab-layouts"
+          className="flex flex-col gap-5"
+        >
+          <div className="overflow-hidden rounded-xl border border-border/80 bg-card/30">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/70 px-5 py-3.5">
+              <div>
+                <h2 className="text-sm font-medium text-foreground">Record layout</h2>
+                <p className="text-xs text-muted-foreground">
+                  How a lead&rsquo;s details are grouped on its record page, for each lead type.
+                </p>
+              </div>
+              <div className="w-56">
+                <FormField id="layout-lead-type" label="Lead type">
+                  <NativeSelect
+                    value={leadType}
+                    onChange={(event) => {
+                      setLeadType(event.target.value);
+                      setLayoutNotice(undefined);
+                    }}
+                  >
+                    {LEAD_TYPES.map((entry) => (
+                      <option key={entry.key} value={entry.key}>
+                        {entry.label}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                </FormField>
+              </div>
+            </div>
+            <div className="p-5">
+              {layoutNotice ? (
+                <p role="alert" className="mb-4 text-xs text-destructive">
+                  {layoutNotice}
+                </p>
+              ) : null}
+              {canManage ? (
+                <LayoutEditor
+                  key={`${leadType}:${layoutEpoch}`}
+                  leadType={leadType}
+                  initial={layoutStart}
+                  catalog={catalog}
+                  onSave={async (layout) => {
+                    setLayoutNotice(undefined);
+                    const { reason, conflict } = await write(
+                      (token, id) =>
+                        savePropertyLayout(token, id, leadType, {
+                          layout,
+                          ...(layoutRow && layoutRow.version > 0
+                            ? { expectedVersion: layoutRow.version }
+                            : {}),
+                        }),
+                      'layout',
+                    );
+                    if (conflict) {
+                      setLayoutNotice(reason);
+                      setLayoutEpoch((epoch) => epoch + 1);
+                      return undefined;
+                    }
+                    return reason;
+                  }}
+                />
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {renderPropertyLayout(layoutStart, leadType, catalog).map((section) => (
+                    <section
+                      key={section.id}
+                      className="rounded-xl border border-border/70 bg-background/50 p-4"
+                    >
+                      <h3 className="text-sm font-medium text-foreground">{section.label}</h3>
+                      {section.properties.length === 0 ? (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Nothing in this section.
+                        </p>
+                      ) : (
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
+                          {section.properties.map((property) => (
+                            <li key={property.key}>{property.label}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Dialog open={dialog !== undefined} onOpenChange={(open) => !open && setDialog(undefined)}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{dialog?.property ? 'Edit property' : 'Add property'}</DialogTitle>
+            <DialogDescription>
+              {isPlan
+                ? dialog?.property
+                  ? 'Change how this property is labelled and whether the website shows it.'
+                  : 'A plan property adds a detail staff can fill in on each plan.'
+                : dialog?.property
+                  ? 'Change how this property is labelled and where it applies.'
+                  : 'A custom property adds a detail staff can fill in on a lead.'}
+            </DialogDescription>
+          </DialogHeader>
+          {dialogNotice ? (
+            <p role="alert" className="text-sm text-destructive">
+              {dialogNotice}
+            </p>
+          ) : null}
+          {dialog ? (
+            <PropertyEditor
+              key={`${dialog.property?.key ?? 'new'}:${dialogEpoch}`}
+              {...(editing ? { initial: editing } : {})}
+              object={object}
+              leadTypes={LEAD_TYPES}
+              onSave={saveEditor}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={deleting !== undefined}
+        onOpenChange={(open) => !open && setDeleting(undefined)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {deleting?.label}?</DialogTitle>
+            <DialogDescription>
+              {isPlan
+                ? 'The property is removed from every plan. It can be deleted only when no plan holds a value for it; hide it to keep the values.'
+                : 'The property is removed from every record page and layout. It can be deleted only when no lead holds a value for it; hide it to keep the values.'}
+            </DialogDescription>
+          </DialogHeader>
+          {deleteError ? (
+            <p role="alert" className="text-sm text-destructive">
+              {deleteError}
+            </p>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setDeleting(undefined)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={pending}
+              onClick={() => void confirmDelete()}
+            >
+              Delete property
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

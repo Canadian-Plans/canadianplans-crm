@@ -1,0 +1,1219 @@
+import { createAiAutomationRoutes } from './ai-automations.js';
+import { createAutomationTools, AUTOMATION_TOOL_NAMES } from '../ai/automation-tools.js';
+import type { AutomationAuthoringStore } from '../ai/automation-authoring.js';
+import type { FlowStore } from '../automations/flow-store.js';
+import { AISDKError, tool, createUIMessageStream, pipeUIMessageStreamToResponse } from 'ai';
+import { AssistantProviderError } from '../ai/engine.js';
+import { aiActionRootId, createActionProposalTools, verifyAiAction } from '../ai/actions.js';
+import { signAssistantTurn, trustedHistory } from '../ai/history.js';
+import type { LeadWorkStore } from '../leads/work-store.js';
+import type { AiTurnStore } from '../ai/turn-store.js';
+import { Router, type Request, type Response } from 'express';
+import {
+  reviseAiActionRequestSchema,
+  aiFollowUpSchema,
+  aiAutomationProposalSchema,
+  aiActionProposalSchema,
+  aiAssistantHistoryText,
+  type AiFollowUp,
+  AI_ASSISTANT_LIMITS,
+  aiCapabilitiesResponseSchema,
+  confirmAiActionRequestSchema,
+  confirmAiActionResponseSchema,
+  aiChatRequestSchema,
+  aiStreamPartSchema,
+  type AiCapabilitiesResponse,
+  type AiChatRequest,
+  type AiStreamPart,
+  leadStageLabel,
+  leadTypeLabel,
+} from '@canadian-plans/contracts';
+import type { RateLimitInput, RateLimitResult } from '@canadian-plans/db';
+import { z } from 'zod';
+
+import { sendDomainError } from '../http/domain-errors.js';
+import { sendLeadUpdateRefusal } from '../http/lead-update-errors.js';
+import { sendStaffAuthError } from '../http/staff-errors.js';
+import {
+  decideAccess,
+  denyReasonOf,
+  type AuthorizationDenyReason,
+  type StaffAccessSnapshot,
+} from '../staff/authorization.js';
+import type { VerifiedStaffSession } from '../auth/session.js';
+import type { AiAssistantConfig } from '../ai/config.js';
+import type { AssistantEngine } from '../ai/engine.js';
+import { logAiTurn, type AiTurnLog } from '../ai/logging.js';
+import { TurnBudget } from '../ai/limits.js';
+import { buildSystemPrompt, openLeadDataBlock, AI_PROMPT_VERSION } from '../ai/prompt.js';
+import { serializedBytes } from '../ai/projections.js';
+import type { AiReadService } from '../ai/read-service.js';
+import type { AiSiteContextStore } from '../ai/site-context.js';
+import { SourceRegistry } from '../ai/sources.js';
+import {
+  AssistantAccessRevokedError,
+  TOOL_NAMES,
+  createAssistantTools,
+  type AssistantToolset,
+  type ToolName,
+} from '../ai/tools.js';
+import { businessDayLabel, AI_BUSINESS_TIME_ZONE } from '../ai/windows.js';
+import type { ReportStore } from '../reports/store.js';
+import type { Scope } from '../tenant-scope.js';
+import type { PlanRouteDependencies } from './plans.js';
+
+/**
+ * The staff AI assistant's HTTP surface: reads, signed drafts, and explicit confirmation. Answers two
+ * questions — "is this available for me here?" and "answer this" — with all
+ * authority derived on the server: the session names the actor, the route names
+ * the site, and a live membership read decides both, again before every tool and
+ * once more before the answer is released.
+ */
+
+/** The actions that, together with `workspace.read`, let a member use the assistant. */
+const DETAIL_ACTIONS = ['lead.manage', 'order.manage', 'financial.read'] as const;
+
+export type AiAccessRefusal = {
+  readonly allowed: false;
+  readonly reason: AuthorizationDenyReason | 'assistant_not_permitted';
+};
+
+export type AiAccessGrant = { readonly allowed: true; readonly access: StaffAccessSnapshot };
+
+/**
+ * The assistant's own access policy, expressed with the existing decision
+ * function rather than a second role table: an active site membership, plus at
+ * least one action that already reveals lead detail. A viewer, content or
+ * partner member keeps the dashboard; the assistant is not an aggregate-only
+ * side door for them.
+ */
+export function decideAiAccess(
+  access: StaffAccessSnapshot | undefined,
+): AiAccessGrant | AiAccessRefusal {
+  const read = decideAccess(access, 'workspace.read');
+  if (!read.allowed) return { allowed: false, reason: denyReasonOf(read) };
+  const detail = DETAIL_ACTIONS.some((action) => decideAccess(access, action).allowed);
+  if (!detail) return { allowed: false, reason: 'assistant_not_permitted' };
+  return { allowed: true, access: read.access };
+}
+
+/** Progress labels: fixed words per tool, never the model's own narration. */
+const PROGRESS_LABELS: Record<ToolName, string> = {
+  getSiteOverview: 'Checking lead counts',
+  findLeads: 'Searching leads',
+  getLeadSummary: 'Reading the lead',
+  listOpenTasks: 'Checking follow-ups',
+  getSourcePerformance: 'Reading the source report',
+};
+
+const TOOL_NAME_SET: ReadonlySet<string> = new Set(TOOL_NAMES);
+
+/** Narrows a model-supplied tool name to one this route actually offers. */
+function isToolName(value: string): value is ToolName {
+  return TOOL_NAME_SET.has(value);
+}
+
+export interface AiAssistantRouteDependencies {
+  automationAuthoring?: AutomationAuthoringStore;
+  flows?: FlowStore;
+  work?: Pick<
+    LeadWorkStore,
+    | 'addNote'
+    | 'createTask'
+    | 'queueAiEmail'
+    | 'previewAiEmail'
+    | 'previewAiLeadUpdate'
+    | 'confirmAiLeadUpdate'
+    | 'aiCardOf'
+  >;
+  listAssignees?: (scope: Scope) => Promise<{ actorId: string; displayName: string | null }[]>;
+  config: AiAssistantConfig;
+  /** The actor's live membership in the site; the same read the staff router uses. */
+  loadAccess(actorId: string, workspaceId: string): Promise<StaffAccessSnapshot | undefined>;
+  siteContext: AiSiteContextStore;
+  /** The projection-aware reads behind the tools. */
+  reads: AiReadService;
+  /** The existing source report, reused unchanged for the source tool. */
+  reports: ReportStore;
+  /** Absent when the deployment is not configured: the chat then answers unavailable. */
+  engine?: AssistantEngine;
+  /** The distributed limiter; a failure to reach it refuses the request. */
+  rateLimit(input: RateLimitInput): Promise<RateLimitResult>;
+  /** Where each turn's usage is recorded; absent in tests that do not check it. */
+  turns?: AiTurnStore;
+  now?: () => Date;
+  reportFailure: PlanRouteDependencies['reportFailure'];
+}
+
+function session(req: { staffSession?: VerifiedStaffSession }): VerifiedStaffSession | undefined {
+  return req.staffSession;
+}
+
+function sendRefusal(res: Response, requestId: string, reason: AiAccessRefusal['reason']): void {
+  if (reason === 'assistant_not_permitted') {
+    sendStaffAuthError(res, requestId, 'permission_denied', 403);
+    return;
+  }
+  sendStaffAuthError(res, requestId, reason, 403);
+}
+
+function capabilityDocument(
+  site: { siteId: string; slug: string; name: string; leadTypes: readonly string[] },
+  requestId: string,
+  unavailable?: AiCapabilitiesResponse['reason'],
+  canAct = false,
+  automationAuthoring = false,
+): AiCapabilitiesResponse {
+  return aiCapabilitiesResponseSchema.parse({
+    available: unavailable === undefined,
+    ...(automationAuthoring ? { automationAuthoring: true } : {}),
+    actions: canAct && unavailable === undefined ? ['task', 'note', 'email', 'lead_update'] : [],
+    ...(unavailable === undefined ? {} : { reason: unavailable }),
+    site: { id: site.siteId, slug: site.slug, name: site.name },
+    leadTypes: [...site.leadTypes],
+    limits: {
+      maxMessageChars: AI_ASSISTANT_LIMITS.maxMessageChars,
+      maxHistoryMessages: AI_ASSISTANT_LIMITS.maxHistoryMessages,
+      maxConversationChars: AI_ASSISTANT_LIMITS.maxConversationChars,
+    },
+    requestId,
+  });
+}
+
+/**
+ * Request-size guards the schema cannot express: total conversation characters
+ * and the serialized byte ceiling of the whole body (the global JSON limit stays
+ * 64 KiB and is not widened).
+ */
+function withinRequestLimits(body: AiChatRequest): boolean {
+  const characters =
+    Array.from(body.message).length +
+    body.history.reduce((total, message) => total + Array.from(message.text).length, 0);
+  return (
+    characters <= AI_ASSISTANT_LIMITS.maxConversationChars &&
+    serializedBytes(body) <= AI_ASSISTANT_LIMITS.maxRequestBytes
+  );
+}
+
+/**
+ * In-flight answer streams, so a graceful shutdown can cancel them instead of
+ * holding sockets until the platform kills the process. Aborting a turn here is
+ * the same signal a browser disconnect sends: the model call stops and the
+ * response ends.
+ */
+const activeTurns = new Set<AbortController>();
+
+/** Aborts every in-flight assistant turn; called by the shutdown handler. */
+export function abortActiveAssistantTurns(): void {
+  for (const controller of activeTurns) controller.abort();
+}
+
+/** Ends waiting promptly; database statements retain their own server deadline. */
+async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw new AssistantProviderError('cancelled');
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new AssistantProviderError('cancelled'));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Members a lead-update preview may list: the contract's 100 choices, Unassigned included. */
+const AI_ASSIGNEE_CHOICES_MAX = 99;
+
+/** Confirm and revise requests per member per site per minute (CHAT-9). */
+const AI_CARD_REQUESTS_PER_MINUTE = 30;
+
+/** CHAT-12: what the panel says while an action or automation tool runs. */
+const CARD_PROGRESS_LABELS: Readonly<Record<string, string>> = {
+  prepareNote: 'Preparing a note for review',
+  prepareTask: 'Preparing a task for review',
+  prepareEmail: 'Preparing an email for review',
+  getLeadUpdateOptions: 'Checking the lead’s choices',
+  prepareLeadUpdate: 'Preparing a lead change for review',
+  listAutomations: 'Reading the automations',
+  getAutomation: 'Reading the automation',
+  getAutomationCatalog: 'Checking what automations can use',
+  getAutomationRuns: 'Reading recent runs',
+  proposeAutomationCreate: 'Drafting an automation for review',
+  proposeAutomationEdit: 'Drafting automation changes for review',
+  askFollowUp: 'Preparing a question',
+};
+
+/** The longest text part the stream sends; a longer provider chunk is split. */
+const AI_TEXT_PART_CHARS = 8_000;
+
+/** How long a chat request id stays claimed in the shared limiter. */
+export const AI_REPLAY_WINDOW_SECONDS = 3600;
+
+/**
+ * What the error tracker receives for a failed assistant request. A provider
+ * error is reported by a fixed code (its body could carry prompt text); any
+ * other failure (a database, schema or programming error) is reported as
+ * itself, so it stays diagnosable. The tracker scrubs the message either way.
+ */
+export function reportableAssistantError(error: unknown, code: string): unknown {
+  if (error instanceof AssistantProviderError || AISDKError.isInstance(error)) {
+    return new Error(code);
+  }
+  return error;
+}
+
+export function createAiAssistantRoutes(dependencies: AiAssistantRouteDependencies): Router {
+  const router = Router();
+
+  /**
+   * CHAT-9: confirm and revise get a per-member budget like the chat's, so an
+   * office behind one address does not share the staff limiter's. True when
+   * the request was refused (the limiter said no, or could not be reached).
+   */
+  async function cardLimitRefused(
+    req: Request,
+    res: Response,
+    workspaceId: string,
+    actorId: string,
+  ): Promise<boolean> {
+    let limit: RateLimitResult;
+    try {
+      limit = await dependencies.rateLimit({
+        bucketKey: `ai_card:${actorId}:${workspaceId}`,
+        windowSeconds: 60,
+        maxCount: AI_CARD_REQUESTS_PER_MINUTE,
+      });
+    } catch (error) {
+      dependencies.reportFailure(req, error);
+      sendDomainError(res, req.id, 'ai_unavailable', 503);
+      return true;
+    }
+    if (limit.allowed) return false;
+    res.setHeader('retry-after', String(limit.retryAfterSeconds));
+    sendDomainError(res, req.id, 'ai_rate_limited', 429);
+    return true;
+  }
+  const previewEmail = dependencies.work?.previewAiEmail?.bind(dependencies.work);
+  const leadUpdatePreview = async (
+    scope: Scope,
+    leadId: string,
+    field: import('../leads/work-store.js').AiLeadUpdateDraft['field'],
+    options: { search?: string; limit?: number } = {},
+  ) => {
+    const preview = await dependencies.work?.previewAiLeadUpdate?.({ ...scope, leadId, field });
+    if (!preview) return undefined;
+    if (field === 'assignedActorId') {
+      // ACT-4: every active member, labelled; the model's list is narrowed by
+      // a name search and capped, but a card may name any of them, and the
+      // current assignee is never called "Former" while still a member.
+      const all = ((await dependencies.listAssignees?.(scope)) ?? []).map((member) => ({
+        value: member.actorId,
+        label: member.displayName || (member.actorId === scope.actorId ? 'You' : 'Unnamed member'),
+      }));
+      const needle = options.search?.normalize('NFKC').trim().toLowerCase();
+      const matching = needle
+        ? all.filter((choice) => choice.label.normalize('NFKC').toLowerCase().includes(needle))
+        : all;
+      const limit = Math.min(options.limit ?? AI_ASSIGNEE_CHOICES_MAX, AI_ASSIGNEE_CHOICES_MAX);
+      preview.choices = [{ value: null, label: 'Unassigned' }, ...matching.slice(0, limit)];
+      preview.beforeLabel =
+        preview.before === null
+          ? 'Unassigned'
+          : (all.find((choice) => choice.value === preview.before)?.label ?? 'Former member');
+    }
+    return preview;
+  };
+  const now = () => (dependencies.now ?? (() => new Date()))();
+  // One guard per router (one per process): a duplicate request id inside a
+  // minute is refused rather than spending a second turn's budget.
+
+  // Nothing the assistant answers may be cached — refusals included.
+  router.use((req, res, next) => {
+    if (req.path.includes('/ai/')) res.setHeader('cache-control', 'no-store');
+    next();
+  });
+
+  router.use(createAiAutomationRoutes(dependencies));
+
+  async function refuseDisabled(res: Response, requestId: string): Promise<void> {
+    sendDomainError(res, requestId, 'ai_unavailable', 503);
+  }
+
+  router.get('/workspaces/:workspaceId/ai/capabilities', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const actor = session(req);
+    if (!workspaceId.success || !actor) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const access = await dependencies.loadAccess(actor.actorId, workspaceId.data);
+      const decision = decideAiAccess(access);
+      if (!decision.allowed) {
+        sendRefusal(res, req.id, decision.reason);
+        return;
+      }
+
+      const site = await dependencies.siteContext.siteContext({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+      });
+      if (!site) {
+        sendStaffAuthError(res, req.id, 'workspace_not_found', 404);
+        return;
+      }
+
+      if (!dependencies.config.enabled) {
+        res.setHeader('cache-control', 'no-store');
+        res.json(capabilityDocument(site, req.id, dependencies.config.reason ?? 'disabled'));
+        return;
+      }
+      if (!dependencies.config.workspaceIds.has(workspaceId.data)) {
+        res.setHeader('cache-control', 'no-store');
+        res.json(capabilityDocument(site, req.id, 'site_not_enabled'));
+        return;
+      }
+
+      res.setHeader('cache-control', 'no-store');
+      res.json(
+        capabilityDocument(
+          site,
+          req.id,
+          undefined,
+          Boolean(
+            dependencies.work &&
+            dependencies.config.signingKey &&
+            decideAccess(access, 'lead.manage').allowed,
+          ),
+          Boolean(
+            dependencies.automationAuthoring &&
+            dependencies.flows &&
+            dependencies.config.automationWorkspaceIds?.has(workspaceId.data) &&
+            decideAccess(access, 'integration.manage').allowed,
+          ),
+        ),
+      );
+    } catch (error) {
+      dependencies.reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/ai/actions/revise', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const actor = session(req);
+    const body = reviseAiActionRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !actor || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const access = await dependencies.loadAccess(actor.actorId, workspaceId.data);
+      if (
+        !decideAccess(access, 'workspace.read').allowed ||
+        !decideAccess(access, 'lead.manage').allowed
+      ) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const config = dependencies.config;
+      if (!config.enabled || !config.signingKey || !config.workspaceIds.has(workspaceId.data)) {
+        sendDomainError(res, req.id, 'ai_unavailable', 503);
+        return;
+      }
+      if (await cardLimitRefused(req, res, workspaceId.data, actor.actorId)) return;
+      const scope = { workspaceId: workspaceId.data, actorId: actor.actorId };
+      const original = verifyAiAction(body.data.token, config.signingKey, scope, now());
+      if (
+        !original ||
+        original.draft.kind !== body.data.draft.kind ||
+        original.draft.leadId !== body.data.draft.leadId ||
+        (original.draft.kind === 'lead_update' &&
+          body.data.draft.kind === 'lead_update' &&
+          original.draft.field !== body.data.draft.field)
+      ) {
+        sendStaffAuthError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+      const site = await dependencies.siteContext.siteContext(scope);
+      if (!site) {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      const tools = createActionProposalTools({
+        scope,
+        site,
+        key: config.signingKey,
+        // The new card is a version of the same draft: it saves under one id.
+        rootId: aiActionRootId(original),
+        leadUpdatePreview: (leadId, field) => leadUpdatePreview(scope, leadId, field),
+        reads: dependencies.reads,
+        emailPreview: previewEmail
+          ? (leadId) => previewEmail({ ...scope, leadId, requestId: req.id })
+          : undefined,
+        loadAccess: () => dependencies.loadAccess(actor.actorId, scope.workspaceId),
+        now,
+        budget: new TurnBudget(),
+      });
+      const { kind, ...draft } = body.data.draft;
+      await tools.execute(
+        kind === 'note'
+          ? 'prepareNote'
+          : kind === 'task'
+            ? 'prepareTask'
+            : kind === 'email'
+              ? 'prepareEmail'
+              : 'prepareLeadUpdate',
+        draft,
+      );
+      const proposal = tools.proposals[0];
+      if (!proposal) {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      const finalAccess = await dependencies.loadAccess(actor.actorId, scope.workspaceId);
+      if (
+        !decideAccess(finalAccess, 'workspace.read').allowed ||
+        !decideAccess(finalAccess, 'lead.manage').allowed
+      ) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      res.json(proposal);
+    } catch (error) {
+      dependencies.reportFailure(req, reportableAssistantError(error, 'assistant_revision_failed'));
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/ai/actions/confirm', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const actor = session(req);
+    const body = confirmAiActionRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !actor || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const access = await dependencies.loadAccess(actor.actorId, workspaceId.data);
+      if (
+        !decideAccess(access, 'workspace.read').allowed ||
+        !decideAccess(access, 'lead.manage').allowed
+      ) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const config = dependencies.config;
+      if (
+        !config.enabled ||
+        !config.signingKey ||
+        !config.workspaceIds.has(workspaceId.data) ||
+        !dependencies.work
+      ) {
+        sendDomainError(res, req.id, 'ai_unavailable', 503);
+        return;
+      }
+      if (await cardLimitRefused(req, res, workspaceId.data, actor.actorId)) return;
+      const scope = { workspaceId: workspaceId.data, actorId: actor.actorId };
+      const action = verifyAiAction(body.data.token, config.signingKey, scope, now());
+      if (!action) {
+        sendDomainError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+      // Every version of one draft saves under its first card's id, so the
+      // draft saves once; the saved record says which card did it.
+      const rootId = aiActionRootId(action);
+      const work = dependencies.work;
+      /** True (and answered) when another version of this draft was already saved. */
+      const superseded = async (): Promise<boolean> => {
+        const savedBy = await work.aiCardOf?.({ ...scope, rootId });
+        if (!savedBy || savedBy === action.id) return false;
+        sendDomainError(res, req.id, 'conflict', 409, { reason: 'superseded' });
+        return true;
+      };
+      if (action.draft.kind === 'lead_update') {
+        if (!dependencies.work.confirmAiLeadUpdate || action.leadUpdateBefore === undefined) {
+          sendDomainError(res, req.id, 'ai_unavailable', 503);
+          return;
+        }
+        const outcome = await dependencies.work.confirmAiLeadUpdate({
+          ...scope,
+          requestId: req.id,
+          draft: action.draft,
+          creationId: rootId,
+          aiCardId: action.id,
+          before: action.leadUpdateBefore,
+        });
+        if (outcome.status === 'refused') {
+          // The same answer a staff edit gets: which detail or documents the
+          // move still needs, or which moves are allowed — never "conflict".
+          sendLeadUpdateRefusal(res, req.id, outcome.refusal);
+          return;
+        }
+        if (outcome.status === 'invalid') {
+          sendDomainError(res, req.id, 'validation_error', 400, { field: action.draft.field });
+          return;
+        }
+        if (outcome.status !== 'saved') {
+          sendDomainError(
+            res,
+            req.id,
+            outcome.status === 'not_found'
+              ? 'lead_not_found'
+              : outcome.status === 'trashed'
+                ? 'lead_trashed'
+                : 'conflict',
+            outcome.status === 'not_found' ? 404 : 409,
+          );
+          return;
+        }
+        if (await superseded()) return;
+        res.json(
+          confirmAiActionResponseSchema.parse({
+            status: 'saved',
+            actionId: action.id,
+            kind: 'lead_update',
+            recordId: outcome.recordId,
+            requestId: req.id,
+          }),
+        );
+        return;
+      }
+      if (action.draft.kind === 'email') {
+        if (!dependencies.work.queueAiEmail || !action.emailContext) {
+          sendDomainError(res, req.id, 'ai_unavailable', 503);
+          return;
+        }
+        const outcome = await dependencies.work.queueAiEmail({
+          ...scope,
+          requestId: req.id,
+          leadId: action.draft.leadId,
+          creationId: rootId,
+          aiCardId: action.id,
+          draft: action.draft,
+          emailContext: action.emailContext,
+        });
+        if (outcome.status !== 'queued') {
+          sendDomainError(
+            res,
+            req.id,
+            outcome.status === 'not_found'
+              ? 'lead_not_found'
+              : outcome.status === 'trashed'
+                ? 'lead_trashed'
+                : outcome.status === 'changed'
+                  ? 'conflict'
+                  : 'feature_not_ready',
+            outcome.status === 'not_found' ? 404 : 409,
+          );
+          return;
+        }
+        if (await superseded()) return;
+        res.json(
+          confirmAiActionResponseSchema.parse({
+            status: 'saved',
+            actionId: action.id,
+            kind: 'email',
+            recordId: outcome.recordId,
+            requestId: req.id,
+          }),
+        );
+        return;
+      }
+      const input = {
+        ...scope,
+        requestId: req.id,
+        leadId: action.draft.leadId,
+        creationId: rootId,
+        aiCardId: action.id,
+      };
+      const outcome =
+        action.draft.kind === 'note'
+          ? await dependencies.work.addNote({ ...input, body: action.draft.body })
+          : await dependencies.work.createTask({
+              ...input,
+              title: action.draft.title,
+              dueAt: action.draft.dueDate === null ? null : `${action.draft.dueDate}T12:00:00.000Z`,
+              assignedActorId: action.draft.assignee === 'me' ? actor.actorId : null,
+            });
+      if (outcome.status === 'not_found') {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      if (outcome.status === 'trashed') {
+        sendDomainError(res, req.id, 'lead_trashed', 409);
+        return;
+      }
+      if (outcome.status === 'assignee_not_found') {
+        sendDomainError(res, req.id, 'assignee_not_found', 409);
+        return;
+      }
+      if (await superseded()) return;
+      res.json(
+        confirmAiActionResponseSchema.parse({
+          status: 'saved',
+          actionId: action.id,
+          kind: action.draft.kind,
+          recordId:
+            outcome.status === 'created'
+              ? outcome.activity.id
+              : outcome.status === 'saved'
+                ? outcome.task.id
+                : undefined,
+          requestId: req.id,
+        }),
+      );
+    } catch (error) {
+      dependencies.reportFailure(req, reportableAssistantError(error, 'assistant_action_failed'));
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/ai/chat', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const actor = session(req);
+    const parsed = aiChatRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !actor || !parsed.success || !withinRequestLimits(parsed.data)) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    const body = parsed.data;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    activeTurns.add(controller);
+    let timedOut = false;
+    let clientGone = false;
+    let revoked = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, AI_ASSISTANT_LIMITS.requestTimeoutMs);
+    const onClose = () => {
+      if (!res.writableEnded) {
+        clientGone = true;
+        controller.abort();
+      }
+    };
+    res.on('close', onClose);
+    const wait = <T>(work: Promise<T>) => abortable(work, controller.signal);
+
+    try {
+      const access = await wait(dependencies.loadAccess(actor.actorId, workspaceId.data));
+      const decision = decideAiAccess(access);
+      if (!decision.allowed) {
+        sendRefusal(res, req.id, decision.reason);
+        return;
+      }
+      if (!dependencies.config.enabled || !dependencies.engine) {
+        await refuseDisabled(res, req.id);
+        return;
+      }
+      if (!dependencies.config.workspaceIds.has(workspaceId.data)) {
+        await refuseDisabled(res, req.id);
+        return;
+      }
+
+      const site = await wait(
+        dependencies.siteContext.siteContext({
+          workspaceId: workspaceId.data,
+          actorId: actor.actorId,
+        }),
+      );
+      if (!site) {
+        sendStaffAuthError(res, req.id, 'workspace_not_found', 404);
+        return;
+      }
+
+      // Distributed budgets first: per actor and per site. A limiter that cannot
+      // be reached refuses the request rather than letting usage go unbounded.
+      let actorLimit: RateLimitResult;
+      let siteLimit: RateLimitResult;
+      let siteDayLimit: RateLimitResult;
+      try {
+        actorLimit = await wait(
+          dependencies.rateLimit({
+            bucketKey: `ai_actor:${actor.actorId}:${workspaceId.data}`,
+            windowSeconds: 60,
+            maxCount: AI_ASSISTANT_LIMITS.perActorPerMinute,
+          }),
+        );
+        siteLimit = await wait(
+          dependencies.rateLimit({
+            bucketKey: `ai_site:${workspaceId.data}`,
+            windowSeconds: 60,
+            maxCount: AI_ASSISTANT_LIMITS.perSitePerMinute,
+          }),
+        );
+        // A daily ceiling per site stops a runaway site inside the CRM, beside
+        // the Gateway's own spend budget.
+        siteDayLimit = await wait(
+          dependencies.rateLimit({
+            bucketKey: `ai_site_day:${workspaceId.data}`,
+            windowSeconds: 86_400,
+            maxCount: AI_ASSISTANT_LIMITS.perSitePerDay,
+          }),
+        );
+      } catch (error) {
+        dependencies.reportFailure(req, error);
+        await refuseDisabled(res, req.id);
+        return;
+      }
+      if (!actorLimit.allowed || !siteLimit.allowed || !siteDayLimit.allowed) {
+        const retryAfter = Math.max(
+          actorLimit.retryAfterSeconds,
+          siteLimit.retryAfterSeconds,
+          siteDayLimit.retryAfterSeconds,
+        );
+        res.setHeader('retry-after', String(retryAfter));
+        sendDomainError(res, req.id, 'ai_rate_limited', 429);
+        return;
+      }
+
+      // A duplicate client request id is the same question twice (two tabs, a
+      // retried fetch): refuse it instead of spending a second turn. The claim
+      // lives in the shared limiter so every replica sees it. Request ids are
+      // fresh UUIDs, so an hour-long window costs nothing legitimate.
+      let replayClaim: RateLimitResult;
+      try {
+        replayClaim = await wait(
+          dependencies.rateLimit({
+            bucketKey: `ai_replay:${actor.actorId}:${workspaceId.data}:${body.requestId}`,
+            windowSeconds: AI_REPLAY_WINDOW_SECONDS,
+            maxCount: 1,
+          }),
+        );
+      } catch (error) {
+        dependencies.reportFailure(req, error);
+        await refuseDisabled(res, req.id);
+        return;
+      }
+      if (!replayClaim.allowed) {
+        sendDomainError(res, req.id, 'conflict', 409);
+        return;
+      }
+
+      const turnStarted = now();
+      const scope: Scope = { workspaceId: workspaceId.data, actorId: actor.actorId };
+      const budget = new TurnBudget();
+      const actionTools =
+        dependencies.work &&
+        dependencies.config.signingKey &&
+        decideAccess(access, 'lead.manage').allowed
+          ? createActionProposalTools({
+              scope,
+              site,
+              key: dependencies.config.signingKey,
+              leadUpdatePreview: (leadId, field, options) =>
+                wait(leadUpdatePreview(scope, leadId, field, options)),
+              reads: dependencies.reads,
+              emailPreview: previewEmail
+                ? (leadId) => wait(previewEmail({ ...scope, leadId, requestId: req.id }))
+                : undefined,
+              loadAccess: () => wait(dependencies.loadAccess(actor.actorId, workspaceId.data)),
+              now,
+              budget,
+            })
+          : undefined;
+      const automationTools =
+        dependencies.automationAuthoring &&
+        dependencies.flows &&
+        dependencies.config.signingKey &&
+        dependencies.config.automationWorkspaceIds?.has(scope.workspaceId) &&
+        decideAccess(access, 'integration.manage').allowed
+          ? createAutomationTools({
+              scope,
+              site,
+              key: dependencies.config.signingKey,
+              flows: dependencies.flows,
+              store: dependencies.automationAuthoring,
+              loadAccess: () => wait(dependencies.loadAccess(actor.actorId, workspaceId.data)),
+              now,
+              budget,
+            })
+          : undefined;
+      const sources = new SourceRegistry({
+        workspaceSlug: site.slug,
+        asOf: turnStarted,
+      });
+
+      let toolset: AssistantToolset;
+      try {
+        toolset = createAssistantTools({
+          scope,
+          site,
+          now: turnStarted,
+          budget,
+          sources,
+          reads: dependencies.reads,
+          reports: dependencies.reports,
+          loadAccess: () => wait(dependencies.loadAccess(actor.actorId, workspaceId.data)),
+          signal: controller.signal,
+          onAccessRevoked: () => {
+            revoked = true;
+            controller.abort();
+          },
+        });
+      } catch (error) {
+        dependencies.reportFailure(req, error);
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+        return;
+      }
+
+      const engine = dependencies.engine;
+      const stream = createUIMessageStream({
+        execute: async ({ writer }) => {
+          // The answer as the client will hold it, for its history signature.
+          let answered = '';
+          const writePart = (part: AiStreamPart) => {
+            if (part.type === 'text') {
+              answered += part.text;
+              // CHAT-11: a provider chunk over the part limit goes out in pieces.
+              const characters = Array.from(part.text);
+              for (let at = 0; at < characters.length; at += AI_TEXT_PART_CHARS) {
+                writer.write({
+                  type: 'data-assistant',
+                  data: aiStreamPartSchema.parse({
+                    type: 'text',
+                    text: characters.slice(at, at + AI_TEXT_PART_CHARS).join(''),
+                  }),
+                  transient: true,
+                });
+              }
+              return;
+            }
+            writer.write({
+              type: 'data-assistant',
+              data: aiStreamPartSchema.parse(part),
+              transient: true,
+            });
+          };
+          // CHAT-2: the finished answer is signed so the next turn can replay it.
+          const writeDone = () => {
+            const key = dependencies.config.signingKey;
+            writePart({
+              type: 'done',
+              ...(key === undefined
+                ? {}
+                : {
+                    signature: signAssistantTurn(
+                      key,
+                      scope,
+                      aiAssistantHistoryText({ text: answered, followUp }),
+                    ),
+                  }),
+            });
+          };
+          writePart({ type: 'progress', label: 'Getting ready' });
+
+          const leadHint =
+            body.context === undefined
+              ? undefined
+              : await wait(dependencies.reads.leadHint(scope, body.context.leadId)).catch(
+                  () => undefined,
+                );
+          let followUp: AiFollowUp | undefined;
+          const guide = async (raw: unknown) => {
+            if (!budget.reserveToolCall()) return 'Question limit reached';
+            const question = aiFollowUpSchema.parse(raw);
+            if (
+              automationTools &&
+              /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\buuid\b|staff id/i.test(
+                [question.question, ...question.choices].join(' '),
+              )
+            )
+              return 'Do not ask for internal IDs. Use currentMember/me for the signed-in person, or ask for staff names from getAutomationCatalog.';
+            followUp = question;
+            return 'Question and choices ready. Wait for the person to answer; do not assume a choice.';
+          };
+          const guidedTool = tool({
+            description:
+              'Ask one short clarification with 2-5 meaningful choices when the lead, action content, due date or email intent is missing or ambiguous. Never invent an answer. The person can also type freely.',
+            inputSchema: aiFollowUpSchema,
+            execute: guide,
+          });
+          const system = buildSystemPrompt({
+            siteName: site.name,
+            leadTypes: site.leadTypes,
+            today: businessDayLabel(turnStarted, AI_BUSINESS_TIME_ZONE),
+            timeZone: AI_BUSINESS_TIME_ZONE,
+            automationsAvailable: automationTools !== undefined,
+            actionsAvailable:
+              actionTools !== undefined && decideAccess(access, 'lead.manage').allowed,
+            // Only the verified id and the catalogue's labels reach the system
+            // prompt; the customer-typed name and reference travel as data in
+            // the person's own message below.
+            ...(leadHint === undefined
+              ? {}
+              : {
+                  openLead: {
+                    leadId: leadHint.leadId,
+                    leadTypeLabel: leadTypeLabel(leadHint.leadType),
+                    stageLabel: leadStageLabel(leadHint.leadType, leadHint.stage),
+                  },
+                }),
+          });
+          const openLeadData = leadHint === undefined ? undefined : openLeadDataBlock(leadHint);
+          // CHAT-2: only whole turns whose answer this server signed are replayed.
+          const history = trustedHistory(body.history, dependencies.config.signingKey, scope);
+          const messages = [
+            ...history.messages,
+            {
+              role: 'user' as const,
+              text:
+                openLeadData === undefined ? body.message : `${openLeadData}\n\n${body.message}`,
+            },
+          ];
+
+          let recoveredDraft = false;
+          let failureCode: import('@canadian-plans/contracts').AiStreamErrorCode | undefined;
+          let outcome: 'completed' | 'cancelled' | 'failed' | 'access_lost' = 'completed';
+          let outputTokens: number | undefined;
+          let finished = false;
+
+          try {
+            for await (const event of engine.stream({
+              system,
+              messages,
+              automationAuthoring: automationTools !== undefined,
+              // CHAT-4: a turn that ends on a prepared card's tool call is done.
+              hasPreparedDraft: () =>
+                (automationTools?.proposals.length ?? 0) > 0 ||
+                (actionTools?.proposals.length ?? 0) > 0,
+              tools: {
+                ...toolset.definitions,
+                ...actionTools?.definitions,
+                ...automationTools?.definitions,
+                askFollowUp: guidedTool,
+              },
+              signal: controller.signal,
+              executeTool: (name, input) =>
+                isToolName(name)
+                  ? toolset.execute(name, input)
+                  : actionTools &&
+                      (name === 'prepareNote' ||
+                        name === 'prepareTask' ||
+                        name === 'prepareEmail' ||
+                        name === 'prepareLeadUpdate' ||
+                        name === 'getLeadUpdateOptions')
+                    ? actionTools.execute(name, input)
+                    : automationTools && AUTOMATION_TOOL_NAMES.some((toolName) => toolName === name)
+                      ? automationTools.execute(name, input)
+                      : name === 'askFollowUp'
+                        ? guide(input)
+                        : Promise.reject(new Error('unknown assistant tool')),
+            })) {
+              if (controller.signal.aborted) break;
+              switch (event.type) {
+                case 'text':
+                  writePart({ type: 'text', text: event.text });
+                  break;
+                case 'tool-start':
+                  writePart({
+                    type: 'progress',
+                    label: isToolName(event.toolName)
+                      ? PROGRESS_LABELS[event.toolName]
+                      : (CARD_PROGRESS_LABELS[event.toolName] ?? 'Checking the CRM'),
+                  });
+                  break;
+                case 'finish':
+                  finished = true;
+                  outputTokens = event.outputTokens;
+                  break;
+                default:
+                  break;
+              }
+            }
+
+            if (revoked) {
+              outcome = 'access_lost';
+              writePart({
+                type: 'error',
+                code: 'access_lost',
+                message: 'Your access to this site changed. Close Ask AI and sign in again.',
+              });
+              return;
+            }
+            if (timedOut) {
+              outcome = 'failed';
+              writePart({
+                type: 'error',
+                code: 'timeout',
+                message: 'That took too long. Try a narrower question.',
+              });
+              return;
+            }
+
+            if (!controller.signal.aborted) {
+              // A dropped engine stream is a failed turn, even if it already
+              // yielded some text. Only an explicit finish can release sources
+              // and the successful terminal frame.
+              if (!finished) throw new AssistantProviderError();
+              // Access is rechecked before any answer is released: a role removed
+              // while the model was writing must not receive the rest of the turn.
+              const finalAccess = await wait(
+                dependencies.loadAccess(actor.actorId, workspaceId.data),
+              );
+              if (!decideAiAccess(finalAccess).allowed) {
+                outcome = 'access_lost';
+                writePart({
+                  type: 'error',
+                  code: 'access_lost',
+                  message: 'Your access to this site changed. Close Ask AI and sign in again.',
+                });
+                return;
+              }
+              const cards = sources.list();
+              if (cards.length > 0) writePart({ type: 'sources', sources: cards });
+              if (
+                actionTools &&
+                actionTools.proposals.length > 0 &&
+                decideAccess(finalAccess, 'lead.manage').allowed
+              )
+                writePart({ type: 'actions', actions: actionTools.proposals });
+              if (
+                automationTools?.proposals.length &&
+                decideAccess(finalAccess, 'integration.manage').allowed
+              )
+                writePart({ type: 'automation_proposals', proposals: automationTools.proposals });
+              if (followUp) writePart({ type: 'follow_up', followUp });
+              writeDone();
+            }
+          } catch (error) {
+            if (revoked || error instanceof AssistantAccessRevokedError) {
+              outcome = 'access_lost';
+              writePart({
+                type: 'error',
+                code: 'access_lost',
+                message: 'Your access to this site changed. Close Ask AI and sign in again.',
+              });
+            } else if (timedOut) {
+              outcome = 'failed';
+              writePart({
+                type: 'error',
+                code: 'timeout',
+                message: 'That took too long. Try a narrower question.',
+              });
+            } else if (clientGone || controller.signal.aborted) {
+              outcome = 'cancelled';
+            } else {
+              failureCode = error instanceof AssistantProviderError ? error.code : 'internal_error';
+              // CHAT-4: cards already prepared (signed drafts that save nothing
+              // until confirmed) are released with a note, not lost with the turn.
+              const readyAutomations = aiAutomationProposalSchema
+                .array()
+                .max(3)
+                .safeParse(automationTools?.proposals ?? []);
+              const readyActions = aiActionProposalSchema
+                .array()
+                .max(3)
+                .safeParse(actionTools?.proposals ?? []);
+              const automations = readyAutomations.success ? readyAutomations.data : [];
+              const actions = readyActions.success ? readyActions.data : [];
+              if (automations.length > 0 || actions.length > 0) {
+                try {
+                  const finalAccess = await wait(
+                    dependencies.loadAccess(actor.actorId, workspaceId.data),
+                  );
+                  if (!decideAiAccess(finalAccess).allowed) {
+                    outcome = 'access_lost';
+                    writePart({
+                      type: 'error',
+                      code: 'access_lost',
+                      message: 'Your access to this site changed. Close Ask AI and sign in again.',
+                    });
+                    return;
+                  }
+                  const releaseActions =
+                    actions.length > 0 && decideAccess(finalAccess, 'lead.manage').allowed;
+                  const releaseAutomations =
+                    automations.length > 0 &&
+                    decideAccess(finalAccess, 'integration.manage').allowed;
+                  if (releaseActions || releaseAutomations) {
+                    writePart({
+                      type: 'text',
+                      text: '\n\nThe explanation could not finish, but a draft is ready for your review. Nothing has been saved.',
+                    });
+                    if (releaseActions) writePart({ type: 'actions', actions });
+                    if (releaseAutomations)
+                      writePart({ type: 'automation_proposals', proposals: automations });
+                    writeDone();
+                    recoveredDraft = true;
+                    outcome = 'completed';
+                  }
+                } catch {
+                  // A failed access check or invalid stream must not release a card.
+                }
+              }
+              if (!recoveredDraft) {
+                outcome = 'failed';
+                // A provider failure is reported by a fixed code, never its body.
+                dependencies.reportFailure(
+                  req,
+                  reportableAssistantError(error, 'assistant_provider_error'),
+                );
+                writePart({
+                  type: 'error',
+                  code:
+                    error instanceof AssistantProviderError ? error.code : 'provider_unavailable',
+                  message: 'Ask AI could not answer just now. Nothing was changed.',
+                });
+              }
+            }
+          } finally {
+            activeTurns.delete(controller);
+            clearTimeout(timer);
+            const turnRecord: AiTurnLog = {
+              requestId: req.id,
+              workspaceId: workspaceId.data,
+              actorId: actor.actorId,
+              engine: engine.kind,
+              modelId: dependencies.config.modelId,
+              promptVersion: AI_PROMPT_VERSION,
+              outcome,
+              durationMs: Date.now() - startedAt,
+              ...(outputTokens === undefined ? {} : { outputTokens }),
+              ...budget.usage,
+              ...(failureCode ? { failureCode } : {}),
+              ...(recoveredDraft ? { recoveredDraft: true } : {}),
+            };
+            logAiTurn(turnRecord);
+            // The usage record never fails the turn: a write error is reported
+            // and the log line above still carries the same fields.
+            if (dependencies.turns) {
+              await dependencies.turns.record(turnRecord).catch((error: unknown) => {
+                dependencies.reportFailure(req, error);
+              });
+            }
+          }
+        },
+        onError: () => 'Ask AI could not answer just now.',
+      });
+      try {
+        await pipeUIMessageStreamToResponse({
+          response: res,
+          stream,
+          headers: { 'cache-control': 'no-store' },
+        });
+      } finally {
+        controller.abort();
+        activeTurns.delete(controller);
+        clearTimeout(timer);
+        res.off('close', onClose);
+      }
+    } catch (error) {
+      dependencies.reportFailure(req, reportableAssistantError(error, 'assistant_request_failed'));
+      if (!res.headersSent) sendStaffAuthError(res, req.id, 'internal_error', 503);
+      else if (!res.writableEnded) res.end();
+    } finally {
+      controller.abort();
+      activeTurns.delete(controller);
+      clearTimeout(timer);
+      res.off('close', onClose);
+    }
+  });
+
+  return router;
+}

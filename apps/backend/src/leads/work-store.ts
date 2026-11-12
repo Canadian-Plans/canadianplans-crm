@@ -1,0 +1,1834 @@
+import { createHash } from 'node:crypto';
+
+import { z } from 'zod';
+import { and, eq, sql } from 'drizzle-orm';
+import {
+  outboxJobs,
+  auditEvents,
+  leadActivities,
+  leads,
+  leadTasks,
+  withTenantTx,
+  type DatabaseClient,
+  type TenantTransaction,
+} from '@canadian-plans/db';
+import {
+  customerEmailJobPayloadSchema,
+  codePropertyCatalog,
+  allowedStageMoves,
+  leadStageLabel,
+  type AiActionDraft,
+  type AiStageMoveNeed,
+  ORDER_PROPERTY_KEYS,
+  ORDER_STORAGE_KEYS,
+  applyCustomValueEdits,
+  applyLeadFormEdit,
+  freezePlan,
+  isActiveTaskStatus,
+  isLeadStage,
+  isOrderLeadType,
+  leadFormSchema,
+  leadTypeEntry,
+  type EmailFillInName,
+  type EmailSkipped,
+  type QueueCustomerEmailRequest,
+  type LeadActivity,
+  type LeadAssigneeFilter,
+  type LeadBoardColumn,
+  type LeadContactEdit,
+  type LeadDetail,
+  type LeadForm,
+  type LeadOrder,
+  type LeadOrderEdit,
+  type PlanSnapshot,
+  type LeadPropertyFilter,
+  type LeadTask,
+  type LeadTaskStatus,
+  type PropertyCatalog,
+  type TaskAssigneeFilter,
+  type TaskStatusFilter,
+  type AutomationKey,
+  type LeadTypeCount,
+  type WorkspaceTask,
+} from '@canadian-plans/contracts';
+
+import { fireFlows, runQueuedStarts, type FlowSiteHolder } from '../automations/engine.js';
+import { automationLeadOf } from '../automations/run.js';
+import { taskDueDay, writeTimers } from '../automations/timers.js';
+import type { StaffNotificationEnvironment } from '../automations/staff-notification.js';
+import { renderPlainCustomerEmail } from '../email/layout.js';
+import { composeCustomerEmail } from '../email/compose.js';
+import { queueComposedEmail } from '../email/queue.js';
+import {
+  resolveSiteSender,
+  customerEmailEnvironmentFromEnv,
+  type CustomerEmailEnvironment,
+} from '../email/senders.js';
+import { loadPlanForFreeze } from '../plans/store.js';
+import { findMissingDocuments } from './documents-check.js';
+import { isPlanAvailable, submittedOrder, toLeadOrder } from './order.js';
+import { planStageMove, todayInToronto, type StageMoveRefusal } from './stage-move.js';
+import {
+  iso,
+  selectLeadBoard,
+  selectLeadDetail,
+  selectLeadStats,
+  selectLeadSummary,
+  selectLeadWithWork,
+  selectTask,
+  selectWorkspaceTasks,
+  toLeadActivity,
+  type ActivityRow,
+  type LeadFilters,
+  type LeadStats,
+  type LeadWithWork,
+} from './staff-queries.js';
+import type { Scope, WriteScope } from '../tenant-scope.js';
+import { upsertContact } from './store.js';
+import { cancelLeadWork } from '../automations/records.js';
+
+/**
+ * Staff working a lead: the lead page's reads and every write a staff member
+ * makes (stage, assignee, contact corrections, order details, notes, tasks,
+ * archive). Each write runs in one tenant transaction that locks the lead,
+ * records what changed on the append-only timeline, and writes an audit
+ * event. Neither the
+ * timeline nor the audit trail stores contact values or note text a second
+ * time: an edit records the field names, a note's audit event its id.
+ */
+
+export type { Scope, WriteScope };
+
+export type LeadWorkResult = LeadWithWork;
+
+export type UpdateLeadWorkOutcome =
+  | {
+      status: 'updated';
+      lead: LeadDetail;
+      activities: LeadActivity[];
+      /** The mails the move's rules were on for but could not send; absent when none. */
+      emailSkipped?: EmailSkipped[];
+    }
+  | { status: 'not_found' | 'trashed' | 'invalid_stage' | 'assignee_not_found' }
+  /** A form correction the type does not allow; names the field, never the value. */
+  | { status: 'invalid_field'; field: string }
+  /** A move the type does not allow, or one whose dispatch or activation details are missing. */
+  | StageMoveRefusal
+  /** The required documents of the order's plan that have no approved current file. */
+  | { status: 'documents_incomplete'; missing: string[] }
+  /** An override reason was given but is blank. */
+  | { status: 'document_override_reason_required' };
+
+export type ArchiveLeadOutcome =
+  | { status: 'changed' | 'unchanged'; lead: LeadDetail; activity: LeadActivity | null }
+  | { status: 'not_found' };
+
+export type NoteOutcome =
+  { status: 'created'; activity: LeadActivity } | { status: 'not_found' } | { status: 'trashed' };
+
+export type CustomerEmailOutcome =
+  | { status: 'queued'; activity: LeadActivity }
+  | { status: 'not_found' }
+  | { status: 'trashed' }
+  /** The site has no sender, or the deployment cannot send. */
+  | { status: 'no_sender' }
+  /** What the lead lacks for the mail: its fill-ins, or an address to send it to. */
+  | { status: 'missing'; missing: Array<EmailFillInName | 'customer email'> };
+
+export interface QueueCustomerEmailInput extends WriteScope {
+  leadId: string;
+  template: QueueCustomerEmailRequest['template'];
+}
+
+export type TaskOutcome =
+  { status: 'saved'; task: LeadTask } | { status: 'not_found' | 'trashed' | 'assignee_not_found' };
+
+export interface UpdateLeadWorkInput extends WriteScope {
+  leadId: string;
+  stage?: string;
+  /** `null` unassigns; `undefined` leaves the assignee alone. */
+  assignedActorId?: string | null;
+  contact?: LeadContactEdit;
+  /** Corrections to the form's editable fields; null clears one. */
+  form?: Record<string, string | number | boolean | null>;
+  /** New values of the site's custom properties; null clears one. */
+  customValues?: Record<string, string | number | boolean | null>;
+  /** The site's property catalogue, loaded once for the request; custom values are checked against it. */
+  catalog: PropertyCatalog;
+  /** Order details of an order lead type: a new `planId` re-freezes the plan, null clears it. */
+  order?: LeadOrderEdit;
+  /**
+   * Why the stage move goes ahead without the plan's documents approved. The
+   * route admits it only from an actor with `order.override`; the store
+   * trusts it. Ignored when nothing is missing.
+   */
+  documentsOverrideReason?: string;
+}
+
+/** Rolls back an AI-confirmed update the store refused, carrying the refusal out. */
+class AiLeadUpdateRefused extends Error {
+  constructor(readonly outcome: Exclude<UpdateLeadWorkOutcome, { status: 'updated' }>) {
+    super('ai lead update refused');
+  }
+}
+
+export type AiLeadUpdateDraft = Extract<AiActionDraft, { kind: 'lead_update' }>;
+export type AiLeadUpdatePreview = {
+  version: string;
+  before: string | null;
+  beforeLabel: string;
+  choices: {
+    value: string | null;
+    label: string;
+    /** What a stage move still needs on the lead page first; absent when nothing. */
+    needs?: AiStageMoveNeed;
+    missingDocuments?: string[];
+  }[];
+};
+
+/** A confirmed AI lead update: saved, or why not (a refusal carries the same outcome a staff edit gets). */
+export type AiLeadUpdateConfirmOutcome =
+  | { status: 'saved'; recordId: string }
+  | { status: 'conflict' | 'not_found' | 'trashed' | 'invalid' }
+  | { status: 'refused'; refusal: Exclude<UpdateLeadWorkOutcome, { status: 'updated' }> };
+
+export interface CreateTaskInput extends WriteScope {
+  /** Server-signed AI proposal id; retries reuse the existing record under the lead lock. */
+  creationId?: string;
+  /** The AI card that confirmed it (a version of `creationId`'s draft), kept in the audit. */
+  aiCardId?: string;
+  leadId: string;
+  title: string;
+  dueAt?: string | null;
+  assignedActorId?: string | null;
+}
+
+export interface UpdateTaskInput extends WriteScope {
+  taskId: string;
+  title?: string;
+  dueAt?: string | null;
+  assignedActorId?: string | null;
+  status?: LeadTaskStatus;
+}
+
+export interface LeadWorkStore {
+  /** With `dueBy`, each type also counts its leads with a follow-up due by that day. */
+  summary(input: Scope & { dueBy?: string }): Promise<{ types: LeadTypeCount[]; archived: number }>;
+  /** The dashboard's counts for one type, received in the last `days` days or ever. */
+  stats(input: Scope & { leadType: string; days?: number }): Promise<LeadStats>;
+  board(
+    input: Scope & {
+      leadType: string;
+      assignee?: LeadAssigneeFilter;
+      search?: string;
+      where?: readonly LeadPropertyFilter[];
+      /** The site's property catalogue `where` was validated against. */
+      catalog: PropertyCatalog;
+    },
+    perStage: number,
+  ): Promise<LeadBoardColumn[]>;
+  /**
+   * `includeWork: false` skips the timeline, tasks, related requests, identities, documents and custom values for a caller who may not see them.
+   * `catalog` is the site's property catalogue, loaded once for the request.
+   */
+  getLead(
+    input: Scope & { leadId: string; includeWork: boolean; catalog: PropertyCatalog },
+  ): Promise<LeadWorkResult | undefined>;
+  previewAiLeadUpdate?(
+    input: Scope & { leadId: string; field: AiLeadUpdateDraft['field'] },
+  ): Promise<AiLeadUpdatePreview | undefined>;
+  confirmAiLeadUpdate?(
+    input: WriteScope & {
+      draft: AiLeadUpdateDraft;
+      creationId: string;
+      /** The digest of the field's value the card was prepared against (ACT-3, ACT-5). */
+      before: string;
+      aiCardId?: string;
+    },
+  ): Promise<AiLeadUpdateConfirmOutcome>;
+  /**
+   * The AI card that saved a draft (by the draft's root id), or null when the
+   * save predates card ids or nothing was saved: a confirmation compares it
+   * with its own card to tell a retry from a second version of the draft.
+   */
+  aiCardOf?(input: Scope & { rootId: string }): Promise<string | null>;
+  updateLead(input: UpdateLeadWorkInput): Promise<UpdateLeadWorkOutcome>;
+  /** Archives a lead (or restores one); the timeline and audit keep the `trashed`/`restored` names. */
+  setArchived(
+    input: WriteScope & { leadId: string; archived: boolean },
+  ): Promise<ArchiveLeadOutcome>;
+  /** The first open by someone who works leads; null activity when it was already opened. */
+  markOpened(
+    input: WriteScope & { leadId: string },
+  ): Promise<{ status: 'opened'; activity: LeadActivity | null } | { status: 'not_found' }>;
+  addNote(
+    input: WriteScope & { leadId: string; body: string; creationId?: string; aiCardId?: string },
+  ): Promise<NoteOutcome>;
+  /** Resolves addresses for an authorized browser preview; returns no model-visible data. */
+  previewAiEmail?(
+    input: WriteScope & { leadId: string },
+  ): Promise<{ toAddress: string; fromAddress: string } | undefined>;
+  queueAiEmail?(
+    input: WriteScope & {
+      leadId: string;
+      creationId: string;
+      aiCardId?: string;
+      draft: Extract<AiActionDraft, { kind: 'email' }>;
+      emailContext: { toAddress: string; fromAddress: string };
+    },
+  ): Promise<
+    | { status: 'queued'; recordId: string }
+    | { status: 'not_found' | 'trashed' | 'no_sender' | 'missing' | 'changed' }
+  >;
+  queueCustomerEmail(input: QueueCustomerEmailInput): Promise<CustomerEmailOutcome>;
+  createTask(input: CreateTaskInput): Promise<TaskOutcome>;
+  updateTask(input: UpdateTaskInput): Promise<TaskOutcome>;
+  listTasks(
+    input: Scope & {
+      assignee: TaskAssigneeFilter;
+      status: TaskStatusFilter;
+      dueBy?: string;
+      completedSince?: string;
+    },
+    page: number,
+    pageSize: number,
+  ): Promise<{ tasks: WorkspaceTask[]; total: number }>;
+}
+
+export interface LockedLead {
+  [key: string]: unknown;
+  id: string;
+  leadType: string;
+  /** `incomplete` until the customer submits the form, then `submitted`. */
+  status: string;
+  stage: string;
+  assignedActorId: string | null;
+  fullName: string | null;
+  email: string | null;
+  phone: string | null;
+  countryCode: string | null;
+  externalRef: string | null;
+  trashed: boolean;
+  payload: unknown;
+  customValues: unknown;
+  orderDetails: unknown;
+}
+
+const isStoredObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** The stored form, or an empty version-1 one for a lead that has none yet. */
+function storedForm(payload: unknown): LeadForm {
+  const form = leadFormSchema.safeParse(payload);
+  return form.success ? form.data : { schemaVersion: 1, payload: {} };
+}
+
+/**
+ * The lead, locked for the rest of the transaction; restricted leads do not
+ * exist here. Every write that also locks a change request locks the lead
+ * first, so the two never deadlock.
+ */
+export async function lockLead(
+  tx: TenantTransaction,
+  workspaceId: string,
+  leadId: string,
+): Promise<LockedLead | undefined> {
+  const [row] = await tx.execute<LockedLead>(sql`
+    select
+      l.id,
+      l.lead_type as "leadType",
+      l.status,
+      l.stage,
+      l.assigned_actor_id as "assignedActorId",
+      l.full_name as "fullName",
+      l.email,
+      l.phone,
+      l.country_code as "countryCode",
+      l.external_ref as "externalRef",
+      l.deleted_at is not null as trashed,
+      l.payload,
+      l.custom_values as "customValues",
+      l.order_details as "orderDetails"
+    from app.leads l
+    where l.workspace_id = ${workspaceId}
+      and l.id = ${leadId}
+      and l.customer_data_restricted_at is null
+    for update
+  `);
+  return row;
+}
+
+/** Only an active staff member of this site can be given a lead or a task. */
+async function isActiveMember(
+  tx: TenantTransaction,
+  workspaceId: string,
+  actorId: string,
+): Promise<boolean> {
+  const rows = await tx.execute(sql`
+    select 1
+    from app.memberships m
+    where m.workspace_id = ${workspaceId}
+      and m.user_id = ${actorId}
+      and m.membership_type = 'staff'
+      and m.status = 'active'
+    limit 1
+  `);
+  return rows.length > 0;
+}
+
+async function requireDetail(
+  tx: TenantTransaction,
+  workspaceId: string,
+  leadId: string,
+  catalog?: PropertyCatalog,
+): Promise<LeadDetail> {
+  const detail = await selectLeadDetail(tx, workspaceId, leadId, catalog);
+  if (!detail) throw new Error('lead vanished inside its own transaction');
+  return detail;
+}
+
+async function requireTask(
+  tx: TenantTransaction,
+  workspaceId: string,
+  taskId: string,
+): Promise<LeadTask> {
+  const task = await selectTask(tx, workspaceId, taskId);
+  if (!task) throw new Error('task vanished inside its own transaction');
+  return task;
+}
+
+/** A timeline insert returns its entries, so the response needs no second read. */
+const ACTIVITY_RETURNING = {
+  id: leadActivities.id,
+  actorId: leadActivities.actorId,
+  kind: leadActivities.kind,
+  body: leadActivities.body,
+  data: leadActivities.data,
+  createdAt: leadActivities.createdAt,
+};
+
+interface InsertedActivity {
+  id: string;
+  actorId: string;
+  kind: string;
+  body: string | null;
+  data: unknown;
+  createdAt: Date;
+}
+
+/** A newly written timeline row as an entry. */
+function insertedActivity(row: InsertedActivity): LeadActivity {
+  return toLeadActivity({ ...row, createdAt: row.createdAt.toISOString() });
+}
+
+/** Entries in the lead page's order: newest first, ties (one transaction's entries) by id descending. */
+function newestFirst(activities: readonly LeadActivity[]): LeadActivity[] {
+  return [...activities].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+  });
+}
+
+/** Newly written timeline rows as entries, in the lead page's order. */
+function insertedActivities(rows: readonly InsertedActivity[]): LeadActivity[] {
+  return newestFirst(rows.map(insertedActivity));
+}
+
+const CONTACT_FIELDS = ['fullName', 'email', 'phone'] as const;
+type ContactField = (typeof CONTACT_FIELDS)[number];
+
+type OrderEditResult =
+  | {
+      ok: true;
+      /** The stored object with only the changed fields written over it. */
+      stored: Record<string, unknown>;
+      changedKeys: string[];
+    }
+  | { ok: false; field: string };
+
+/** The stored `order_details` as an object to write over; anything else reads as empty. */
+function storedObject(stored: unknown): Record<string, unknown> {
+  return typeof stored === 'object' && stored !== null && !Array.isArray(stored)
+    ? Object.fromEntries(Object.entries(stored))
+    : {};
+}
+
+/** JSON text with every object's keys sorted: a stored copy comes back from JSONB in its own key order. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (typeof value === 'object' && value !== null) {
+    const entries = Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Two frozen copies of one plan are the same when only the moment they were taken differs. */
+function sameSnapshot(a: PlanSnapshot | null, b: PlanSnapshot | null): boolean {
+  if (a === null || b === null) return a === b;
+  return canonicalJson({ ...a, frozenAt: '' }) === canonicalJson({ ...b, frozenAt: '' });
+}
+
+/** The dispatch and activation details: text or a date each, null clears one. */
+const ORDER_DETAIL_FIELDS = [
+  'courier',
+  'trackingNumber',
+  'dispatchedAt',
+  'activatedAt',
+  'activationNumber',
+  'activationAccount',
+] as const;
+
+/**
+ * The stored order as the audit trail keeps it: without the dispatch and
+ * activation details, whose activation number is the customer's phone and
+ * whose account and tracking number identify them too. The edit's
+ * `changedFields` names which of them changed; nothing scrubs an audit row.
+ */
+function auditedOrder(stored: unknown): Record<string, unknown> {
+  const details: ReadonlySet<string> = new Set(ORDER_DETAIL_FIELDS);
+  return Object.fromEntries(
+    Object.entries(storedObject(stored)).filter(([key]) => !details.has(key)),
+  );
+}
+
+/**
+ * The flow a write is made for (spec §5, R5): its key and name for the
+ * timeline, its version and run for the audit, and where it sits in a chain
+ * of flow moves (R8), so a move it makes fires the next flows one deeper.
+ */
+export interface AutomationAttribution {
+  key: AutomationKey;
+  name: string;
+  version: number;
+  runId: string;
+  depth: number;
+  chain: readonly string[];
+}
+
+/** What an automation's audit event says of it: `after.automation`. */
+function auditedAutomation(automation: AutomationAttribution) {
+  return { key: automation.key, version: automation.version, runId: automation.runId };
+}
+
+/** What an automation's timeline entry says of it: `automation` and `automationName`. */
+function entryAutomation(automation: AutomationAttribution | undefined): Record<string, string> {
+  return automation ? { automation: automation.key, automationName: automation.name } : {};
+}
+
+/** One audit event on a lead: by staff, or by an automation (`actorLabel` and `after.automation`). */
+async function auditLead(
+  tx: TenantTransaction,
+  scope: WriteScope & { leadId: string; automation?: AutomationAttribution },
+  action: string,
+  values: { before?: Record<string, unknown>; after: Record<string, unknown> },
+): Promise<void> {
+  const { automation } = scope;
+  await tx.insert(auditEvents).values({
+    workspaceId: scope.workspaceId,
+    actorId: scope.actorId,
+    actorLabel: automation ? 'automation' : 'staff actor',
+    action,
+    entity: 'lead',
+    entityId: scope.leadId,
+    requestId: scope.requestId,
+    before: values.before,
+    after: automation
+      ? { ...values.after, automation: auditedAutomation(automation) }
+      : values.after,
+  });
+}
+
+/**
+ * The one insert of a task, its audit and its timers; the staff route and
+ * the flow step both call it. The lead is the caller's, already locked.
+ */
+export async function insertLeadTask(
+  tx: TenantTransaction,
+  input: WriteScope & {
+    leadId: string;
+    title: string;
+    dueAt: string | null;
+    assignedActorId: string | null;
+    automation?: AutomationAttribution;
+    creationId?: string;
+    aiCardId?: string;
+  },
+): Promise<{ taskId: string }> {
+  const [row] = await tx
+    .insert(leadTasks)
+    .values({
+      ...(input.creationId === undefined ? {} : { id: input.creationId }),
+      workspaceId: input.workspaceId,
+      leadId: input.leadId,
+      title: input.title,
+      dueAt: input.dueAt ? new Date(input.dueAt) : null,
+      assignedActorId: input.assignedActorId,
+      createdBy: input.actorId,
+    })
+    .returning({ id: leadTasks.id });
+  if (!row) throw new Error('task insert did not return a row');
+  const after = {
+    leadId: input.leadId,
+    dueAt: input.dueAt,
+    assignedActorId: input.assignedActorId,
+    ...(input.creationId === undefined ? {} : { aiActionId: input.creationId }),
+    ...(input.aiCardId === undefined ? {} : { aiCardId: input.aiCardId }),
+  };
+  await tx.insert(auditEvents).values({
+    workspaceId: input.workspaceId,
+    actorId: input.actorId,
+    actorLabel: input.automation ? 'automation' : 'staff actor',
+    action: 'lead.task_created',
+    entity: 'lead_task',
+    entityId: row.id,
+    requestId: input.requestId,
+    after: input.automation ? { ...after, automation: auditedAutomation(input.automation) } : after,
+  });
+  if (input.dueAt) await writeTaskTimers(tx, input.workspaceId, input.leadId, row.id, input.dueAt);
+  return { taskId: row.id };
+}
+
+/** A task's `task_overdue` timers, for its due day (the lead's type read here). */
+async function writeTaskTimers(
+  tx: TenantTransaction,
+  workspaceId: string,
+  leadId: string,
+  taskId: string,
+  dueAt: string | Date,
+): Promise<void> {
+  const [lead] = await tx.execute<{ leadType: string }>(sql`
+    select l.lead_type as "leadType" from app.leads l
+    where l.workspace_id = ${workspaceId} and l.id = ${leadId}
+  `);
+  if (!lead) return;
+  await writeTimers(tx, {
+    workspaceId,
+    leadId,
+    leadType: lead.leadType,
+    event: { kind: 'task_due', taskId, dueDay: taskDueDay(dueAt) },
+  });
+}
+
+/**
+ * Staff's change to a lead's order: a new plan is frozen from the site's
+ * current plan (it must be active and of the lead's type, else the `plan`
+ * field is refused), null clears the link and the copy, and the quantity, the
+ * two statuses and the dispatch and activation details are set as given.
+ * Names the changed catalogue keys.
+ * Only the changed fields are written over the stored object: a key the
+ * parse does not know, or a stored value it cannot read, survives an
+ * unrelated edit, and so does the frozen copy while the plan stays the same.
+ */
+async function editOrder(
+  tx: TenantTransaction,
+  workspaceId: string,
+  lead: LockedLead,
+  edit: LeadOrderEdit,
+): Promise<OrderEditResult> {
+  if (!isOrderLeadType(lead.leadType)) return { ok: false, field: 'order' };
+  const current = toLeadOrder(lead.orderDetails);
+  const next: LeadOrder = { ...current };
+  const changed = new Set<keyof LeadOrderEdit>();
+
+  if (edit.planId === null) {
+    next.planId = null;
+    next.plan = null;
+  } else if (edit.planId !== undefined) {
+    const found = await loadPlanForFreeze(tx, workspaceId, edit.planId);
+    if (!isPlanAvailable(found, lead.leadType)) return { ok: false, field: 'plan' };
+    next.planId = found.plan.id;
+    next.plan = freezePlan(found.plan, found.visibleKeys, new Date());
+  }
+  if (next.planId !== current.planId || !sameSnapshot(next.plan, current.plan)) {
+    changed.add('planId');
+  }
+  if (edit.quantity !== undefined && edit.quantity !== current.quantity) {
+    next.quantity = edit.quantity;
+    changed.add('quantity');
+  }
+  if (edit.paymentStatus !== undefined && edit.paymentStatus !== current.paymentStatus) {
+    next.paymentStatus = edit.paymentStatus;
+    changed.add('paymentStatus');
+  }
+  if (
+    edit.carrierCommission !== undefined &&
+    edit.carrierCommission !== current.carrierCommission
+  ) {
+    next.carrierCommission = edit.carrierCommission;
+    changed.add('carrierCommission');
+  }
+  for (const field of ORDER_DETAIL_FIELDS) {
+    const value = edit[field];
+    if (value !== undefined && value !== current[field]) {
+      next[field] = value;
+      changed.add(field);
+    }
+  }
+  // Each changed field under its stored name (`ORDER_STORAGE_KEYS`: `plan` is
+  // `planId`); a new plan writes its frozen copy with it. A re-freeze of the
+  // same plan with nothing new keeps the copy already held, as stored.
+  const written: Record<string, unknown> = {};
+  const changedKeys: string[] = [];
+  for (const key of ORDER_PROPERTY_KEYS) {
+    const field = ORDER_STORAGE_KEYS[key];
+    if (!changed.has(field)) continue;
+    changedKeys.push(key);
+    written[field] = next[field];
+    if (field === 'planId') written['plan'] = next.plan;
+  }
+  return {
+    ok: true,
+    stored: { ...storedObject(lead.orderDetails), ...written },
+    changedKeys,
+  };
+}
+
+/**
+ * The stages that close a lead as lost: the catalogue's `lost` outcome
+ * stages (a SIM order's `cancelled`) and, for the types whose catalogue
+ * names no outcomes, their lost, declined and closed stages. A staff move of a lead
+ * the customer never submitted into one of them is no rescue (controller
+ * ruling, fix round 1): the lead stays unsubmitted and no flow fires.
+ */
+const CLOSING_STAGES: Readonly<Record<string, readonly string[]>> = {
+  sim_order: ['cancelled'],
+  internet: ['lost', 'non_serviceable_address'],
+  mobility: ['lost'],
+  partner_application: ['declined'],
+  contact_message: ['closed'],
+};
+
+export function isClosingStage(leadType: string, stage: string): boolean {
+  const lost = leadTypeEntry(leadType)?.outcomes?.lost.stages ?? [];
+  return lost.includes(stage) || (CLOSING_STAGES[leadType] ?? []).includes(stage);
+}
+
+/**
+ * A rescued checkout's order, frozen as the website's submission would have
+ * frozen it (`submittedOrder`) when its `planId` names a plan still
+ * available for the type; else as stored (unfrozen). Other stored keys stay.
+ */
+async function rescuedOrder(
+  tx: TenantTransaction,
+  workspaceId: string,
+  lead: LockedLead,
+): Promise<unknown> {
+  if (!isOrderLeadType(lead.leadType)) return lead.orderDetails;
+  const draft = toLeadOrder(lead.orderDetails);
+  if (draft.planId === null) return lead.orderDetails;
+  const found = await loadPlanForFreeze(tx, workspaceId, draft.planId);
+  if (!isPlanAvailable(found, lead.leadType)) return lead.orderDetails;
+  const frozen = submittedOrder(found, draft.quantity, new Date());
+  return {
+    ...frozen,
+    ...storedObject(lead.orderDetails),
+    planId: frozen.planId,
+    plan: frozen.plan,
+    quantity: frozen.quantity,
+  };
+}
+
+/** What a lead update needs beyond its transaction: customer mail (the flows it sets off send it). */
+export interface LeadUpdateContext {
+  /** Set only by AI confirmation, never read from the staff PATCH body. */
+  aiActionId?: string;
+  emailEnvironment: CustomerEmailEnvironment;
+  /** The site snapshot the write's flows share (P23); a flow's own move passes its write's. */
+  siteHolder?: FlowSiteHolder;
+  /** P24, tests only: called once after the move's flows are read. */
+  afterFlowsRead?: () => Promise<void>;
+  /** What staff notification mail needs; read from the environment when absent. */
+  staffNotifications?: StaffNotificationEnvironment;
+  /** A flow's own write passes its write's list of started runs (counted once, at the end). */
+  startedRuns?: string[];
+  /**
+   * ENG-5: a person's write collects the runs its move starts here; they run
+   * after the write commits (`runQueuedStarts`), out of its lead lock.
+   */
+  queued?: string[];
+}
+
+/**
+ * Staff's change to a lead, in the caller's tenant transaction: locks the
+ * lead, applies the stage, assignee, contact, form, custom value and order
+ * edits it is given (a new plan re-frozen), writes the timeline (one `edit`
+ * entry naming the changed keys, never values) and a `lead.updated` audit,
+ * and runs the rules of a stage entered. A refusal returns before anything is
+ * written to the lead, but a contact correction may already have refreshed its
+ * contact: a caller that must leave nothing behind rolls back on a refusal.
+ * The staff `PATCH` and a change request's approval both go through it.
+ */
+export async function applyLeadUpdate(
+  tx: TenantTransaction,
+  context: LeadUpdateContext,
+  input: UpdateLeadWorkInput & { automation?: AutomationAttribution },
+): Promise<UpdateLeadWorkOutcome> {
+  const lead = await lockLead(tx, input.workspaceId, input.leadId);
+  if (!lead) return { status: 'not_found' };
+  if (lead.trashed) return { status: 'trashed' };
+  const { automation } = input;
+
+  const set: Partial<typeof leads.$inferInsert> = {};
+  const entries: Array<{ kind: string; data: Record<string, unknown> }> = [];
+  const before: Record<string, unknown> = {};
+  const after: Record<string, unknown> = {};
+
+  // The order edit to write: the one given, with the dates a move defaults.
+  let orderEdit = input.order;
+  let checkDocuments = false;
+  // A flow passes the documents gate as staff do, and never by the override.
+  const reason = automation ? undefined : input.documentsOverrideReason?.trim();
+  let override: { reason: string; missing: string[] } | undefined;
+  // A staff move of a checkout the customer never submitted submits it (O9, O12),
+  // unless the move closes it (a lost or cancelled stage: `isClosingStage`).
+  let rescue = false;
+  let base: LockedLead = lead;
+  if (input.stage !== undefined && input.stage !== lead.stage) {
+    if (!isLeadStage(lead.leadType, input.stage)) return { status: 'invalid_stage' };
+    const current = toLeadOrder(lead.orderDetails);
+    const move = planStageMove({
+      leadType: lead.leadType,
+      from: lead.stage,
+      to: input.stage,
+      current,
+      edit: input.order,
+      today: todayInToronto(new Date()),
+    });
+    if (!move.ok) return move.refusal;
+    if (reason === '') return { status: 'document_override_reason_required' };
+    checkDocuments = move.gates.includes('documents');
+    orderEdit = move.order;
+    set.stage = input.stage;
+    entries.push({ kind: 'status_change', data: { from: lead.stage, to: input.stage } });
+    before['stage'] = lead.stage;
+    after['stage'] = input.stage;
+    if (
+      !automation &&
+      lead.status === 'incomplete' &&
+      !isClosingStage(lead.leadType, input.stage)
+    ) {
+      rescue = true;
+      set.status = 'submitted';
+      before['status'] = lead.status;
+      after['status'] = 'submitted';
+      entries.push({ kind: 'system', data: { event: 'submitted' } });
+      base = { ...lead, orderDetails: await rescuedOrder(tx, input.workspaceId, lead) };
+    }
+  }
+
+  // The order as this change leaves it, worked out before anything is
+  // written, so the documents check sees the plan the lead will have.
+  const changedOrder: string[] = [];
+  let storedOrder: Record<string, unknown> | undefined;
+  if (orderEdit) {
+    const edit = await editOrder(tx, input.workspaceId, base, orderEdit);
+    if (!edit.ok) return { status: 'invalid_field', field: edit.field };
+    if (edit.changedKeys.length > 0) {
+      storedOrder = edit.stored;
+      changedOrder.push(...edit.changedKeys);
+    }
+  }
+  // The rescue's freeze is the submission's, not an edit: no field is named for it.
+  if (storedOrder === undefined && base.orderDetails !== lead.orderDetails) {
+    storedOrder = storedObject(base.orderDetails);
+  }
+  if (checkDocuments) {
+    // What that frozen plan requires; no plan, or a plan from before the field, requires nothing.
+    const plan = toLeadOrder(storedOrder ?? base.orderDetails).plan;
+    const missing = await findMissingDocuments(tx, {
+      workspaceId: input.workspaceId,
+      leadId: input.leadId,
+      required: plan?.requiredDocuments ?? [],
+    });
+    if (missing.length > 0) {
+      if (reason === undefined) return { status: 'documents_incomplete', missing };
+      override = { reason, missing };
+    }
+  }
+
+  if (input.assignedActorId !== undefined && input.assignedActorId !== lead.assignedActorId) {
+    if (
+      input.assignedActorId !== null &&
+      !(await isActiveMember(tx, input.workspaceId, input.assignedActorId))
+    ) {
+      return { status: 'assignee_not_found' };
+    }
+    set.assignedActorId = input.assignedActorId;
+    entries.push({
+      kind: 'assignment',
+      data: { from: lead.assignedActorId, to: input.assignedActorId },
+    });
+    before['assignedActorId'] = lead.assignedActorId;
+    after['assignedActorId'] = input.assignedActorId;
+  }
+
+  const contact = input.contact;
+  const changed: ContactField[] = contact
+    ? CONTACT_FIELDS.filter(
+        (field) => contact[field] !== undefined && contact[field] !== lead[field],
+      )
+    : [];
+  if (contact && changed.length > 0) {
+    const next = {
+      fullName: contact.fullName ?? lead.fullName,
+      email: contact.email ?? lead.email,
+      phone: contact.phone ?? lead.phone,
+    };
+    if (changed.includes('fullName')) set.fullName = next.fullName;
+    if (changed.includes('email')) set.email = next.email;
+    if (changed.includes('phone')) set.phone = next.phone;
+    // A corrected address moves the lead to that person's contact; a
+    // corrected name or phone refreshes the contact it already has.
+    if (next.email) {
+      set.contactId = await upsertContact(tx, {
+        email: next.email,
+        fullName: next.fullName ?? undefined,
+        phone: next.phone ?? undefined,
+        countryCode: lead.countryCode ?? undefined,
+      });
+    }
+  }
+
+  const changedForm: string[] = [];
+  if (input.form && Object.keys(input.form).length > 0) {
+    const form = storedForm(lead.payload);
+    const edit = applyLeadFormEdit(lead.leadType, form.payload, input.form);
+    if (!edit.ok) return { status: 'invalid_field', field: edit.field };
+    if (edit.changed.length > 0) {
+      set.payload = { schemaVersion: form.schemaVersion, payload: edit.payload };
+      changedForm.push(...edit.changed);
+    }
+  }
+
+  const changedCustom: string[] = [];
+  if (input.customValues && Object.keys(input.customValues).length > 0) {
+    // Only the custom properties this type shows; a hidden or unknown key is refused.
+    const current = isStoredObject(lead.customValues) ? lead.customValues : {};
+    const edit = applyCustomValueEdits({
+      properties: input.catalog.forType(lead.leadType),
+      current,
+      edits: input.customValues,
+    });
+    if (!edit.ok) return { status: 'invalid_field', field: edit.field };
+    if (edit.changedKeys.length > 0) {
+      // Only the changed keys are written; every other stored value stays as it is.
+      const cleared = edit.changedKeys.filter((key) => !Object.hasOwn(edit.values, key));
+      const setValues = Object.fromEntries(
+        edit.changedKeys.flatMap((key) =>
+          Object.hasOwn(edit.values, key) ? [[key, edit.values[key]]] : [],
+        ),
+      );
+      const remaining = cleared.reduce(
+        (expression, key) => sql`(${expression} - ${key}::text)`,
+        sql`${leads.customValues}`,
+      );
+      set.customValues = sql`(${remaining} || ${JSON.stringify(setValues)}::jsonb)`;
+      changedCustom.push(...edit.changedKeys);
+    }
+  }
+
+  if (override) {
+    // Only a move that actually went past missing documents records an override.
+    storedOrder = {
+      ...(storedOrder ?? storedObject(lead.orderDetails)),
+      documentsOverride: { ...override, at: new Date().toISOString() },
+    };
+  }
+  if (storedOrder) {
+    set.orderDetails = storedOrder;
+    before['order'] = auditedOrder(lead.orderDetails);
+    after['order'] = auditedOrder(storedOrder);
+  }
+
+  // One entry for the whole correction, naming the fields (built-in, custom and order) and never their values.
+  const changedFields = [...changed, ...changedForm, ...changedCustom, ...changedOrder];
+  if (changedFields.length > 0) {
+    entries.push({ kind: 'edit', data: { fields: changedFields } });
+    after['changedFields'] = changedFields;
+  }
+  if (override) {
+    entries.push({
+      kind: 'system',
+      data: { event: 'documents_override', missing: override.missing, reason: override.reason },
+    });
+  }
+
+  if (entries.length === 0) {
+    return {
+      status: 'updated',
+      lead: await requireDetail(tx, input.workspaceId, input.leadId, input.catalog),
+      activities: [],
+    };
+  }
+
+  await tx
+    .update(leads)
+    .set({ ...set, updatedAt: new Date() })
+    .where(and(eq(leads.workspaceId, input.workspaceId), eq(leads.id, input.leadId)));
+  const inserted = await tx
+    .insert(leadActivities)
+    .values(
+      entries.map((entry) => ({
+        workspaceId: input.workspaceId,
+        leadId: input.leadId,
+        actorId: input.actorId,
+        kind: entry.kind,
+        data: {
+          ...entry.data,
+          ...entryAutomation(automation),
+          ...(context.aiActionId && !automation ? { viaAi: true } : {}),
+        },
+      })),
+    )
+    .returning(ACTIVITY_RETURNING);
+  await auditLead(tx, input, 'lead.updated', { before, after });
+  if (override) {
+    await auditLead(tx, input, 'lead.documents_overridden', {
+      after: {
+        from: lead.stage,
+        to: input.stage,
+        missing: override.missing,
+        reason: override.reason,
+      },
+    });
+  }
+
+  // The flows of the stage entered, from the lead as just written; each
+  // move is its own occurrence, so moving back and forth mails again. A
+  // rescue is the submission too (its flows first, R4); a flow's move fires
+  // the next flows one deeper in its chain (R8).
+  const statusChange = inserted.find((row) => row.kind === 'status_change');
+  if (statusChange && set.stage !== undefined) {
+    // The clocks of the time triggers this entry (and a rescue's submission) start.
+    const timerInput = {
+      workspaceId: input.workspaceId,
+      leadId: input.leadId,
+      leadType: lead.leadType,
+    };
+    if (rescue) {
+      await writeTimers(tx, {
+        ...timerInput,
+        event: { kind: 'submitted', at: statusChange.createdAt },
+      });
+    }
+    await writeTimers(tx, {
+      ...timerInput,
+      event: {
+        kind: 'stage_entered',
+        stage: set.stage,
+        occurrence: statusChange.id,
+        at: statusChange.createdAt,
+      },
+    });
+  }
+  const chained = {
+    depth: automation ? automation.depth + 1 : 0,
+    chain: automation ? [...automation.chain, automation.key] : [],
+    parentRunId: automation?.runId ?? null,
+  };
+  const fired =
+    statusChange && set.stage !== undefined
+      ? await fireFlows(
+          tx,
+          {
+            workspaceId: input.workspaceId,
+            actorId: input.actorId,
+            requestId: input.requestId,
+            environment: context.emailEnvironment,
+            catalog: input.catalog,
+            ...(context.siteHolder ? { siteHolder: context.siteHolder } : {}),
+            ...(context.afterFlowsRead ? { afterFlowsRead: context.afterFlowsRead } : {}),
+            ...(context.staffNotifications
+              ? { staffNotifications: context.staffNotifications }
+              : {}),
+            ...(context.startedRuns ? { startedRuns: context.startedRuns } : {}),
+            ...(context.queued && !automation ? { queued: context.queued } : {}),
+          },
+          [
+            ...(rescue
+              ? [
+                  {
+                    kind: 'lead_submitted' as const,
+                    leadId: input.leadId,
+                    leadType: lead.leadType,
+                    stage: set.stage,
+                    occurrence: 'submitted',
+                    ...chained,
+                    at: statusChange.createdAt,
+                  },
+                ]
+              : []),
+            {
+              kind: 'stage_entered',
+              leadId: input.leadId,
+              leadType: lead.leadType,
+              stage: set.stage,
+              occurrence: statusChange.id,
+              ...chained,
+              at: statusChange.createdAt,
+            },
+          ],
+        )
+      : { skipped: [], activities: [] };
+  // The response contract caps the list at 200; the move itself is saved either way.
+  const emailSkipped = fired.skipped.slice(0, 200);
+
+  return {
+    status: 'updated',
+    lead: await requireDetail(tx, input.workspaceId, input.leadId, input.catalog),
+    // Every entry the change wrote, the rules' mails among them.
+    activities: newestFirst([...inserted.map(insertedActivity), ...fired.activities]),
+    ...(emailSkipped.length > 0 ? { emailSkipped } : {}),
+  };
+}
+
+/**
+ * A lead field's value as an AI card carries it (ACT-5): a digest, so the
+ * bearer token never holds the customer's name or phone, and confirmation
+ * can still tell whether the value changed since the card was prepared.
+ */
+export function aiLeadValueDigest(value: string | null | undefined): string {
+  return createHash('sha256')
+    .update(JSON.stringify(value ?? null))
+    .digest('hex');
+}
+
+type LeadDatabase = Pick<DatabaseClient, 'withTenantTx'>;
+
+const defaultLeadDatabase: LeadDatabase = { withTenantTx };
+
+export class DatabaseLeadWorkStore implements LeadWorkStore {
+  constructor(
+    private readonly database: LeadDatabase = defaultLeadDatabase,
+    /** What customer mail needs from the deployment: the provider and the hash secret. */
+    private readonly emailEnvironment: CustomerEmailEnvironment = customerEmailEnvironmentFromEnv(),
+  ) {}
+
+  summary(input: Scope & { dueBy?: string }) {
+    return this.database.withTenantTx(input, (tx) => selectLeadSummary(tx, input.dueBy));
+  }
+
+  stats(input: Scope & { leadType: string; days?: number }) {
+    const lost = leadTypeEntry(input.leadType)?.outcomes?.lost.stages ?? [];
+    return this.database.withTenantTx(input, (tx) =>
+      selectLeadStats(tx, { leadType: input.leadType, days: input.days, lost }),
+    );
+  }
+
+  board(
+    input: Scope & {
+      leadType: string;
+      assignee?: LeadAssigneeFilter;
+      search?: string;
+      where?: readonly LeadPropertyFilter[];
+      catalog: PropertyCatalog;
+    },
+    perStage: number,
+  ) {
+    const filters: LeadFilters & { leadType: string } = {
+      workspaceId: input.workspaceId,
+      actorId: input.actorId,
+      leadType: input.leadType,
+      assignee: input.assignee,
+      search: input.search,
+      where: input.where,
+      catalog: input.catalog,
+    };
+    return this.database.withTenantTx(input, (tx) => selectLeadBoard(tx, filters, perStage));
+  }
+
+  getLead(input: Scope & { leadId: string; includeWork: boolean; catalog: PropertyCatalog }) {
+    return this.database.withTenantTx(input, async (tx) => {
+      if (input.includeWork) {
+        return selectLeadWithWork(tx, input.workspaceId, input.leadId, input.catalog);
+      }
+      const detail = await selectLeadDetail(tx, input.workspaceId, input.leadId, input.catalog);
+      if (!detail) return undefined;
+      // Custom values and the order travel with contact visibility, as the form does.
+      const { customValues: _customValues, order: _order, ...rest } = detail;
+      const lead: LeadDetail = rest;
+      return {
+        lead,
+        activities: [],
+        tasks: [],
+        related: [],
+        identities: [],
+        documents: [],
+        changeRequest: null,
+      };
+    });
+  }
+
+  async updateLead(input: UpdateLeadWorkInput): Promise<UpdateLeadWorkOutcome> {
+    const queued: string[] = [];
+    const outcome = await this.database.withTenantTx(input, (tx) =>
+      applyLeadUpdate(tx, { emailEnvironment: this.emailEnvironment, queued }, input),
+    );
+    return this.afterQueuedFlows(input, outcome, queued);
+  }
+
+  /**
+   * ENG-5: the flows a committed move started run now, each in its own
+   * transaction, and the response carries what they wrote and the lead as
+   * they left it. A flow that fails here is retried by the scheduler.
+   */
+  private async afterQueuedFlows(
+    input: WriteScope & { leadId: string; catalog: PropertyCatalog },
+    outcome: UpdateLeadWorkOutcome,
+    queued: readonly string[],
+  ): Promise<UpdateLeadWorkOutcome> {
+    if (outcome.status !== 'updated' || queued.length === 0) return outcome;
+    const ran = await runQueuedStarts(
+      this.database,
+      {
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        requestId: input.requestId,
+        environment: this.emailEnvironment,
+        catalog: input.catalog,
+      },
+      queued,
+    );
+    const lead = await this.database.withTenantTx(input, (tx) =>
+      requireDetail(tx, input.workspaceId, input.leadId, input.catalog),
+    );
+    const emailSkipped = [...(outcome.emailSkipped ?? []), ...ran.skipped].slice(0, 200);
+    return {
+      ...outcome,
+      lead,
+      activities: newestFirst([...outcome.activities, ...ran.activities]),
+      ...(emailSkipped.length > 0 ? { emailSkipped } : {}),
+    };
+  }
+
+  markOpened(
+    input: WriteScope & { leadId: string },
+  ): Promise<{ status: 'opened'; activity: LeadActivity | null } | { status: 'not_found' }> {
+    return this.database.withTenantTx(input, async (tx) => {
+      // Locked, so two people opening the lead at once write one entry.
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      // Opening is not work on the lead: `updated_at` (the inbox's order) stays.
+      const inserted = await tx.execute<ActivityRow>(sql`
+        insert into app.lead_activities (workspace_id, lead_id, actor_id, kind, data)
+        select ${input.workspaceId}::uuid, ${input.leadId}::uuid, ${input.actorId}::uuid,
+               'system', '{"event":"opened"}'::jsonb
+        where not exists (
+          select 1 from app.lead_activities opened
+          where opened.workspace_id = ${input.workspaceId}
+            and opened.lead_id = ${input.leadId}
+            and opened.kind = 'system'
+            and opened.data ->> 'event' = 'opened'
+        )
+        returning id, actor_id as "actorId", kind, body, data, ${iso('created_at')} as "createdAt"
+      `);
+      const [row] = inserted;
+      return { status: 'opened', activity: row ? toLeadActivity(row) : null };
+    });
+  }
+
+  setArchived(
+    input: WriteScope & { leadId: string; archived: boolean },
+  ): Promise<ArchiveLeadOutcome> {
+    return this.database.withTenantTx(input, async (tx) => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed === input.archived) {
+        return {
+          status: 'unchanged',
+          lead: await requireDetail(tx, input.workspaceId, input.leadId),
+          activity: null,
+        };
+      }
+
+      // Archiving is a visibility change, not work on the lead, so
+      // `updated_at` (the inbox's order) is left alone and a restored lead
+      // returns to its old place. Stored names stay `trashed`/`restored`.
+      await tx
+        .update(leads)
+        .set({ deletedAt: input.archived ? new Date() : null })
+        .where(and(eq(leads.workspaceId, input.workspaceId), eq(leads.id, input.leadId)));
+      // Its flows' waits and timers end with it; a restore does not revive them.
+      if (input.archived) await cancelLeadWork(tx, input.workspaceId, input.leadId);
+      const [entry] = await tx
+        .insert(leadActivities)
+        .values({
+          workspaceId: input.workspaceId,
+          leadId: input.leadId,
+          actorId: input.actorId,
+          kind: 'system',
+          data: { event: input.archived ? 'trashed' : 'restored' },
+        })
+        .returning(ACTIVITY_RETURNING);
+      if (!entry) throw new Error('activity insert did not return a row');
+      await tx.insert(auditEvents).values({
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        actorLabel: 'staff actor',
+        action: input.archived ? 'lead.trashed' : 'lead.restored',
+        entity: 'lead',
+        entityId: input.leadId,
+        requestId: input.requestId,
+        before: { trashed: lead.trashed },
+        after: { trashed: input.archived },
+      });
+
+      const [activity] = insertedActivities([entry]);
+      return {
+        status: 'changed',
+        lead: await requireDetail(tx, input.workspaceId, input.leadId),
+        activity: activity ?? null,
+      };
+    });
+  }
+
+  previewAiLeadUpdate(
+    input: Scope & { leadId: string; field: AiLeadUpdateDraft['field'] },
+  ): Promise<AiLeadUpdatePreview | undefined> {
+    return this.database.withTenantTx(input, async (tx) => {
+      await tx.execute(sql`set local statement_timeout = '5s'`);
+      const [row] = await tx
+        .select({
+          stage: leads.stage,
+          leadType: leads.leadType,
+          assignedActorId: leads.assignedActorId,
+          fullName: leads.fullName,
+          phone: leads.phone,
+          orderDetails: leads.orderDetails,
+          version: sql<string>`updated_at::text`,
+        })
+        .from(leads)
+        .where(
+          and(
+            eq(leads.workspaceId, input.workspaceId),
+            eq(leads.id, input.leadId),
+            sql`${leads.deletedAt} is null`,
+            sql`${leads.customerDataRestrictedAt} is null`,
+          ),
+        );
+      if (!row) return undefined;
+      const before = row[input.field];
+      const choices: AiLeadUpdatePreview['choices'] = [];
+      if (input.field === 'stage') {
+        // Each move is planned exactly as a confirmation would plan it (no
+        // order edit, no override), so a gate the assistant cannot satisfy is
+        // named before a card is made rather than refused after Confirm.
+        const current = toLeadOrder(row.orderDetails);
+        const today = todayInToronto(new Date());
+        let missing: string[] | undefined;
+        for (const value of allowedStageMoves(row.leadType, row.stage)) {
+          const choice: AiLeadUpdatePreview['choices'][number] = {
+            value,
+            label: leadStageLabel(row.leadType, value),
+          };
+          const move = planStageMove({
+            leadType: row.leadType,
+            from: row.stage,
+            to: value,
+            current,
+            edit: undefined,
+            today,
+          });
+          if (!move.ok) {
+            if (move.refusal.status === 'dispatch_details_required')
+              choice.needs = 'dispatch_details';
+            else if (move.refusal.status === 'activation_details_required')
+              choice.needs = 'activation_details';
+          } else if (move.gates.includes('documents')) {
+            missing ??= await findMissingDocuments(tx, {
+              workspaceId: input.workspaceId,
+              leadId: input.leadId,
+              required: current.plan?.requiredDocuments ?? [],
+            });
+            if (missing.length > 0) {
+              choice.needs = 'documents';
+              choice.missingDocuments = [...missing];
+            }
+          }
+          choices.push(choice);
+        }
+      }
+      return {
+        version: row.version,
+        before,
+        beforeLabel:
+          input.field === 'stage'
+            ? leadStageLabel(row.leadType, row.stage)
+            : (before ?? 'Unassigned / not recorded'),
+        choices,
+      };
+    });
+  }
+
+  confirmAiLeadUpdate(
+    input: WriteScope & {
+      draft: AiLeadUpdateDraft;
+      creationId: string;
+      before: string;
+      aiCardId?: string;
+    },
+  ): Promise<AiLeadUpdateConfirmOutcome> {
+    const queued: string[] = [];
+    return this.database
+      .withTenantTx(input, async (tx): Promise<AiLeadUpdateConfirmOutcome> => {
+        const lead = await lockLead(tx, input.workspaceId, input.draft.leadId);
+        if (!lead) return { status: 'not_found' };
+        if (lead.trashed) return { status: 'trashed' };
+        const [receipt] = await tx
+          .select({ id: auditEvents.id })
+          .from(auditEvents)
+          .where(
+            and(
+              eq(auditEvents.workspaceId, input.workspaceId),
+              eq(auditEvents.id, input.creationId),
+              eq(auditEvents.actorId, input.actorId),
+              eq(auditEvents.entityId, input.draft.leadId),
+              eq(auditEvents.action, 'ai.lead_updated'),
+            ),
+          );
+        if (receipt) return { status: 'saved', recordId: input.draft.leadId };
+        // ACT-3: only a change to the field itself makes the card stale; a
+        // note, a task or another card on the lead does not.
+        const [row] = await tx
+          .select({
+            stage: leads.stage,
+            assignedActorId: leads.assignedActorId,
+            fullName: leads.fullName,
+            phone: leads.phone,
+          })
+          .from(leads)
+          .where(and(eq(leads.workspaceId, input.workspaceId), eq(leads.id, input.draft.leadId)));
+        if (!row || aiLeadValueDigest(row[input.draft.field]) !== input.before)
+          return { status: 'conflict' };
+        const { field, value } = input.draft;
+        if (field === 'assignedActorId' && value !== null && !z.uuid().safeParse(value).success)
+          return { status: 'invalid' };
+        if (
+          (field !== 'assignedActorId' && value === null) ||
+          (field === 'phone' && (value?.length ?? 0) > 40)
+        )
+          return { status: 'invalid' };
+        const outcome = await applyLeadUpdate(
+          tx,
+          { emailEnvironment: this.emailEnvironment, aiActionId: input.creationId, queued },
+          {
+            ...input,
+            leadId: input.draft.leadId,
+            catalog: codePropertyCatalog,
+            ...(field === 'stage' && value !== null ? { stage: value } : {}),
+            ...(field === 'assignedActorId' ? { assignedActorId: value } : {}),
+            ...(field === 'fullName' && value !== null ? { contact: { fullName: value } } : {}),
+            ...(field === 'phone' && value !== null ? { contact: { phone: value } } : {}),
+          },
+        );
+        // Throwing rolls back any partial work (a rescue's freeze included);
+        // the refusal itself is returned below, not swallowed.
+        if (outcome.status !== 'updated') throw new AiLeadUpdateRefused(outcome);
+        await tx.insert(auditEvents).values({
+          id: input.creationId,
+          workspaceId: input.workspaceId,
+          actorId: input.actorId,
+          actorLabel: 'staff actor',
+          action: 'ai.lead_updated',
+          entity: 'lead',
+          entityId: input.draft.leadId,
+          requestId: input.requestId,
+          after: { field, ...(input.aiCardId ? { aiCardId: input.aiCardId } : {}) },
+        });
+        return { status: 'saved', recordId: input.draft.leadId };
+      })
+      .then(async (outcome) => {
+        // ENG-5: the move's flows run once the confirmation has committed.
+        if (outcome.status === 'saved' && queued.length > 0) {
+          await runQueuedStarts(
+            this.database,
+            {
+              workspaceId: input.workspaceId,
+              actorId: input.actorId,
+              requestId: input.requestId,
+              environment: this.emailEnvironment,
+              catalog: codePropertyCatalog,
+            },
+            queued,
+          );
+        }
+        return outcome;
+      })
+      .catch((error: unknown): AiLeadUpdateConfirmOutcome => {
+        if (error instanceof AiLeadUpdateRefused)
+          return { status: 'refused', refusal: error.outcome };
+        throw error;
+      });
+  }
+
+  aiCardOf(input: Scope & { rootId: string }): Promise<string | null> {
+    return this.database.withTenantTx(input, async (tx) => {
+      const [row] = await tx.execute<{ card: string | null }>(sql`
+        select after ->> 'aiCardId' as card from app.audit_events
+        where workspace_id = ${input.workspaceId}
+          and action in ('ai.lead_updated', 'lead.note_added', 'lead.task_created', 'lead.customer_emailed')
+          and (id::text = ${input.rootId} or after ->> 'aiActionId' = ${input.rootId})
+        order by created_at
+        limit 1
+      `);
+      return row?.card ?? null;
+    });
+  }
+
+  previewAiEmail(
+    input: WriteScope & { leadId: string },
+  ): Promise<{ toAddress: string; fromAddress: string } | undefined> {
+    return this.database.withTenantTx(input, async (tx) => {
+      if (!this.emailEnvironment.providerReady) return undefined;
+      await tx.execute(sql`set local statement_timeout = '5s'`);
+      const [lead] = await tx
+        .select({ email: leads.email })
+        .from(leads)
+        .where(
+          and(
+            eq(leads.workspaceId, input.workspaceId),
+            eq(leads.id, input.leadId),
+            sql`${leads.deletedAt} is null`,
+            sql`${leads.customerDataRestrictedAt} is null`,
+          ),
+        );
+      const site = await resolveSiteSender(tx, input.workspaceId);
+      const toAddress = customerEmailJobPayloadSchema.shape.toAddress.safeParse(
+        lead?.email?.trim(),
+      );
+      return site && toAddress.success
+        ? { toAddress: toAddress.data, fromAddress: site.sender.fromAddress }
+        : undefined;
+    });
+  }
+
+  queueAiEmail(
+    input: WriteScope & {
+      leadId: string;
+      creationId: string;
+      aiCardId?: string;
+      draft: Extract<AiActionDraft, { kind: 'email' }>;
+      emailContext: { toAddress: string; fromAddress: string };
+    },
+  ): Promise<
+    | { status: 'queued'; recordId: string }
+    | { status: 'not_found' | 'trashed' | 'no_sender' | 'missing' | 'changed' }
+  > {
+    return this.database.withTenantTx(input, async (tx) => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed) return { status: 'trashed' };
+      const dedupeKey = `ai_email:${input.creationId}`;
+      const [existing] = await tx
+        .select({ id: outboxJobs.id })
+        .from(outboxJobs)
+        .where(
+          and(
+            eq(outboxJobs.workspaceId, input.workspaceId),
+            eq(outboxJobs.jobType, 'lead_customer_email'),
+            eq(outboxJobs.dedupeKey, dedupeKey),
+          ),
+        );
+      if (existing) return { status: 'queued', recordId: existing.id };
+      if (!this.emailEnvironment.providerReady) return { status: 'no_sender' };
+      const site = await resolveSiteSender(tx, input.workspaceId);
+      if (!site) return { status: 'no_sender' };
+      if (
+        !lead.email ||
+        !customerEmailJobPayloadSchema.shape.toAddress.safeParse(lead.email.trim()).success
+      )
+        return { status: 'missing' };
+      if (
+        lead.email.trim() !== input.emailContext.toAddress ||
+        site.sender.fromAddress !== input.emailContext.fromAddress
+      )
+        return { status: 'changed' };
+      const payload = customerEmailJobPayloadSchema.parse({
+        leadId: input.leadId,
+        // A per-message custom-template transport label; never read as a saved template.
+        template: `tpl_${input.creationId.replace(/-/g, '').slice(0, 16)}`,
+        templateVersion: 0,
+        toAddress: lead.email.trim(),
+        contactHash: this.emailEnvironment.contactHash(lead.email.trim()),
+        sender: site.sender,
+        rendered: renderPlainCustomerEmail({ ...input.draft, branding: site.branding }),
+      });
+      const queued = await queueComposedEmail(tx, {
+        ...input,
+        dedupeKey,
+        payload,
+        automation: null,
+        templateName: 'AI email',
+        aiActionId: input.creationId,
+        ...(input.aiCardId ? { aiCardId: input.aiCardId } : {}),
+      });
+      if (!queued.jobId) throw new Error('AI email queue did not return a job');
+      return { status: 'queued', recordId: queued.jobId };
+    });
+  }
+
+  queueCustomerEmail(input: QueueCustomerEmailInput): Promise<CustomerEmailOutcome> {
+    return this.database.withTenantTx(input, async (tx): Promise<CustomerEmailOutcome> => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed) return { status: 'trashed' };
+      const composed = await composeCustomerEmail(tx, this.emailEnvironment, {
+        workspaceId: input.workspaceId,
+        template: input.template,
+        recipient: { kind: 'lead', lead: automationLeadOf(lead) },
+      });
+      if (composed.kind === 'skipped') {
+        if (composed.reason === 'no_sender') return { status: 'no_sender' };
+        if (composed.reason === 'no_customer_email') {
+          return { status: 'missing', missing: ['customer email'] };
+        }
+        return { status: 'missing', missing: composed.missing ?? [] };
+      }
+
+      // Sent by the outbox, after this commits; the address and the mail's
+      // words live only in the job, never on the timeline or in the audit.
+      const queued = await queueComposedEmail(tx, {
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        requestId: input.requestId,
+        leadId: input.leadId,
+        // One mail per request: sending again is a second, deliberate mail.
+        dedupeKey: `${input.leadId}:${input.requestId}`,
+        payload: composed.payload,
+        automation: null,
+      });
+      // Request ids are the server's own, fresh per request: a hit is a bug.
+      if (!queued.activity) throw new Error('this request already queued its mail');
+      return { status: 'queued', activity: queued.activity };
+    });
+  }
+
+  addNote(
+    input: WriteScope & { leadId: string; body: string; creationId?: string; aiCardId?: string },
+  ): Promise<NoteOutcome> {
+    return this.database.withTenantTx(input, async (tx) => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed) return { status: 'trashed' };
+
+      if (input.creationId) {
+        const [existing] = await tx
+          .select(ACTIVITY_RETURNING)
+          .from(leadActivities)
+          .where(
+            and(
+              eq(leadActivities.workspaceId, input.workspaceId),
+              eq(leadActivities.leadId, input.leadId),
+              eq(leadActivities.actorId, input.actorId),
+              eq(leadActivities.kind, 'note'),
+              eq(leadActivities.id, input.creationId),
+            ),
+          );
+        if (existing) return { status: 'created', activity: insertedActivity(existing) };
+      }
+      const [entry] = await tx
+        .insert(leadActivities)
+        .values({
+          ...(input.creationId === undefined ? {} : { id: input.creationId }),
+          workspaceId: input.workspaceId,
+          leadId: input.leadId,
+          actorId: input.actorId,
+          kind: 'note',
+          body: input.body,
+          ...(input.creationId ? { data: { viaAi: true } } : {}),
+        })
+        .returning(ACTIVITY_RETURNING);
+      if (!entry) throw new Error('activity insert did not return a row');
+      // A note is work on the lead: it moves up the inbox.
+      await tx
+        .update(leads)
+        .set({ updatedAt: new Date() })
+        .where(and(eq(leads.workspaceId, input.workspaceId), eq(leads.id, input.leadId)));
+      await tx.insert(auditEvents).values({
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        actorLabel: 'staff actor',
+        action: 'lead.note_added',
+        entity: 'lead',
+        entityId: input.leadId,
+        requestId: input.requestId,
+        after: {
+          activityId: entry.id,
+          ...(input.creationId === undefined ? {} : { aiActionId: input.creationId }),
+          ...(input.aiCardId === undefined ? {} : { aiCardId: input.aiCardId }),
+        },
+      });
+
+      const [activity] = insertedActivities([entry]);
+      if (!activity) throw new Error('note insert did not return its entry');
+      return { status: 'created', activity };
+    });
+  }
+
+  createTask(input: CreateTaskInput): Promise<TaskOutcome> {
+    return this.database.withTenantTx(input, async (tx) => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed) return { status: 'trashed' };
+      if (input.creationId) {
+        const [existing] = await tx
+          .select({ id: leadTasks.id })
+          .from(leadTasks)
+          .where(
+            and(
+              eq(leadTasks.workspaceId, input.workspaceId),
+              eq(leadTasks.leadId, input.leadId),
+              eq(leadTasks.createdBy, input.actorId),
+              eq(leadTasks.id, input.creationId),
+            ),
+          );
+        if (existing)
+          return { status: 'saved', task: await requireTask(tx, input.workspaceId, existing.id) };
+      }
+      const assignee = input.assignedActorId ?? null;
+      if (assignee !== null && !(await isActiveMember(tx, input.workspaceId, assignee))) {
+        return { status: 'assignee_not_found' };
+      }
+
+      const { taskId } = await insertLeadTask(tx, {
+        ...(input.creationId === undefined ? {} : { creationId: input.creationId }),
+        ...(input.aiCardId === undefined ? {} : { aiCardId: input.aiCardId }),
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        requestId: input.requestId,
+        leadId: input.leadId,
+        title: input.title,
+        dueAt: input.dueAt ?? null,
+        assignedActorId: assignee,
+      });
+      return { status: 'saved', task: await requireTask(tx, input.workspaceId, taskId) };
+    });
+  }
+
+  updateTask(input: UpdateTaskInput): Promise<TaskOutcome> {
+    return this.database.withTenantTx(input, async (tx) => {
+      const [current] = await tx.execute<{
+        [key: string]: unknown;
+        status: string;
+        title: string;
+        dueAt: Date | string | null;
+        assignedActorId: string | null;
+        trashed: boolean;
+        leadId: string;
+      }>(sql`
+        select
+          k.lead_id as "leadId",
+          k.status,
+          k.title,
+          k.due_at as "dueAt",
+          k.assigned_actor_id as "assignedActorId",
+          l.deleted_at is not null as trashed
+        from app.lead_tasks k
+        inner join app.leads l on l.workspace_id = k.workspace_id and l.id = k.lead_id
+        where k.workspace_id = ${input.workspaceId}
+          and k.id = ${input.taskId}
+          and l.customer_data_restricted_at is null
+        for update of k
+      `);
+      if (!current) return { status: 'not_found' };
+      if (current.trashed) return { status: 'trashed' };
+      if (
+        input.assignedActorId !== undefined &&
+        input.assignedActorId !== null &&
+        input.assignedActorId !== current.assignedActorId &&
+        !(await isActiveMember(tx, input.workspaceId, input.assignedActorId))
+      ) {
+        return { status: 'assignee_not_found' };
+      }
+
+      const set: Partial<typeof leadTasks.$inferInsert> = {};
+      const changedFields: string[] = [];
+      if (input.title !== undefined && input.title !== current.title) {
+        set.title = input.title;
+        changedFields.push('title');
+      }
+      if (input.dueAt !== undefined) {
+        set.dueAt = input.dueAt === null ? null : new Date(input.dueAt);
+        changedFields.push('dueAt');
+      }
+      if (
+        input.assignedActorId !== undefined &&
+        input.assignedActorId !== current.assignedActorId
+      ) {
+        set.assignedActorId = input.assignedActorId;
+        changedFields.push('assignedActorId');
+      }
+      if (input.status !== undefined && input.status !== current.status) {
+        set.status = input.status;
+        // The completion check pairs `done` with a completion time; any other
+        // status clears it, so a reopened task is open again in full.
+        set.completedAt = input.status === 'done' ? new Date() : null;
+        changedFields.push('status');
+      }
+      if (changedFields.length === 0) {
+        return { status: 'saved', task: await requireTask(tx, input.workspaceId, input.taskId) };
+      }
+
+      await tx
+        .update(leadTasks)
+        .set({ ...set, updatedAt: new Date() })
+        .where(and(eq(leadTasks.workspaceId, input.workspaceId), eq(leadTasks.id, input.taskId)));
+      await tx.insert(auditEvents).values({
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        actorLabel: 'staff actor',
+        action: 'lead.task_updated',
+        entity: 'lead_task',
+        entityId: input.taskId,
+        requestId: input.requestId,
+        before: { status: current.status },
+        after: { changedFields, status: input.status ?? current.status },
+      });
+      // An active (open or in-progress) task with a new due day, or one
+      // reopened from done or cancelled with a due day, starts its overdue
+      // clock. Moving between open and in progress keeps the clock it has.
+      const status = input.status ?? current.status;
+      const dueAt = input.dueAt !== undefined ? input.dueAt : current.dueAt;
+      const dueMoved =
+        input.dueAt !== undefined &&
+        input.dueAt !== null &&
+        (current.dueAt === null || taskDueDay(input.dueAt) !== taskDueDay(current.dueAt));
+      const reopened =
+        input.status !== undefined &&
+        isActiveTaskStatus(input.status) &&
+        !isActiveTaskStatus(current.status);
+      if (isActiveTaskStatus(status) && dueAt !== null && (dueMoved || reopened)) {
+        await writeTaskTimers(tx, input.workspaceId, current.leadId, input.taskId, dueAt);
+      }
+      return { status: 'saved', task: await requireTask(tx, input.workspaceId, input.taskId) };
+    });
+  }
+
+  listTasks(
+    input: Scope & {
+      assignee: TaskAssigneeFilter;
+      status: TaskStatusFilter;
+      dueBy?: string;
+      completedSince?: string;
+    },
+    page: number,
+    pageSize: number,
+  ) {
+    return this.database.withTenantTx(input, (tx) =>
+      selectWorkspaceTasks(
+        tx,
+        {
+          workspaceId: input.workspaceId,
+          actorId: input.actorId,
+          assignee: input.assignee,
+          status: input.status,
+          dueBy: input.dueBy,
+          completedSince: input.completedSince,
+        },
+        page,
+        pageSize,
+      ),
+    );
+  }
+}

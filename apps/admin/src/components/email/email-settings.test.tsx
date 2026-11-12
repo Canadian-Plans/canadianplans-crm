@@ -1,0 +1,486 @@
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  CUSTOMER_EMAIL_TEMPLATES,
+  CUSTOMER_EMAIL_TEMPLATE_LABELS,
+  type CustomerEmailTemplate,
+  type EmailSettingsResponse,
+  type SiteEmailTemplate,
+  type UpdateEmailSettingsRequest,
+} from '@canadian-plans/contracts';
+
+import { EmailSettings, EmailSettingsScreen } from './email-settings';
+
+const WORKSPACE = '10000000-0000-4000-8000-000000000001';
+const STAMP = '2026-10-01T00:00:00.000Z';
+const STAFF = '30000000-0000-4000-8000-000000000001';
+
+const mocks = vi.hoisted(() => {
+  class FakeBackendError extends Error {
+    constructor(
+      readonly code: string,
+      readonly status: number,
+      readonly details?: Record<string, unknown>,
+    ) {
+      super(code);
+    }
+  }
+  return {
+    FakeBackendError,
+    getEmailSettings: vi.fn(),
+    updateEmailSettings: vi.fn(),
+    listEmailTemplates: vi.fn(),
+    createEmailTemplate: vi.fn(),
+    updateEmailTemplate: vi.fn(),
+    archiveEmailTemplate: vi.fn(),
+    restoreEmailTemplate: vi.fn(),
+    previewEmailTemplate: vi.fn(),
+    sendTestEmail: vi.fn(),
+  };
+});
+
+vi.mock('../../lib/api', () => ({
+  getEmailSettings: mocks.getEmailSettings,
+  updateEmailSettings: mocks.updateEmailSettings,
+  listEmailTemplates: mocks.listEmailTemplates,
+  createEmailTemplate: mocks.createEmailTemplate,
+  updateEmailTemplate: mocks.updateEmailTemplate,
+  archiveEmailTemplate: mocks.archiveEmailTemplate,
+  restoreEmailTemplate: mocks.restoreEmailTemplate,
+  previewEmailTemplate: mocks.previewEmailTemplate,
+  sendTestEmail: mocks.sendTestEmail,
+  BackendError: mocks.FakeBackendError,
+}));
+
+vi.mock('../staff-session-provider', () => ({
+  useStaffSession: () => ({
+    accessToken: 'staff-token',
+    workspaces: [{ id: WORKSPACE, slug: 'canadawide', roles: ['owner'] }],
+  }),
+}));
+
+const saved: EmailSettingsResponse = {
+  settings: {
+    fromName: 'CanadaWide',
+    fromAddress: 'orders@canadawide.example',
+    replyTo: null,
+    logoUrl: null,
+    brandColor: '#123abc',
+    footerText: 'CanadaWide, Toronto',
+    siteUrl: 'https://canadawide.example',
+    style: 'classic',
+    accentColor: null,
+    updatedAt: STAMP,
+    updatedBy: STAFF,
+  },
+  requestId: 'req_test',
+};
+
+const unsaved: EmailSettingsResponse = { settings: null, requestId: 'req_test' };
+
+function template(key: CustomerEmailTemplate, version = 0): SiteEmailTemplate {
+  return {
+    key,
+    name: CUSTOMER_EMAIL_TEMPLATE_LABELS[key],
+    archived: false,
+    usedBy: [],
+    subject: `Subject of ${key}`,
+    body: `Body of ${key}`,
+    version,
+    updatedAt: version === 0 ? null : STAMP,
+    updatedBy: version === 0 ? null : STAFF,
+  };
+}
+
+const siteMade: SiteEmailTemplate = {
+  key: 'tpl_abcdefghij012345',
+  name: 'Welcome check-in',
+  archived: false,
+  usedBy: [],
+  subject: 'Checking in, {first name}',
+  body: 'Hi {first name}, how is your {plan}?',
+  version: 1,
+  updatedAt: STAMP,
+  updatedBy: STAFF,
+};
+
+const templates = CUSTOMER_EMAIL_TEMPLATES.map((key) =>
+  template(key, key === 'dispatched' ? 4 : 0),
+);
+
+const field = (name: string) => screen.getByRole('textbox', { name });
+
+describe('EmailSettings form', () => {
+  it('saves the whole form, the brand colour in lower case and empty fields as null', async () => {
+    const onSave = vi.fn((_input: UpdateEmailSettingsRequest) => Promise.resolve(undefined));
+    render(<EmailSettings initial={saved} onSave={onSave} />);
+    fireEvent.change(field('Brand colour'), { target: { value: '#AABBCC' } });
+    expect(screen.getByLabelText('Brand colour picker')).toHaveProperty('value', '#aabbcc');
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith({
+        fromName: 'CanadaWide',
+        fromAddress: 'orders@canadawide.example',
+        replyTo: null,
+        logoUrl: null,
+        brandColor: '#aabbcc',
+        footerText: 'CanadaWide, Toronto',
+        siteUrl: 'https://canadawide.example',
+        style: 'classic',
+        accentColor: null,
+      }),
+    );
+    expect((await screen.findByRole('status')).textContent).toContain('Saved.');
+  });
+
+  it('saves the Website hero style with its accent colour in lower case', async () => {
+    const onSave = vi.fn((_input: UpdateEmailSettingsRequest) => Promise.resolve(undefined));
+    render(<EmailSettings initial={saved} onSave={onSave} />);
+    const select = screen.getByRole('combobox', { name: 'Style' });
+    expect(select).toHaveProperty('value', 'classic');
+    expect(
+      within(select)
+        .getAllByRole('option')
+        .map((option) => option.textContent),
+    ).toEqual(['Classic', 'Website hero']);
+    fireEvent.change(select, { target: { value: 'hero' } });
+    fireEvent.change(field('Accent colour'), { target: { value: '#C0FF72' } });
+    expect(screen.getByLabelText('Accent colour picker')).toHaveProperty('value', '#c0ff72');
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ style: 'hero', accentColor: '#c0ff72' }),
+      ),
+    );
+  });
+
+  it('starts from the saved style and accent, and refuses a malformed accent', async () => {
+    const onSave = vi.fn();
+    render(
+      <EmailSettings
+        initial={{
+          ...saved,
+          settings: { ...saved.settings!, style: 'hero', accentColor: '#c0ff72' },
+        }}
+        onSave={onSave}
+      />,
+    );
+    expect(screen.getByRole('combobox', { name: 'Style' })).toHaveProperty('value', 'hero');
+    expect(field('Accent colour')).toHaveProperty('value', '#c0ff72');
+    fireEvent.change(field('Accent colour'), { target: { value: 'lime' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    expect(await screen.findByText(/such as #c0ff72, or leave it empty/)).toBeTruthy();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('sketches the chosen style in the typed colours as the form changes', () => {
+    render(<EmailSettings initial={saved} onSave={vi.fn()} />);
+    const sketch = () => screen.getByRole('figure', { name: 'Style preview' });
+    expect(sketch().textContent).toContain('Classic style');
+    expect(sketch().innerHTML).not.toContain('linear-gradient');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Style' }), {
+      target: { value: 'hero' },
+    });
+    fireEvent.change(field('Accent colour'), { target: { value: '#c0ff72' } });
+    expect(sketch().textContent).toContain('Website hero style');
+    expect(sketch().textContent).toContain('CanadaWide');
+    expect(sketch().innerHTML).toContain('linear-gradient');
+    expect(sketch().innerHTML).toMatch(/background: (#c0ff72|rgb\(192, 255, 114\))/);
+  });
+
+  it('keeps the picker and the text field in step', () => {
+    render(<EmailSettings initial={saved} onSave={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText('Brand colour picker'), {
+      target: { value: '#00ff00' },
+    });
+    expect(field('Brand colour')).toHaveProperty('value', '#00ff00');
+  });
+
+  it('explains a sender address and refuses a malformed colour', async () => {
+    const onSave = vi.fn();
+    render(<EmailSettings initial={saved} onSave={onSave} />);
+    expect(
+      screen.getByText('Must be on a domain verified in Resend; send yourself a test to check.'),
+    ).toBeTruthy();
+    fireEvent.change(field('Brand colour'), { target: { value: 'red' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    expect(await screen.findByText(/Enter a colour as #rrggbb/)).toBeTruthy();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('starts empty when nothing is saved, and says the site sends no email until saved', () => {
+    render(<EmailSettings initial={unsaved} onSave={vi.fn()} />);
+    expect(
+      screen.getByText('Not saved yet: this site sends no email until you save these settings.'),
+    ).toBeTruthy();
+    expect(field('Sender name')).toHaveProperty('value', '');
+    expect(field('Sender address')).toHaveProperty('value', '');
+    expect(field('Site address')).toHaveProperty('value', '');
+    expect(field('Brand colour')).toHaveProperty('value', '#d72638');
+  });
+
+  it('shows no note once the settings are saved', () => {
+    render(<EmailSettings initial={saved} onSave={vi.fn()} />);
+    expect(screen.queryByText(/Not saved yet/)).toBeNull();
+  });
+});
+
+describe('EmailSettingsScreen', () => {
+  beforeEach(() => {
+    for (const mock of [
+      mocks.getEmailSettings,
+      mocks.updateEmailSettings,
+      mocks.listEmailTemplates,
+      mocks.createEmailTemplate,
+      mocks.updateEmailTemplate,
+      mocks.archiveEmailTemplate,
+      mocks.restoreEmailTemplate,
+      mocks.previewEmailTemplate,
+      mocks.sendTestEmail,
+    ]) {
+      mock.mockReset();
+    }
+    mocks.getEmailSettings.mockResolvedValue(saved);
+    mocks.listEmailTemplates.mockResolvedValue({
+      templates,
+      nextBefore: null,
+      requestId: 'req_test',
+    });
+    mocks.previewEmailTemplate.mockResolvedValue({
+      subject: 'Subject of dispatched',
+      html: '<p>Body</p>',
+      text: 'Body',
+      requestId: 'req_test',
+    });
+  });
+
+  it('loads the settings and the templates of the site', async () => {
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    expect(await screen.findByRole('list', { name: 'Emails' })).toBeTruthy();
+    expect(mocks.getEmailSettings).toHaveBeenCalledWith('staff-token', WORKSPACE);
+    expect(mocks.listEmailTemplates).toHaveBeenCalledWith('staff-token', WORKSPACE);
+    expect(field('Sender name')).toHaveProperty('value', 'CanadaWide');
+  });
+
+  it('opens the editor of the template the address names', async () => {
+    render(<EmailSettingsScreen workspaceSlug="canadawide" initialTemplate="dispatched" />);
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('heading', { name: 'Dispatched' })).toBeTruthy();
+    expect(within(dialog).getByRole('textbox', { name: 'Subject' })).toHaveProperty(
+      'value',
+      'Subject of dispatched',
+    );
+  });
+
+  it('saves the settings and reads them back', async () => {
+    mocks.updateEmailSettings.mockResolvedValue(saved);
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Save settings' }));
+    await waitFor(() =>
+      expect(mocks.updateEmailSettings).toHaveBeenCalledWith(
+        'staff-token',
+        WORKSPACE,
+        expect.objectContaining({ fromName: 'CanadaWide', brandColor: '#123abc' }),
+      ),
+    );
+    await waitFor(() => expect(mocks.getEmailSettings).toHaveBeenCalledTimes(2));
+  });
+
+  it('creates a new site-made template from New template and reloads the list', async () => {
+    mocks.createEmailTemplate.mockResolvedValue({
+      template: siteMade,
+      requestId: 'req_test',
+    });
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'New template' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), {
+      target: { value: 'Welcome check-in' },
+    });
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Subject' }), {
+      target: { value: 'Checking in, {first name}' },
+    });
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Body' }), {
+      target: { value: 'Hi {first name}, how is your {plan}?' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create template' }));
+    await waitFor(() =>
+      expect(mocks.createEmailTemplate).toHaveBeenCalledWith('staff-token', WORKSPACE, {
+        name: 'Welcome check-in',
+        subject: 'Checking in, {first name}',
+        body: 'Hi {first name}, how is your {plan}?',
+      }),
+    );
+    await waitFor(() => expect(mocks.listEmailTemplates).toHaveBeenCalledTimes(2));
+  });
+
+  it('archives and restores a site-made template', async () => {
+    mocks.listEmailTemplates
+      .mockResolvedValueOnce({
+        templates: [...templates, siteMade],
+        nextBefore: null,
+        requestId: 'req_test',
+      })
+      .mockResolvedValueOnce({
+        templates,
+        nextBefore: null,
+        requestId: 'req_test',
+      })
+      .mockResolvedValueOnce({
+        templates: [{ ...siteMade, archived: true }],
+        nextBefore: null,
+        requestId: 'req_test',
+      })
+      .mockResolvedValue({
+        templates: [...templates, siteMade],
+        nextBefore: null,
+        requestId: 'req_test',
+      });
+    mocks.archiveEmailTemplate.mockResolvedValue({
+      template: { ...siteMade, archived: true },
+      requestId: 'req_test',
+    });
+    mocks.restoreEmailTemplate.mockResolvedValue({
+      template: siteMade,
+      requestId: 'req_test',
+    });
+
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Archive Welcome check-in' }));
+    await waitFor(() =>
+      expect(mocks.archiveEmailTemplate).toHaveBeenCalledWith(
+        'staff-token',
+        WORKSPACE,
+        'tpl_abcdefghij012345',
+      ),
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Archived templates' }));
+    await waitFor(() =>
+      expect(mocks.listEmailTemplates).toHaveBeenCalledWith('staff-token', WORKSPACE, {
+        archived: '1',
+      }),
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore Welcome check-in' }));
+    await waitFor(() =>
+      expect(mocks.restoreEmailTemplate).toHaveBeenCalledWith(
+        'staff-token',
+        WORKSPACE,
+        'tpl_abcdefghij012345',
+      ),
+    );
+  });
+
+  it('saves a template with its version and reports a conflict in words', async () => {
+    mocks.updateEmailTemplate.mockRejectedValue(
+      new mocks.FakeBackendError('version_conflict', 409),
+    );
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit Dispatched' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(mocks.updateEmailTemplate).toHaveBeenCalledWith(
+        'staff-token',
+        WORKSPACE,
+        'dispatched',
+        {
+          expectedVersion: 4,
+          subject: 'Subject of dispatched',
+          body: 'Body of dispatched',
+        },
+      ),
+    );
+    expect(
+      await within(dialog).findByText(
+        'Someone else saved this template. The latest version is loaded and your draft is kept. Check it, then save again.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('reads the emails again on a conflict, keeps the draft and saves it over the new version', async () => {
+    mocks.listEmailTemplates.mockResolvedValueOnce({
+      templates,
+      nextBefore: null,
+      requestId: 'req_test',
+    });
+    mocks.listEmailTemplates.mockResolvedValue({
+      templates: templates.map((entry) =>
+        entry.key === 'dispatched' ? template('dispatched', 5) : entry,
+      ),
+      nextBefore: null,
+      requestId: 'req_test',
+    });
+    mocks.updateEmailTemplate
+      .mockRejectedValueOnce(new mocks.FakeBackendError('version_conflict', 409))
+      .mockResolvedValueOnce({ template: template('dispatched', 6), requestId: 'req_test' });
+    render(<EmailSettingsScreen workspaceSlug="canadawide" initialTemplate="dispatched" />);
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Body' }), {
+      target: { value: 'Your SIM is on its way.' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+
+    expect(
+      await within(dialog).findByText(
+        'Someone else saved this template. The latest version is loaded and your draft is kept. Check it, then save again.',
+      ),
+    ).toBeTruthy();
+    await waitFor(() => expect(mocks.listEmailTemplates).toHaveBeenCalledTimes(2));
+    expect(within(dialog).getByRole('textbox', { name: 'Body' })).toHaveProperty(
+      'value',
+      'Your SIM is on its way.',
+    );
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(mocks.updateEmailTemplate).toHaveBeenLastCalledWith(
+        'staff-token',
+        WORKSPACE,
+        'dispatched',
+        { expectedVersion: 5, subject: 'Subject of dispatched', body: 'Your SIM is on its way.' },
+      ),
+    );
+    expect(await within(dialog).findByText('Saved.')).toBeTruthy();
+  });
+
+  it('sends a test of the template', async () => {
+    mocks.sendTestEmail.mockResolvedValue({ queued: true, requestId: 'req_test' });
+    render(<EmailSettingsScreen workspaceSlug="canadawide" initialTemplate="dispatched" />);
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Send me a test' }));
+    expect(await within(dialog).findByText('Sent to your address: check your inbox.')).toBeTruthy();
+    expect(mocks.sendTestEmail).toHaveBeenCalledWith('staff-token', WORKSPACE, 'dispatched');
+  });
+
+  it('says when a test was already sent this minute', async () => {
+    mocks.sendTestEmail.mockResolvedValue({ queued: false, requestId: 'req_test' });
+    render(<EmailSettingsScreen workspaceSlug="canadawide" initialTemplate="dispatched" />);
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Send me a test' }));
+    expect(await within(dialog).findByText('A test was already sent this minute.')).toBeTruthy();
+  });
+
+  it('says the Integrations permission is needed when the site refuses', async () => {
+    mocks.getEmailSettings.mockRejectedValue(new mocks.FakeBackendError('permission_denied', 403));
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'This needs the Integrations permission (the owner has it).',
+    );
+    expect(screen.queryByRole('button', { name: 'Save settings' })).toBeNull();
+  });
+
+  it('turns the page read-only when a save is refused for lack of permission', async () => {
+    mocks.updateEmailSettings.mockRejectedValue(
+      new mocks.FakeBackendError('permission_denied', 403),
+    );
+    render(<EmailSettingsScreen workspaceSlug="canadawide" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Save settings' }));
+    expect(
+      (await screen.findAllByText('This needs the Integrations permission (the owner has it).'))
+        .length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty('disabled', true);
+    expect(screen.queryByRole('button', { name: /^Edit/ })).toBeNull();
+  });
+});

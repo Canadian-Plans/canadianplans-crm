@@ -1,0 +1,494 @@
+'use client';
+
+import Link from 'next/link';
+import { useId, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  emailTemplateLabel,
+  LEGACY_IMPORT_ACTOR_ID,
+  leadStageLabel,
+  type AssignableMember,
+  type LeadActivity,
+  type LeadDetail,
+  type PropertyCatalog,
+} from '@canadian-plans/contracts';
+import { Button, Textarea } from '@canadian-plans/ui';
+import {
+  ArchiveIcon,
+  ArrowRightIcon,
+  BotIcon,
+  CheckIcon,
+  EyeIcon,
+  FilePenLineIcon,
+  InboxIcon,
+  MailIcon,
+  PencilIcon,
+  RotateCcwIcon,
+  ShieldAlertIcon,
+  StickyNoteIcon,
+  UserIcon,
+  XIcon,
+} from 'lucide-react';
+
+import { addLeadNote } from '../../lib/api';
+import { dateTimeLabel, relativeTime } from '../../lib/dates';
+import { actorName, memberName } from '../../lib/people';
+import { errorReason } from '../../lib/use-resource';
+import { documentTypeLabel } from '../plans/document-types';
+import { documentLabel } from './lead-documents';
+import { fieldLabel } from './lead-fields';
+import { listText } from './stage-move-dialog';
+
+const CONTACT_LABELS: Record<string, string> = { fullName: 'name', email: 'email', phone: 'phone' };
+
+/** A change request names the order's plan by `planId`; staff read it as "plan". */
+const REQUEST_KEY_LABELS: Record<string, string> = { ...CONTACT_LABELS, planId: 'plan' };
+
+type SystemActivity = Extract<LeadActivity, { kind: 'system' }>;
+
+/** `asked to change the phone and arrival in Canada, and sent a new passport (request #12)`. */
+export function changeRequestText(
+  activity: SystemActivity,
+  leadType: string,
+  catalog?: PropertyCatalog,
+): string {
+  const fields = (activity.fields ?? []).map(
+    (field) => REQUEST_KEY_LABELS[field] ?? fieldLabel(leadType, field, catalog),
+  );
+  const documents = (activity.documents ?? []).map((document) =>
+    documentLabel(document).toLowerCase(),
+  );
+  const parts: string[] = [];
+  if (fields.length > 0) parts.push(`asked to change the ${listText(fields)}`);
+  if (documents.length > 0) {
+    // A comma keeps "and sent" apart from a list that has its own "and".
+    const joiner = fields.length > 1 ? ', and sent' : fields.length > 0 ? ' and sent' : 'sent';
+    parts.push(`${joiner} a new ${listText(documents)}`);
+  }
+  const what = parts.length > 0 ? parts.join('').trimStart() : 'asked to change their order';
+  return activity.requestNo ? `${what} (request #${activity.requestNo})` : what;
+}
+
+/**
+ * The newest change request carried over from the old admin that nobody has
+ * decided yet, if any (activities come newest first). Requests made through
+ * the CRM are not counted: the change request card decides those.
+ */
+export function pendingChangeRequest(
+  activities: readonly LeadActivity[],
+): SystemActivity | undefined {
+  const decided = new Set(
+    activities.flatMap((activity) =>
+      activity.kind === 'system' &&
+      activity.actorId === LEGACY_IMPORT_ACTOR_ID &&
+      (activity.event === 'change_approved' || activity.event === 'change_rejected')
+        ? [activity.requestNo]
+        : [],
+    ),
+  );
+  return activities.find(
+    (activity): activity is SystemActivity =>
+      activity.kind === 'system' &&
+      activity.actorId === LEGACY_IMPORT_ACTOR_ID &&
+      activity.event === 'change_requested' &&
+      activity.requestNo !== undefined &&
+      !decided.has(activity.requestNo),
+  );
+}
+
+function personName(actorId: string | null, members: readonly AssignableMember[]): string {
+  if (actorId === null) return 'nobody';
+  const member = members.find((entry) => entry.actorId === actorId);
+  if (!member) return 'a former teammate';
+  return member.isSelf ? 'you' : memberName(member);
+}
+
+/**
+ * An entry's icon and words. `actor` null leaves out who: an automation
+ * queued the mail, whoever made the move that fired it. An entry a flow wrote
+ * (a move, an assignment, a correction) reads "… by automation <name>",
+ * linked to the flow, rather than naming the member who activated it.
+ */
+function describe(
+  activity: LeadActivity,
+  leadType: string,
+  members: readonly AssignableMember[],
+  catalog: PropertyCatalog | undefined,
+  workspaceSlug: string,
+): { icon: ReactNode; text: ReactNode; actor?: null } {
+  const described = describeEntry(activity, leadType, members, catalog, workspaceSlug);
+  const isMail = activity.kind === 'system' && activity.event === 'customer_emailed';
+  if (!activity.automation || !activity.automationName || isMail) return described;
+  return {
+    icon: <BotIcon />,
+    actor: null,
+    text: (
+      <>
+        {described.text} by automation{' '}
+        <Link
+          href={`/w/${workspaceSlug}/automations/${activity.automation}`}
+          className="underline-offset-2 hover:underline"
+        >
+          {activity.automationName}
+        </Link>
+      </>
+    ),
+  };
+}
+
+function describeEntry(
+  activity: LeadActivity,
+  leadType: string,
+  members: readonly AssignableMember[],
+  catalog: PropertyCatalog | undefined,
+  workspaceSlug: string,
+): { icon: ReactNode; text: ReactNode; actor?: null } {
+  switch (activity.kind) {
+    case 'note':
+      return { icon: <StickyNoteIcon />, text: 'added a note' };
+    case 'status_change':
+      return {
+        icon: <ArrowRightIcon />,
+        text: (
+          <>
+            moved this from <strong>{leadStageLabel(leadType, activity.from)}</strong> to{' '}
+            <strong>{leadStageLabel(leadType, activity.to)}</strong>
+          </>
+        ),
+      };
+    case 'assignment':
+      if (activity.to === null) {
+        return { icon: <UserIcon />, text: <>unassigned {personName(activity.from, members)}</> };
+      }
+      if (activity.to === activity.actorId) return { icon: <UserIcon />, text: 'took this lead' };
+      return {
+        icon: <UserIcon />,
+        text: (
+          <>
+            assigned this to <strong>{personName(activity.to, members)}</strong>
+          </>
+        ),
+      };
+    case 'edit':
+      return {
+        icon: <PencilIcon />,
+        text: `corrected the ${listText(
+          activity.fields.map(
+            (field) => CONTACT_LABELS[field] ?? fieldLabel(leadType, field, catalog),
+          ),
+        )}`,
+      };
+    case 'document': {
+      const approved = activity.decision === 'approved';
+      return {
+        icon: approved ? <CheckIcon /> : <XIcon />,
+        text: `${approved ? 'approved' : 'rejected'} the ${documentLabel(
+          activity.documentType,
+        ).toLowerCase()}`,
+      };
+    }
+    case 'system':
+      // `trashed` is the API's name for an archive.
+      if (activity.event === 'trashed') return { icon: <ArchiveIcon />, text: 'archived this' };
+      if (activity.event === 'restored') return { icon: <RotateCcwIcon />, text: 'restored this' };
+      if (activity.event === 'opened') return { icon: <EyeIcon />, text: 'opened this' };
+      if (activity.event === 'submitted' && members.some((m) => m.actorId === activity.actorId)) {
+        // A staff move rescued a checkout the customer never finished (merge phase 8, O9).
+        return { icon: <ArrowRightIcon />, text: 'submitted this checkout for the customer' };
+      }
+      if (activity.event === 'submitted') {
+        // The website's credential made the move, so no name is shown.
+        return {
+          icon: <ArrowRightIcon />,
+          actor: null,
+          text: (
+            <>
+              Submitted on the website and moved to{' '}
+              <strong>{leadStageLabel(leadType, 'pending')}</strong>
+            </>
+          ),
+        };
+      }
+      if (activity.event === 'change_requested') {
+        // Made through the CRM: the website's own credential is the actor, so no name is shown.
+        if (activity.actorId !== LEGACY_IMPORT_ACTOR_ID) {
+          return {
+            icon: <FilePenLineIcon />,
+            actor: null,
+            text: `The customer ${changeRequestText(activity, leadType, catalog)}`,
+          };
+        }
+        return {
+          icon: <FilePenLineIcon />,
+          text: changeRequestText(activity, leadType, catalog),
+        };
+      }
+      if (activity.event === 'change_approved' || activity.event === 'change_rejected') {
+        const approved = activity.event === 'change_approved';
+        const number = activity.requestNo ? ` #${activity.requestNo}` : '';
+        // The CRM's own wording is plain; the old admin's carried-over entries keep theirs.
+        const customers = activity.actorId === LEGACY_IMPORT_ACTOR_ID ? 'customer’s' : "customer's";
+        return {
+          icon: approved ? <CheckIcon /> : <XIcon />,
+          text: `${approved ? 'approved' : 'rejected'} the ${customers} change request${number}`,
+        };
+      }
+      if (activity.event === 'documents_override') {
+        return {
+          icon: <ShieldAlertIcon />,
+          text: `moved on without approved documents: ${(activity.missing ?? [])
+            .map(documentTypeLabel)
+            .join(', ')}. Reason: ${activity.reason ?? '—'}`,
+        };
+      }
+      if (activity.event === 'customer_emailed' && activity.automation && activity.template) {
+        return {
+          icon: <BotIcon />,
+          actor: null,
+          text: (
+            <>
+              {emailTemplateLabel(activity.template, activity.templateName)} email queued by{' '}
+              <Link
+                href={`/w/${workspaceSlug}/automations/${activity.automation}`}
+                title={activity.automationName}
+                className="underline-offset-2 hover:underline"
+              >
+                an automation
+              </Link>
+              {activity.templateVersion === undefined
+                ? ''
+                : ` (version ${activity.templateVersion})`}
+            </>
+          ),
+        };
+      }
+      if (activity.event === 'customer_emailed') {
+        return {
+          icon: <MailIcon />,
+          text:
+            activity.template === 'sim_number_ready'
+              ? 'emailed the customer their SIM number'
+              : 'emailed the customer',
+        };
+      }
+      return { icon: <InboxIcon />, text: 'recorded a change' };
+  }
+}
+
+function TimelineMarker() {
+  return (
+    <span aria-hidden="true" className="relative flex w-3 shrink-0 justify-center">
+      <span className="absolute top-2 -bottom-9 left-1/2 w-px -translate-x-1/2 bg-border group-last/timeline:hidden" />
+      <span className="relative mt-0.5 size-3 rounded-full border-2 border-muted-foreground/50 bg-card" />
+    </span>
+  );
+}
+
+/**
+ * The lead's history, newest first, with connected markers and dates above
+ * each event. Staff who manage leads write notes at the top; the panel's
+ * Notes tab keeps its separate note list and composer.
+ */
+export function LeadTimeline({
+  lead,
+  activities,
+  members,
+  canWrite,
+  accessToken,
+  workspaceSlug,
+  catalog,
+  onNoteAdded,
+  mode = 'timeline',
+}: {
+  lead: LeadDetail;
+  activities: readonly LeadActivity[];
+  members: readonly AssignableMember[];
+  canWrite: boolean;
+  accessToken: string;
+  /** The site's slug, for the links an entry carries (Automations). */
+  workspaceSlug: string;
+  /** The site's catalogue, so a correction names custom properties by label. */
+  catalog?: PropertyCatalog;
+  onNoteAdded(activity: LeadActivity): void;
+  /** Notes alone for the panel's Notes tab; the full page keeps the complete history. */
+  mode?: 'timeline' | 'notes';
+}) {
+  const id = useId();
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string>();
+
+  async function submit(event?: FormEvent) {
+    event?.preventDefault();
+    const body = draft.trim();
+    if (!body || saving) return;
+    setSaving(true);
+    setMessage(undefined);
+    try {
+      const result = await addLeadNote(accessToken, lead.workspaceId, lead.id, body);
+      onNoteAdded(result.activity);
+      setDraft('');
+    } catch (error) {
+      setMessage(`The note was not saved. Reason: ${errorReason(error)}.`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section aria-labelledby={`${id}-heading`} className="flex flex-col gap-4">
+      <h2 id={`${id}-heading`} className="text-base font-semibold">
+        {mode === 'notes' ? 'Notes' : 'Timeline'}
+      </h2>
+      {canWrite ? (
+        <form onSubmit={(event) => void submit(event)} className="flex flex-col gap-2">
+          <label htmlFor={`${id}-note`} className="sr-only">
+            Add a note
+          </label>
+          <Textarea
+            id={`${id}-note`}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) void submit();
+            }}
+            placeholder="Add a note: what was said, what happens next…"
+            maxLength={4000}
+            rows={3}
+          />
+          <div className="flex items-center gap-3">
+            <Button type="submit" size="sm" disabled={saving || draft.trim() === ''}>
+              {saving ? 'Saving…' : 'Add note'}
+            </Button>
+            <span className="text-xs text-muted-foreground">Ctrl or ⌘ + Enter</span>
+            {message ? (
+              <span role="alert" className="text-sm text-rose-700 dark:text-rose-300">
+                {message}
+              </span>
+            ) : null}
+          </div>
+        </form>
+      ) : null}
+
+      <ol className="flex flex-col">
+        {/* An open carried over from the old admin tells staff nothing. */}
+        {activities
+          .filter((activity) => mode === 'timeline' || activity.kind === 'note')
+          .filter(
+            (activity) =>
+              !(
+                activity.kind === 'system' &&
+                activity.event === 'opened' &&
+                activity.actorId === LEGACY_IMPORT_ACTOR_ID
+              ),
+          )
+          .map((activity) => {
+            const approvingMember =
+              activity.viaAi && !activity.automation
+                ? members.find((member) => member.actorId === activity.actorId)
+                : undefined;
+            const { icon, text, actor } = describe(
+              activity,
+              lead.leadType,
+              members,
+              catalog,
+              workspaceSlug,
+            );
+            // A data migration (the 0012 stage clean-up) says in words what it changed.
+            const body = activity.kind === 'system' ? activity.body : undefined;
+            return (
+              <li
+                key={activity.id}
+                className={
+                  mode === 'timeline'
+                    ? 'group/timeline relative flex gap-4 pb-7 last:pb-0'
+                    : 'relative flex gap-3 pb-5 last:pb-0'
+                }
+              >
+                {mode === 'timeline' ? (
+                  <TimelineMarker />
+                ) : (
+                  <span
+                    aria-hidden="true"
+                    className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-muted-foreground [&_svg]:size-3.5"
+                  >
+                    {icon}
+                  </span>
+                )}
+                <div
+                  className={
+                    mode === 'timeline' ? 'min-w-0 flex-1 text-sm' : 'min-w-0 flex-1 pt-1 text-sm'
+                  }
+                >
+                  {mode === 'timeline' ? (
+                    <time
+                      dateTime={activity.createdAt}
+                      title={dateTimeLabel(activity.createdAt)}
+                      className="mb-1 block text-xs text-muted-foreground"
+                    >
+                      {dateTimeLabel(activity.createdAt)} · {relativeTime(activity.createdAt)}
+                    </time>
+                  ) : null}
+                  <p className={actor === null ? 'first-letter:uppercase' : undefined}>
+                    {actor === null ? null : (
+                      <>
+                        <span className="font-medium">
+                          {/* The customer asked, through the website; the import only carried it over. */}
+                          {activity.kind === 'system' && activity.event === 'change_requested'
+                            ? 'Customer'
+                            : approvingMember
+                              ? memberName(approvingMember)
+                              : actorName(activity.actorId, members)}
+                          {activity.viaAi && !activity.automation ? (
+                            <span className="text-xs font-normal text-primary"> · via AI</span>
+                          ) : null}
+                        </span>{' '}
+                      </>
+                    )}
+                    <span className="text-muted-foreground">{text}</span>{' '}
+                    {mode === 'notes' ? (
+                      <time
+                        dateTime={activity.createdAt}
+                        title={dateTimeLabel(activity.createdAt)}
+                        className="text-xs text-muted-foreground"
+                      >
+                        · {relativeTime(activity.createdAt)}
+                      </time>
+                    ) : null}
+                  </p>
+                  {activity.kind === 'note' ? (
+                    <p className="mt-2 rounded-md border bg-card px-3 py-2 whitespace-pre-wrap">
+                      {activity.body}
+                    </p>
+                  ) : null}
+                  {body ? <p className="mt-1 text-muted-foreground">{body}</p> : null}
+                </div>
+              </li>
+            );
+          })}
+        {mode === 'notes' ? null : (
+          <li className="group/timeline relative flex gap-4">
+            <TimelineMarker />
+            <div className="min-w-0 flex-1 text-sm">
+              <time
+                dateTime={lead.createdAt}
+                title={dateTimeLabel(lead.createdAt)}
+                className="mb-1 block text-xs text-muted-foreground"
+              >
+                {dateTimeLabel(lead.createdAt)} · {relativeTime(lead.createdAt)}
+              </time>
+              <p>
+                <span className="font-medium">Website</span>{' '}
+                <span className="text-muted-foreground">
+                  sent this {lead.status === 'submitted' ? 'lead' : 'draft'}
+                </span>{' '}
+              </p>
+            </div>
+          </li>
+        )}
+      </ol>
+      {mode === 'notes' && !activities.some((activity) => activity.kind === 'note') ? (
+        <p className="text-sm text-muted-foreground">No notes yet.</p>
+      ) : null}
+    </section>
+  );
+}

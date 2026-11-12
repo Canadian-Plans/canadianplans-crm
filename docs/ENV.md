@@ -1,0 +1,347 @@
+# Environment variables
+
+Every variable the backend and the admin read, where it is set, and what
+happens when it is missing. Secrets are set in the host (Railway, Vercel, CI)
+and never committed; `.env*` files are gitignored.
+
+Values that end in `_test` or `_e2e` database names, and anything named
+`DB_TEST_*` / `E2E_*`, are for disposable local or CI databases only.
+
+## Backend (Railway service `backend`)
+
+### Required to boot and serve `/api/v1`
+
+| Variable                    | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`              | Pooled Postgres URL for the **restricted `app_runtime` role** through the Supabase transaction-mode pooler (port 6543). This project's pooler is the `aws-1` cluster; `aws-0` answers "tenant/user not found": `postgresql://app_runtime.<project-ref>:<password>@aws-1-ap-south-1.pooler.supabase.com:6543/postgres`. Never the `postgres` role.                                                                                                                            |
+| `DATABASE_SSL_MODE`         | `require` (default, Supabase) or `disable` (local Postgres only).                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `DATABASE_SSL_CA`           | Optional PEM for a private CA.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `DATABASE_POOL_MAX`         | Application-side pool size, `1`–`50`; defaults to `8`.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `SUPABASE_URL`              | `https://<project-ref>.supabase.co`. The backend verifies staff access tokens against Supabase Auth.                                                                                                                                                                                                                                                                                                                                                                         |
+| `SUPABASE_ANON_KEY`         | The project's **publishable** key (`sb_publishable_…`). Not a secret; grants nothing by itself.                                                                                                                                                                                                                                                                                                                                                                              |
+| `ADMIN_ORIGIN`              | The one browser origin allowed by CORS for staff routes, e.g. `https://crm.gtsales.example`. Defaults to `http://localhost:3000`. Also builds the lead link in a staff notification an automation flow sends (`<ADMIN_ORIGIN>/w/<slug>/leads/<lead id>`, origin only). In production it must be an https origin, or those notifications are skipped as `no_staff_sender` rather than linking to localhost.                                                                   |
+| `TRUST_PROXY_HOPS`          | `1` behind Railway's edge so client IPs (rate limits, audit) are read from `X-Forwarded-For`. Default `0` ignores forwarded headers.                                                                                                                                                                                                                                                                                                                                         |
+| `DEPLOYMENT_ENV`            | `production`, `preview` or `development`. Unknown values resolve to "unknown", never to production.                                                                                                                                                                                                                                                                                                                                                                          |
+| `PORT`                      | Listen port. Set to `4000` on the Railway service so the public domain's target port never drifts (Railway would otherwise inject its own value). Defaults to `4000` locally.                                                                                                                                                                                                                                                                                                |
+| `EMAIL_CONTACT_HASH_SECRET` | ≥16 characters. Keys the HMAC that turns an email address into the `contact_hash` stored on email, suppression and consent rows, so those tables never hold a raw address. Rotating it orphans existing suppressions. Missing or shorter than 16 characters, the deployment is not ready for customer mail: no customer email is sent for any site (each rule records a `no_sender` skip) and the admin reports "no sender" for every site, whatever Settings → Email holds. |
+
+### Scheduler (outbox, document cleanup, retention, intake check)
+
+The scheduler is opt-in. Without it, leads are still captured; emails and
+analytics jobs stay queued until a runner drains them.
+
+| Variable                        | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_SCHEDULER`              | `1` to run the in-process scheduler. Exactly one replica should have it on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `MACHINE_REGISTRY_JSON`         | Server-only registry of machine identities: `{"webhooks":[…],"schedulers":[{"selector":"railway-scheduler","secret":"<≥16 chars>","actorId":"<uuid>","workspaceIds":["<site uuid>",…],"scopes":["outbox:run","synthetic:check"]}]}`. Every tenant write a job makes is attributed to the entry's `actorId`. The intake check needs `synthetic:check` on the entry `JOB_RUNNER_SELECTOR` names; without it the scheduler logs `scheduler_scope_missing` at boot and runs everything but the check.                                                                                                                                                                                                                                                                                 |
+| `JOB_RUNNER_SELECTOR`           | Which scheduler entry this process runs as (its `selector`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `CRON_SECRET`                   | Must equal that entry's `secret`; also authorizes `POST /api/internal/jobs/*` for manual runs (POST only; at most 10 attempts a minute per client IP, counted before the secret is checked). Use a random value of at least 32 characters (`openssl rand -base64 48`): the code accepts 16, which is too short for a secret that anyone on the internet may try.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `INTAKE_CHECK_WORKSPACE_ID`     | Backend only. The id of the intake check's test site (slug `intake-check`, created by `docs/RUNBOOKS/manual/intake-check-site.sql`). Set, the scheduler pushes a test lead through intake every 15 minutes and alerts the owner when it fails (docs/RUNBOOKS/intake-check.md). Unset, the check is off and `POST /api/internal/jobs/intake-check` answers 404 `intake_check_off`; set but not a uuid, the scheduler logs `intake_check_workspace_invalid` at boot and leaves the check out. Confirm the id with the paste file's section A (slug `intake-check`) before saving it: an id of a real site (one with members, roles or site keys) is refused before anything is written, with the alert `leftovers:intake_check_site_not_test`.                                      |
+| `OPERATIONAL_RETENTION_ENABLED` | `1` to let the daily `data_retention` task delete old operational rows through `app.prune_operational_rows`: completed or ended outbox jobs (30 d after they ended), resolved job alerts (30 d), applied email provider events (180 d), idempotency keys (7 d), finished automation runs (90 d), fired or void automation timers (90 d), tracking-code challenges (1 d after they expire), AI automation proposals (1 d) and AI turns (90 d). **Off by default and the default is not a safe resting state:** those tables, and a customer mail's job until it is pruned, grow without bound while it is off. Turn it on once a verified backup exists (the deletes cannot be undone); the owner decision on when is in docs/HANDOFF.md. Exactly `1` enables it; `true` does not. |
+
+### Email (Resend)
+
+| Variable                                                 | Purpose                                                                                                                                                                                                                                        |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EMAIL_PROVIDER`                                         | `resend` in production; `fake` only in CI/previews (a fake never sends in production).                                                                                                                                                         |
+| `RESEND_API_KEY`                                         | Secret. Required when `EMAIL_PROVIDER=resend`.                                                                                                                                                                                                 |
+| `RESEND_ACCOUNT_ID`                                      | Label of the Resend account (any stable string); stored as `provider_account` on sends and matched against inbound webhook identities.                                                                                                         |
+| `RESEND_FROM_EMAIL`                                      | Verified sender, e.g. `crm@<verified-domain>`. Also sends the staff notifications of automation flows; unset, a notify step is skipped `no_staff_sender`.                                                                                      |
+| `RESEND_FROM_NAME`                                       | Display name, e.g. `GT Sales`. Also the sender name of staff notifications.                                                                                                                                                                    |
+| `RESEND_REPLY_TO_EMAIL`                                  | Optional reply-to.                                                                                                                                                                                                                             |
+| `MARKETING_CONSENT_VERSION`                              | Optional. The consent version recorded when a recipient unsubscribes from marketing mail (`marketing_consents`); defaults to `1`. Change it only when the marketing consent wording changes, so each withdrawal names the wording it answered. |
+| `OWNER_ALERT_EMAIL`                                      | Where operational alerts (scheduler not started, stuck jobs, the intake check failing and passing again) are sent; needs `RESEND_API_KEY`.                                                                                                     |
+| `OWNER_ALERT_WEBHOOK_URL` / `OWNER_ALERT_WEBHOOK_SECRET` | Optional chat webhook for the same alerts, HMAC-signed when the secret is set.                                                                                                                                                                 |
+
+A site's mail to its customers comes only from its saved Settings → Email
+(sender name and address, reply-to, look and site address). A site that has
+not saved them sends its customers no email at all: every customer mail,
+including the tracking code and the change decisions, is skipped as
+`no_sender` (phase 5 removed the `EMAIL_SENDERS_JSON` fallback). The sender's
+domain must be verified in the Resend account of `RESEND_API_KEY`: nothing
+checks the domain when the settings are saved, so a mail from an unverified
+domain fails when it is sent (see the site's jobs). A saved sender is used
+only while the deployment is ready for customer mail: `EMAIL_PROVIDER` set,
+with `RESEND_API_KEY` for `resend`, and `EMAIL_CONTACT_HASH_SECRET` at least
+16 characters; otherwise the admin reports "no sender" for every site, which
+is a deployment problem, not something Settings → Email can fix.
+
+`EMAIL_SENDERS_JSON` is gone: this backend never reads it. A site that
+relies on it stops sending customer mail **the moment this backend is
+deployed**, not when the variable is removed, so check that every sending
+site has saved Settings → Email **before** that deploy (docs/HANDOFF.md §5.1,
+step B step 3 and check 1). On 2026-10-30 production had no saved settings
+for either site and had sent no customer mail in 30 days. Delete the
+variable from Railway after the deploy; nothing reads it any more.
+
+Resend delivery events arrive at `POST /api/v1/email/events/:selector`; the
+selector and its signing secret live in `MACHINE_REGISTRY_JSON.webhooks`. A
+site can send before its webhook exists: its mail is then recorded against
+`RESEND_ACCOUNT_ID` without bounce and complaint events, which a webhook adds
+(and a webhook from a different account stops the site's mail).
+
+### Documents (Supabase Storage, S3 protocol)
+
+The document adapter speaks S3. Point it at Supabase Storage's S3 endpoint
+with S3 access keys created in the Supabase dashboard (Project Settings →
+Storage → S3 access keys). Unset = document endpoints answer
+`feature_not_ready`; everything else keeps working.
+
+| Variable                                    | Value for Supabase Storage                                |
+| ------------------------------------------- | --------------------------------------------------------- |
+| `R2_ACCOUNT_ID`                             | Any non-empty label (the adapter's name is historical).   |
+| `R2_ENDPOINT`                               | `https://<project-ref>.storage.supabase.co/storage/v1/s3` |
+| `R2_REGION`                                 | `ap-south-1` (the project's region).                      |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Secret. The S3 access key pair.                           |
+| `R2_BUCKET`                                 | `documents` (private bucket, already exists).             |
+
+### Customer tracking (merge phase 5, step B)
+
+Customers follow and change their orders through the website (Get Canada
+Sim's `/track`), which calls `/api/v1/website/tracking/*` with a site key
+that has the `tracking` scope (docs/HANDOFF.md §2.6).
+
+| Variable                                                 | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TRACKING_HASH_SECRET`                                   | Secret, at least 32 characters (trimmed). Keys the hashes of the tracking code, the customer's email and the per-email rate buckets, seals the code in its outbox job and the email in the grant, and signs the 30-minute grant. Generate with `openssl rand -base64 48`; it must not reuse another secret. Unset or shorter, tracking is off, not broken: the code route answers the same neutral 200 and sends nothing, every other tracking route answers `409 feature_not_ready`. Rotating it ends every grant and makes every pending code fail; customers ask for a new code.                                                                                                                                                                                                         |
+| `RATE_LIMIT_TRACKING_MAX` / `RATE_LIMIT_TRACKING_WINDOW` | Optional. The tracking routes' endpoint budget per site and visitor: at most `_MAX` requests (default `30`) per `_WINDOW` seconds (default `60`). Invalid or absent values use the defaults. The per-email limits (5 code requests, 10 verifications and 30 customer writes per 10 minutes, and 30 verifications per 24 hours) and the per-visitor ones (20 code requests, 40 verifications per 10 minutes) are fixed in code. The same pattern tunes the other endpoint budgets: `RATE_LIMIT_LEADS_*` (30 per 60 s), `RATE_LIMIT_IDENTITY_*` (10 per 60 s) and `RATE_LIMIT_UPLOADS_*` (20 per 60 s per site and visitor, shared by a draft's upload intents, finalizes and download links; a record may also hold at most 10 open upload intents, fixed in code, else 429 `rate_limited`). |
+
+The neutral answer's floor (500 ms) is fixed in code, not a variable.
+
+### Ask AI (staff assistant)
+
+Tasks and notes require an explicit confirmation card and `lead.manage`; other
+writes remain unavailable. Confirmation cards and automation proposals are
+signed with `AI_ACTION_SIGNING_SECRET` (domain-separated HMAC) and expire after
+ten minutes. Until that secret is set the backend signs with
+`AI_GATEWAY_API_KEY`, as before, and logs `ai_signing_secret_missing` at
+startup; set the secret so a provider-key exposure cannot forge cards and a
+provider-key rotation does not void them. Changing either key voids outstanding
+cards (at most ten minutes of work). The feature switch and Site allowlist also
+gate confirmation. Tokens are never sent to the provider or stored in logs.
+
+Off by default and per site. A missing, partial or invalid configuration disables
+the assistant only — the rest of the CRM boots and behaves as before, and
+`GET /api/v1/staff/workspaces/:id/ai/capabilities` reports a bounded reason
+(`disabled`, `not_configured`, `site_not_enabled`). No value is ever returned to
+the browser, and the key must never be a `NEXT_PUBLIC_*` variable.
+
+| Variable                     | Purpose                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AI_ASSISTANT_ENABLED`       | `true` (exactly) switches the feature on for the sites allowed below. Any other value, or unset, keeps it off.                                                                                                                                                                                                                                                                       |
+| `AI_GATEWAY_API_KEY`         | Secret. The Vercel AI Gateway key the backend uses for the model request. Required when enabled; unset means `not_configured`. Use a dedicated key so it can be revoked and budgeted on its own.                                                                                                                                                                                     |
+| `AI_ACTION_SIGNING_SECRET`   | Secret, 32+ random characters (for example `openssl rand -base64 48`). Signs AI confirmation cards and automation proposals, separate from the provider key. Unset: the Gateway key is used and the startup log says `ai_signing_secret_missing`. Set but shorter than 32: nothing can be signed, so AI actions and automation drafts are unavailable (`ai_signing_secret_invalid`). |
+| `AI_GATEWAY_MODEL`           | The exact Gateway model id (for example a `vendor/model` string), required when enabled. Must support streaming and tool calls. There is no default and no fallback model, so an unset or wrong value fails closed with `not_configured` (or a provider error) rather than silently picking another model.                                                                           |
+| `AI_ASSISTANT_WORKSPACE_IDS` | Comma-separated site ids allowed to use the assistant. Empty or unset means no site is enabled. Entries that are not uuids are ignored (a typo enables nothing). Only list a site after the operator has reviewed provider data handling; start with a synthetic/staging site.                                                                                                       |
+
+The request limits (5 model steps, 6 tool calls, 50 records, 6 KiB per tool result,
+24 KiB per turn, 1,200 output tokens, 60 s per turn, 10 requests per actor per
+minute and 60 per site per minute) are product constants in
+`packages/contracts/src/ai-assistant.ts`, not environment knobs. Setup,
+model selection, spend budget and rollback are in `docs/RUNBOOKS/ai-assistant.md`.
+
+### Sealed customer fields (the ID step's SIN)
+
+| Variable               | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SENSITIVE_FIELDS_KEY` | **Secret, at least 32 characters (trimmed); generate with `openssl rand -base64 48`.** Every customer SIN is sealed (AES-256-GCM, bound to its site, lead and field) under a key derived from this value, and only this value opens it again (the owner's "reveal" on a lead). **There is no copy of it in the database or in a backup: lose or change it and every stored SIN is permanently unreadable** (the reveal answers an error). Keep it in the owner's password manager as well as Railway; never rotate it without first re-sealing the stored values with a script that reads them under the old key; never put it in the repository or a log. Unset or shorter than 32 characters, the ID step refuses a SIN rather than store it unsealed and the reveal is off. See docs/RUNBOOKS/database.md. |
+
+### Optional
+
+| Variable                                                                             | Purpose                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WEBSITE_BOT_CHECK`                                                                  | How website writes prove a human: `turnstile` (default; any other value means this too) verifies a forwarded Turnstile token and **refuses every write when Turnstile is not configured**; `delegated` trusts the calling site's own screening, with the site key and all rate limits still applied. Production: `delegated`. |
+| `TURNSTILE_SECRET_KEY`, `TURNSTILE_HOSTNAMES`                                        | Cloudflare Turnstile verification, used only when `WEBSITE_BOT_CHECK` is `turnstile`.                                                                                                                                                                                                                                         |
+| `UMAMI_EVENTS_URL`, `UMAMI_WORKSPACE_WEBSITES`, `UMAMI_HOSTNAME`, `UMAMI_USER_AGENT` | Server-side analytics events per site (`UMAMI_WORKSPACE_WEBSITES` is JSON `[{"workspaceId":"…","websiteId":"…"}]`). Lead intake queues no analytics jobs (websites keep their own events until a later merge phase); unset = any analytics job fails visibly.                                                                 |
+| `OUTBOX_ADAPTERS`                                                                    | `fake` swaps analytics for an in-memory sink. Ignored in production.                                                                                                                                                                                                                                                          |
+| `SENTRY_DSN`, `RELEASE_SHA`                                                          | Error tracking and release tagging.                                                                                                                                                                                                                                                                                           |
+
+## Admin (Vercel project, root `apps/admin`)
+
+| Variable                                                                          | Purpose                                                                                                    |
+| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_SUPABASE_URL`                                                        | Same as the backend's `SUPABASE_URL`. Staff sign in with Supabase Auth in the browser.                     |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY`                                                   | The publishable key. Public by design.                                                                     |
+| `NEXT_PUBLIC_API_BASE_URL`                                                        | The backend's public URL (Railway). The production build refuses to start without it and the Supabase URL. |
+| `NEXT_PUBLIC_SENTRY_DSN`, `NEXT_PUBLIC_DEPLOYMENT_ENV`, `NEXT_PUBLIC_RELEASE_SHA` | Optional error tracking and release tagging.                                                               |
+
+`NEXT_PUBLIC_E2E_STAFF_BEARER` and `ADMIN_DIST_DIR` exist only for the browser
+test build; `next.config.ts` refuses the first on Vercel.
+
+## Migrations, seed and tests (never in the runtime service)
+
+| Variable                                                                             | Purpose                                                                                                                                            |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MIGRATION_DATABASE_URL`, `MIGRATION_DATABASE_SSL_MODE`, `MIGRATION_DATABASE_SSL_CA` | Direct (port 5432) connection as the project's `postgres` role for `pnpm --filter @canadian-plans/db db:migrate`. See `docs/RUNBOOKS/database.md`. |
+| `TEST_MIGRATION_DATABASE_URL` + `DB_TEST_ALLOW_DESTRUCTIVE=1`                        | Enable the integration suites against a disposable database whose name ends in `_test`.                                                            |
+| `DB_SEED_ALLOW_SYNTHETIC=1`                                                          | Allow `db:seed` (synthetic sites and staff); refused on hosted Supabase unless the database name ends in `_test`/`_dev`.                           |
+| `E2E_ALLOW_REMOTE_DATABASE`                                                          | Deliberate override for destructive browser-test setup on a non-local database.                                                                    |
+
+## Backups (GitHub Actions, never the runtime service)
+
+Every deployment is backed up by the same three workflows (the daily backup,
+the hourly heartbeat monitor and the weekly retention prune), and **all three
+run inside one GitHub Environment named `backup-<deployment>`** (owner
+decision 2026-11-06, [docs/RUNBOOKS/backup.md](RUNBOOKS/backup.md) step 6).
+The first deployment is `gt-sales`. Each deployment has its own Backblaze B2
+archive bucket and, in that environment, **one** bucket-only B2 application
+key (Read and Write) in `B2_ARCHIVE_KEY_ID` / `B2_ARCHIVE_APPLICATION_KEY`.
+The workflows hand that same key to the jobs under the role names the code
+reads (`B2_ARCHIVE_WRITER_*` for the backup, `B2_ARCHIVE_READER_*` for the
+monitor, `B2_ARCHIVE_RETENTION_*` for retention), so the code still enforces
+what each job does, but **the credential itself is not separated**: the job
+that installs dependencies and handles the dump holds a key that can also read,
+hide and overwrite archives. What protects the archive is the bucket's 30-day
+Object Lock (governance mode) for the last month of restore points, and the
+public-only recovery recipient: no GitHub environment holds the recovery
+private key, so a leaked B2 key cannot decrypt a backup; the restore runs on
+the owner's machine, never in GitHub. The older monthly restore points have no
+Object Lock protection against a leaked key. Splitting this into three
+environments with a writer, a reader and a retention key (the narrower design
+this page and the workflow headers used to describe) is possible and needs no
+code change, only new environments, keys and secret names in the two sibling
+workflows; it is not what runs today. Every value below is a secret of the named environment unless the
+"Set where" column says otherwise; an optional secret left unset reaches the
+job as an empty value, which means "use the default". Setup, step by step:
+[docs/RUNBOOKS/backup.md](RUNBOOKS/backup.md).
+
+| Role in the code (variable) | Credential today (GitHub secret)                                      | Held by                                                                           |
+| --------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Writer (backup)             | `B2_ARCHIVE_KEY_ID` / `_APPLICATION_KEY`, Read and Write, bucket-only | `backup-<deployment>` (all three workflows)                                       |
+| Reader (monitor, restore)   | the same key                                                          | `backup-<deployment>`, and the owner for a restore (a read-only key of their own) |
+| Retention (prune)           | the same key                                                          | `backup-<deployment>`                                                             |
+
+### Backup run (the `backup` workflow, environment `backup-<deployment>`)
+
+`pnpm --filter @canadian-plans/jobs run backup`. A missing required variable stops
+the run with `<NAME> is required`, before anything is read or written.
+
+| Variable                                                            | Set where                                                                                     | Value / purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BACKUP_DEPLOYMENT`                                                 | Workflow matrix (`${{ matrix.deployment }}`)                                                  | Required. The deployment's name (`gt-sales`); recorded in the manifest and the heartbeat.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `SOURCE_DATABASE_URL`                                               | GitHub Environment secret                                                                     | Required. The `backup_reader` login through the session pooler: `postgresql://backup_reader.<project-ref>:<url-encoded password>@aws-1-ap-south-1.pooler.supabase.com:5432/postgres`. Port 5432, never 6543 (the transaction pooler breaks `pg_dump`). URL-encode the password.                                                                                                                                                                                                                                                       |
+| `SOURCE_STORAGE_ENDPOINT`                                           | GitHub Environment secret                                                                     | Required. `https://<project-ref>.storage.supabase.co/storage/v1/s3`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `SOURCE_STORAGE_REGION`                                             | GitHub Environment secret                                                                     | Required. `ap-south-1` for `gt-sales`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `SOURCE_STORAGE_BUCKET`                                             | GitHub Environment secret                                                                     | Required. `documents` for `gt-sales`. A referenced object in any other bucket fails the run.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `SOURCE_STORAGE_ACCESS_KEY_ID` / `SOURCE_STORAGE_SECRET_ACCESS_KEY` | GitHub Environment secret                                                                     | Required. A Storage S3 access key pair of its own (not the backend's), so either can be revoked alone. The runner only reads.                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `SUPABASE_PROJECT_REF`                                              | GitHub Environment secret                                                                     | Required. Recorded in the manifest's source ids.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `RECOVERY_AGE_RECIPIENT`                                            | GitHub Environment secret                                                                     | Required. The public `age1…` recipient every artifact and the manifest are encrypted to. The private identity is never in GitHub.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `B2_ARCHIVE_ENDPOINT` / `B2_ARCHIVE_REGION` / `B2_ARCHIVE_BUCKET`   | GitHub Environment secret                                                                     | Required. The deployment's archive bucket: `https://s3.<region>.backblazeb2.com`, `<region>`, the bucket name.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `B2_ARCHIVE_WRITER_KEY_ID` / `B2_ARCHIVE_WRITER_APPLICATION_KEY`    | Workflow env, from the Environment secrets `B2_ARCHIVE_KEY_ID` / `B2_ARCHIVE_APPLICATION_KEY` | Required. The environment's one bucket-only B2 key (Read and Write; see the section intro). The code only lists and writes with it.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `BACKUP_AUTH_DATA`                                                  | GitHub Environment secret (override only)                                                     | `include` or `skip`; the `backup.yml` matrix sets each deployment's value (`skip` for gt-sales: its `auth` tables keep row security, docs/RUNBOOKS/backup.md "Facts") and the secret, when set, overrides it. `include` dumps the rows of `auth.users` and `auth.identities` only (never sessions or tokens). `skip` is the operator fallback when `backup_reader` cannot read those two; the manifest records `auth_data_skipped_by_operator` and a restore re-invites staff. With `include`, either table unreadable fails the run. |
+| `BACKUP_HISTORY`                                                    | GitHub Environment secret                                                                     | `include` (default) or `skip`. `skip` leaves out the `supabase_migrations` history; the manifest records `supabase_migrations_skipped_by_operator`.                                                                                                                                                                                                                                                                                                                                                                                   |
+| `BACKUP_RUN_ID`                                                     | Not set by the workflow                                                                       | Defaults to `run-<timestamp>-<uuid>`. For a local or test run only; a run refuses an id whose prefix already holds objects, so a fixed id in the environment would fail every later run.                                                                                                                                                                                                                                                                                                                                              |
+| `BACKUP_MAX_SNAPSHOT_BYTES`                                         | GitHub Environment secret, normally unset                                                     | The in-memory snapshot limit in bytes; default 2 GiB. Above it the run stops with `backup_snapshot_too_large_for_runner` before or while copying documents; nothing is uploaded. Whatever this says, a single `data.sql` cannot pass V8's string limit (about 512 MiB): the run then fails loudly with a string-length error, never with a partial dump.                                                                                                                                                                              |
+| `AGE_VERSION`, `PG_DUMP_VERSION`                                    | The workflow, from the installed binaries                                                     | Recorded in the manifest's tool versions; `unknown` when unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `SENTRY_DSN`, `RELEASE_SHA`, `DEPLOYMENT_ENV`                       | GitHub Environment secret / the workflow                                                      | Optional error tracking for a failed run. `SENTRY_DSN` is a secret; the workflow sets `RELEASE_SHA` to the commit and `DEPLOYMENT_ENV` to `production`.                                                                                                                                                                                                                                                                                                                                                                               |
+
+### Backup monitor (the `backup-monitor` workflow, same environment)
+
+`pnpm --filter @canadian-plans/jobs run monitor`, hourly. It reads
+`heartbeat/latest.json` with the reader key and emails the owner
+(`backup_stale`) and exits 1 when the heartbeat is missing, malformed, older
+than the threshold or names another deployment, or when the check itself fails
+(alert detail `stale:age_seconds:<n>`, `missing`, `malformed`,
+`wrong_deployment:<deployment>` or `monitor_failed`).
+
+| Variable                                                                       | Set where                                           | Value / purpose                                                                                                                                                    |
+| ------------------------------------------------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `BACKUP_DEPLOYMENT`                                                            | Workflow matrix (`${{ matrix.deployment }}`)        | Required. A heartbeat naming any other deployment alerts.                                                                                                          |
+| `B2_ARCHIVE_ENDPOINT` / `B2_ARCHIVE_REGION` / `B2_ARCHIVE_BUCKET`              | GitHub Environment secret                           | Required. The deployment's archive bucket, as for the backup run.                                                                                                  |
+| `B2_ARCHIVE_READER_KEY_ID` / `B2_ARCHIVE_READER_APPLICATION_KEY`               | Workflow env, from the same two Environment secrets | Required. The same one key as above; the monitor only lists and reads with it. The owner's restore uses a read-only key of their own.                              |
+| `BACKUP_MONITOR_MAX_AGE_SECONDS`                                               | GitHub Environment secret, normally unset           | The alert threshold in seconds; default 93600 (26 hours). Must be a positive whole number.                                                                         |
+| `OWNER_ALERT_EMAIL`, `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, `RESEND_FROM_NAME` | GitHub Environment secret                           | The owner alert email. Unset, the alert is only logged (`owner_alert_channel_unconfigured`).                                                                       |
+| `OWNER_ALERT_WEBHOOK_URL` / `OWNER_ALERT_WEBHOOK_SECRET`                       | GitHub Environment secret, optional                 | An optional chat webhook that receives the same alert.                                                                                                             |
+| `SENTRY_DSN`, `RELEASE_SHA`, `DEPLOYMENT_ENV`                                  | GitHub Environment secret / the workflow            | Optional error tracking when the check itself fails. `SENTRY_DSN` is a secret; the workflow sets `RELEASE_SHA` to the commit and `DEPLOYMENT_ENV` to `production`. |
+
+### Backup retention (the `backup-retention` workflow, same environment)
+
+`pnpm --filter @canadian-plans/jobs run retention`, weekly. It keeps the newest run
+of each of the last `RETENTION_DAILY_POINTS` days and `RETENTION_MONTHLY_POINTS`
+months, deletes the other runs and the attempts that never wrote a manifest
+once they are past the grace period, and never deletes `heartbeat/latest.json`.
+It works from the archive listing alone and never holds the recovery key. It
+exits 1 when a run's age cannot be read (`retention_unreadable_manifests`);
+that run is kept.
+
+| Variable                                                               | Set where                                                                       | Value / purpose                                                                                                                                                             |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `B2_ARCHIVE_ENDPOINT` / `B2_ARCHIVE_REGION` / `B2_ARCHIVE_BUCKET`      | GitHub Environment secret                                                       | Required. The deployment's archive bucket, as for the backup run.                                                                                                           |
+| `B2_ARCHIVE_RETENTION_KEY_ID` / `B2_ARCHIVE_RETENTION_APPLICATION_KEY` | Workflow env, from the same two Environment secrets                             | Required. The same one key as above; retention lists, reads and deletes with it.                                                                                            |
+| `RETENTION_DRY_RUN`                                                    | The workflow: `false` for a scheduled run, the `dry_run` input for a manual one | Reports without deleting unless the value is exactly `false` (any case). Unset is a dry run. A scheduled run deletes; a manual run is a dry run unless Dry run is unticked. |
+| `RETENTION_DAILY_POINTS` / `RETENTION_MONTHLY_POINTS`                  | GitHub Environment secret, normally unset                                       | Daily and monthly restore points kept; default 30 and 12. Positive whole numbers.                                                                                           |
+| `RETENTION_GRACE_SECONDS`                                              | GitHub Environment secret, normally unset                                       | Nothing younger than this is deleted; default 86400 (24 hours). A positive whole number.                                                                                    |
+| `BACKUP_DEPLOYMENT`                                                    | Workflow matrix (`${{ matrix.deployment }}`)                                    | Optional. Recorded in the log lines.                                                                                                                                        |
+| `SENTRY_DSN`, `RELEASE_SHA`, `DEPLOYMENT_ENV`                          | GitHub Environment secret / the workflow                                        | Optional error tracking for a failed run. `SENTRY_DSN` is a secret; the workflow sets `RELEASE_SHA` to the commit and `DEPLOYMENT_ENV` to `production`.                     |
+
+### Restore (owner-run, never in GitHub)
+
+`pnpm --filter @canadian-plans/jobs run restore`, on the owner's machine with `age`
+and PostgreSQL 17 `psql` on PATH. Without `TARGET_DATABASE_URL` it only
+verifies the run: the manifest and every artifact must decrypt and match their
+recorded size and SHA-256. With it, it first checks the target (its role must
+bypass RLS, `restore_target_role_cannot_bypass_rls`; no `app` or `drizzle`
+schema may exist yet, `restore_target_not_empty`), then loads the database in
+one transaction, uploads the documents again and compares every table's row
+count with the manifest. It prints one `restore_report` line and exits 0 only
+when the run verified and, with a target, restored with every count matching.
+The values are set in the owner's shell for that one run, never stored in
+GitHub or a deployment.
+
+| Variable                                                                                                                                            | Value / purpose                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RESTORE_RUN_ID`                                                                                                                                    | Required. The run to restore, `run-<id>`, as its archive prefix shows it.                                                                                                                                                                                                                                                                                                                                                 |
+| `B2_ARCHIVE_ENDPOINT` / `B2_ARCHIVE_REGION` / `B2_ARCHIVE_BUCKET`                                                                                   | Required. The deployment's archive bucket, as for the backup run.                                                                                                                                                                                                                                                                                                                                                         |
+| `B2_ARCHIVE_READER_KEY_ID` / `B2_ARCHIVE_READER_APPLICATION_KEY`                                                                                    | Required. The reader key (`listFiles`, `readFiles` only), the same key the monitor holds.                                                                                                                                                                                                                                                                                                                                 |
+| `RECOVERY_PRIVATE_KEY_PATH`                                                                                                                         | Required. Path to a local file holding the `age` recovery private key, supplied at restore time only (from the password manager or the offline copy) and deleted afterwards. It must exist and be readable; only `age` reads it, and its contents are never logged.                                                                                                                                                       |
+| `TARGET_DATABASE_URL`                                                                                                                               | Optional; unset means verify only. The isolated target project's `postgres` login through the session pooler (port 5432), URL-encoded password. It reaches `psql` only as PG\* variables.                                                                                                                                                                                                                                 |
+| `RESTORE_SKIP_ROLES`                                                                                                                                | Optional. `1`, `true` or `yes` leaves out `roles.sql`, for a target that already holds the roles.                                                                                                                                                                                                                                                                                                                         |
+| `TARGET_STORAGE_ENDPOINT` / `TARGET_STORAGE_REGION` / `TARGET_STORAGE_BUCKET` / `TARGET_STORAGE_ACCESS_KEY_ID` / `TARGET_STORAGE_SECRET_ACCESS_KEY` | Required with `TARGET_DATABASE_URL` (all five) unless `RESTORE_SKIP_OBJECTS` is set; refused without it. The target project's Storage S3 endpoint, region, `documents` bucket (created first) and an S3 access key pair. Each archived document is uploaded to `workspaces/<workspace>/<key>`. They are checked before anything is read, because the documents are uploaded after the database transaction has committed. |
+| `RESTORE_SKIP_OBJECTS`                                                                                                                              | Optional. `1`, `true` or `yes` restores without target storage (any `TARGET_STORAGE_*` is ignored). Only for a backup that holds no documents, or a deliberate database-only drill: a run that holds documents then fails with `restore_storage_not_configured` at the documents stage, after the database is loaded, and that loaded target must be discarded before another attempt (`restore_target_not_empty`).       |
+| `INCIDENT_DETECTED_AT`                                                                                                                              | Optional. An ISO 8601 date-time; the report then measures the loss window from the run's capture time.                                                                                                                                                                                                                                                                                                                    |
+| `PGSSLMODE`                                                                                                                                         | Optional. Defaults to `require`; set `disable` only for a local `supabase start` target.                                                                                                                                                                                                                                                                                                                                  |
+| `SENTRY_DSN`, `RELEASE_SHA`, `DEPLOYMENT_ENV`                                                                                                       | Optional error tracking when the restore itself fails.                                                                                                                                                                                                                                                                                                                                                                    |
+
+### Optional local AI smoke (never needed by the deployed apps)
+
+`AI_LIVE_SMOKE=synthetic` explicitly opts the backend's `scripts/ai-live-smoke.ts`
+into one bounded live Gateway test using only in-memory synthetic facts. It also
+needs `AI_GATEWAY_API_KEY` and `AI_GATEWAY_MODEL` from secure environment variables.
+Unset, no provider is called and the script exits 2. See the AI runbook §11.
+
+### Reviewed AI email and interactive drafts
+
+Version 3 uses the existing AI configuration and Site allowlist. Sending also
+requires the existing customer-email provider configuration (`EMAIL_PROVIDER`,
+provider credentials and `EMAIL_CONTACT_HASH_SECRET`) and saved Site email
+settings. No additional secret or database migration is needed. The model never
+gets the recipient/sender preview addresses from tool results; these are sent to
+the authorized browser card only. There is no mailbox/inbox connection.
+
+Reviewed AI lead updates use the existing AI enablement, Gateway key/model and
+Site allowlist. No additional secret or environment variable is required.
+
+Automation builder visual/setup improvements require no new environment
+variable, dependency or migration; existing scheduler and mail configuration
+still controls actual execution and delivery.
+
+### AI automation authoring
+
+`AI_AUTOMATION_WORKSPACE_IDS` is an optional comma-separated UUID allowlist.
+Unset/empty disables automation authoring only. Sites must also be in
+`AI_ASSISTANT_WORKSPACE_IDS`, the assistant must be configured, and each caller
+needs existing assistant access plus `integration.manage`. Deploy migrations
+0021/0022 before adding test sites to this allowlist. Proposal cards expire after
+10 minutes; saved receipts can be retried for 24 hours. Operational retention
+prunes proposal storage after one day; actor-owned lazy cleanup also runs when
+preparing proposals. No new provider key or model is introduced.
+
+AI authoring generations allow up to 4,800 output tokens when automation tools
+are enabled (ordinary chat stays at 1,200). Shared tool/turn and timeout budgets
+still apply. Only `/ai/automations/revise` accepts up to 96 KiB JSON so a maximum
+65 KiB flow definition and its envelope fit; other JSON endpoints retain 64 KiB.
+
+Production rollout (4 Nov 2026): both AI workspace allowlists contain
+`10000000-0000-4000-8000-000000000101` (Get Canada Sim) and
+`10000000-0000-4000-8000-000000000102` (CanadaWide). The intake-check workspace
+is not included. Provider credentials and the configured model are unchanged.

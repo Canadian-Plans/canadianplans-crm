@@ -1,0 +1,1777 @@
+import { DatabaseAiTurnStore, type AiTurnStore } from '../ai/turn-store.js';
+import { AutomationAuthoringStore } from '../ai/automation-authoring.js';
+import { createErrorTrackerFromEnv, type ErrorTracker } from '@canadian-plans/adapters';
+import { Router, type Request, type Response } from 'express';
+import {
+  allowedStageMoves,
+  areValidLeadColumns,
+  areValidLeadPropertyFilters,
+  createDownloadLinkRequestSchema,
+  isValidLeadSort,
+  parseLeadSort,
+  createLeadNoteRequestSchema,
+  createLeadTaskRequestSchema,
+  createServiceCredentialRequestSchema,
+  inviteStaffRequestSchema,
+  leadBoardQuerySchema,
+  leadStatsQuerySchema,
+  leadsSummaryQuerySchema,
+  listWorkspaceLeadsQuerySchema,
+  listWorkspaceTasksQuerySchema,
+  queueCustomerEmailRequestSchema,
+  resolveUncertainJobRequestSchema,
+  reviewFileRequestSchema,
+  updateLeadTaskRequestSchema,
+  updateStaffProfileRequestSchema,
+  updateWorkspaceLeadRequestSchema,
+  resolveChangeRequestRequestSchema,
+  type LeadAccess,
+  type LeadDetail,
+  type LeadListItem,
+  type PropertyCatalog,
+  DOCUMENT_REVIEW_PAGE_SIZE,
+  documentReviewQueueQuerySchema,
+} from '@canadian-plans/contracts';
+import {
+  rateLimitHit,
+  withTenantTx,
+  type DatabaseClient,
+  type RateLimitInput,
+  type RateLimitResult,
+  type TenantContext,
+} from '@canadian-plans/db';
+import { z } from 'zod';
+
+import { createDocumentServiceFromEnv } from '../documents/factory.js';
+import type { DocumentService } from '../documents/service.js';
+import { toStaffFile } from '../documents/summary.js';
+
+import {
+  defaultStaffSessionVerifier,
+  requireStaffSession,
+  type StaffRateLimit,
+  type StaffSessionVerifier,
+} from '../auth/session.js';
+import { isConnectionLevelError, logRequestError } from '../http/logger.js';
+import { sendLeadUpdateRefusal } from '../http/lead-update-errors.js';
+import { sendStaffAuthError } from '../http/staff-errors.js';
+import { sendDomainError } from '../http/domain-errors.js';
+import { sendWebsiteError } from '../http/website-errors.js';
+import { sensitiveFieldsKey } from '../crypto/cipher.js';
+import { DatabaseFlowStore, type FlowStore } from '../automations/flow-store.js';
+import { customerEmailFromEnv, type CustomerEmail } from '../email/senders.js';
+import type { ChangeRequestService } from '../tracking/change-requests.js';
+import { DatabaseEmailSettingsStore, type EmailSettingsStore } from '../email/settings-store.js';
+import { DatabaseIdentityStore, type IdentityStore } from '../leads/identity-store.js';
+import { DatabaseLeadExportStore, type LeadExportStore } from '../leads/export/store.js';
+import { DatabaseLeadStore, type LeadStore } from '../leads/store.js';
+import {
+  DatabaseLeadWorkStore,
+  type LeadWorkStore,
+  type TaskOutcome,
+} from '../leads/work-store.js';
+import { DatabaseOutboxStore, type JobAdminStore } from '../jobs/store.js';
+import { DatabasePlanStore, type PlanStore } from '../plans/store.js';
+import { DatabaseAnalyticsStore, type AnalyticsStore } from '../analytics/store.js';
+import { DatabaseReportStore, type ReportStore } from '../reports/store.js';
+import type { PropertyStore } from '../properties/store.js';
+import {
+  createAuthorize,
+  decideAccess,
+  denyReasonOf,
+  type StaffAccessSnapshot,
+  type StaffAction,
+} from '../staff/authorization.js';
+import { DatabaseStaffStore, type StaffStore } from '../staff/store.js';
+import { DatabaseSavedViewStore, type SavedViewStore } from '../views/store.js';
+import { generateServiceSecret } from '../website/credential.js';
+import { createSavedViewRoutes } from './views.js';
+import {
+  DatabaseWebsiteCredentialStore,
+  type ServiceCredentialRecord,
+  type WebsiteCredentialStore,
+} from '../website/store.js';
+
+import {
+  DatabaseDocumentReviewQueue,
+  type DocumentReviewQueueStore,
+} from '../documents/review-queue.js';
+import { createAutomationRoutes } from './automations.js';
+import { createAiAssistantRoutes } from './ai-assistant.js';
+import { createEmailSettingsRoutes } from './email-settings.js';
+import { createPlanRoutes } from './plans.js';
+import { createPropertyRoutes } from './properties.js';
+import { createAnalyticsRoutes } from './analytics.js';
+import { createLeadExportRoutes } from './lead-export.js';
+import { createReportRoutes } from './reports.js';
+import { loadAiAssistantConfig, type AiAssistantConfig } from '../ai/config.js';
+import { createGatewayEngine, type AssistantEngine } from '../ai/engine.js';
+import { DatabaseAiReadService, type AiReadService } from '../ai/read-service.js';
+import { DatabaseAiSiteContextStore, type AiSiteContextStore } from '../ai/site-context.js';
+
+export interface StaffRouteDependencies {
+  sessionVerifier: StaffSessionVerifier;
+  /** Per-IP limit applied before any session check; omitted in route tests. */
+  rateLimit?: StaffRateLimit;
+  store: StaffStore;
+  credentialStore: WebsiteCredentialStore;
+  leadStore: LeadStore;
+  /** The lead page, board, notes and tasks; omitted in route tests that do not reach them. */
+  leadWorkStore?: LeadWorkStore;
+  /** Leads as an Excel file; omitted in route tests that do not reach it. */
+  leadExportStore?: LeadExportStore;
+  jobStore?: JobAdminStore;
+  documentService?: Pick<DocumentService, 'review' | 'issueDownload'>;
+  /** Opens a lead's sealed SIN for an owner; absent without `SENSITIVE_FIELDS_KEY`. */
+  identityStore?: Pick<IdentityStore, 'revealSin'>;
+  /** Mail to a lead's customer; absent, no site can send. */
+  customerEmail?: CustomerEmail;
+  /** Each staff member's private saved views; omitted in route tests that do not reach them. */
+  savedViewStore?: SavedViewStore;
+  /** The site's property catalogue; `createApp` supplies the default. */
+  loadPropertyCatalog?: (ctx: TenantContext) => Promise<PropertyCatalog>;
+  /** Receives every unexpected handler failure; optional so tests can omit it. */
+  errorTracker?: ErrorTracker;
+  /**
+   * The site's property definitions and layouts; the lead list, board, detail
+   * and edit read the site's catalogue from it. `createApp` supplies the
+   * database store when this is omitted.
+   */
+  propertyStore?: PropertyStore;
+  /** The site's plans; `createApp` supplies the database store when this is omitted. */
+  planStore?: PlanStore;
+  /** The site's reports (counts only); omitted in route tests that do not reach them. */
+  reportStore?: ReportStore;
+  /** The analytics dashboard's figures; omitted in route tests that do not reach them. */
+  analyticsStore?: AnalyticsStore;
+  /** The site's automation flows, their versions and runs; omitted in route tests that do not reach them. */
+  flowStore?: FlowStore;
+  /** Documents → review queue; the database store when absent. */
+  documentReviewQueue?: DocumentReviewQueueStore;
+  /** The site's email settings and templates; omitted in route tests that do not reach them. */
+  emailSettingsStore?: EmailSettingsStore;
+  /** The transaction runner the test mail is composed and queued in; the database's by default. */
+  withTenantTx?: DatabaseClient['withTenantTx'];
+  /** Decides customers' change requests; `createApp` supplies the tracking one when omitted. */
+  changeRequests?: Pick<ChangeRequestService, 'approve' | 'reject'>;
+  /**
+   * Ask AI: its validated configuration, the site lookup the panel header
+   * needs, the reads behind its tools, the model adapter and the distributed
+   * limiter. `createApp` supplies all of them; tests inject fakes so a
+   * disabled, enabled or failing assistant can be exercised offline.
+   */
+  ai?: {
+    config: AiAssistantConfig;
+    siteContext: AiSiteContextStore;
+    reads?: AiReadService;
+    engine?: AssistantEngine;
+    rateLimit?: (input: RateLimitInput) => Promise<RateLimitResult>;
+    /** Per-turn usage records; the default dependencies write `app.ai_turns`. */
+    turns?: AiTurnStore;
+    now?: () => Date;
+  };
+}
+
+export function createDefaultStaffRouteDependencies(): StaffRouteDependencies {
+  const aiConfig = loadAiAssistantConfig();
+  // The deploy keeps working without the dedicated secret, but says so once.
+  if (aiConfig.enabled && aiConfig.signingKeySource !== 'dedicated') {
+    console.warn(
+      JSON.stringify({
+        event:
+          aiConfig.signingKey === undefined
+            ? 'ai_signing_secret_invalid'
+            : 'ai_signing_secret_missing',
+      }),
+    );
+  }
+  return {
+    sessionVerifier: defaultStaffSessionVerifier(),
+    rateLimit: rateLimitHit,
+    store: new DatabaseStaffStore(),
+    credentialStore: new DatabaseWebsiteCredentialStore(),
+    leadStore: new DatabaseLeadStore(),
+    leadWorkStore: new DatabaseLeadWorkStore(),
+    leadExportStore: new DatabaseLeadExportStore(),
+    jobStore: new DatabaseOutboxStore(),
+    documentService: createDocumentServiceFromEnv(),
+    identityStore: identityStoreFromEnv(),
+    customerEmail: customerEmailFromEnv(),
+    savedViewStore: new DatabaseSavedViewStore(),
+    planStore: new DatabasePlanStore(),
+    reportStore: new DatabaseReportStore(),
+    analyticsStore: new DatabaseAnalyticsStore(),
+    flowStore: new DatabaseFlowStore(),
+    emailSettingsStore: new DatabaseEmailSettingsStore(),
+    errorTracker: createErrorTrackerFromEnv(),
+    ai: {
+      config: aiConfig,
+      siteContext: new DatabaseAiSiteContextStore(),
+      reads: new DatabaseAiReadService(),
+      // Only a fully configured deployment builds a provider; otherwise the
+      // chat route reports the feature unavailable and never calls a model.
+      ...(aiConfig.enabled && aiConfig.apiKey !== undefined && aiConfig.modelId !== undefined
+        ? {
+            engine: createGatewayEngine({
+              apiKey: aiConfig.apiKey,
+              modelId: aiConfig.modelId,
+            }),
+          }
+        : {}),
+      rateLimit: rateLimitHit,
+      turns: new DatabaseAiTurnStore(),
+    },
+  };
+}
+function identityStoreFromEnv(): IdentityStore | undefined {
+  const secret = sensitiveFieldsKey();
+  return secret ? new DatabaseIdentityStore(secret) : undefined;
+}
+
+/** Stand-ins for a deployment built without them: each request is a logged 500. */
+function notConfigured(what: string): Promise<never> {
+  return Promise.reject(new Error(`${what} is not configured`));
+}
+const unconfiguredPropertyStore: PropertyStore = {
+  catalog: () => notConfigured('property store'),
+  model: () => notConfigured('property store'),
+  create: () => notConfigured('property store'),
+  update: () => notConfigured('property store'),
+  remove: () => notConfigured('property store'),
+  saveLayout: () => notConfigured('property store'),
+};
+const unconfiguredSavedViewStore: SavedViewStore = {
+  list: () => notConfigured('saved view store'),
+  create: () => notConfigured('saved view store'),
+  update: () => notConfigured('saved view store'),
+  delete: () => notConfigured('saved view store'),
+};
+const unconfiguredPlanStore: PlanStore = {
+  list: () => notConfigured('plan store'),
+  get: () => notConfigured('plan store'),
+  create: () => notConfigured('plan store'),
+  update: () => notConfigured('plan store'),
+  listForWebsite: () => notConfigured('plan store'),
+  options: () => notConfigured('plan store'),
+};
+const unconfiguredLeadExportStore: LeadExportStore = {
+  export: () => notConfigured('lead export store'),
+};
+const unconfiguredReportStore: ReportStore = {
+  sourceReport: () => notConfigured('report store'),
+};
+const unconfiguredAnalyticsStore: AnalyticsStore = {
+  analytics: () => notConfigured('analytics store'),
+};
+const unconfiguredFlowStore: FlowStore = {
+  list: () => notConfigured('flow store'),
+  get: () => notConfigured('flow store'),
+  create: () => notConfigured('flow store'),
+  updateDetails: () => notConfigured('flow store'),
+  setEnabled: () => notConfigured('flow store'),
+  archive: () => notConfigured('flow store'),
+  restore: () => notConfigured('flow store'),
+  listRuns: () => notConfigured('flow store'),
+  getRun: () => notConfigured('flow store'),
+  saveDraft: () => notConfigured('flow store'),
+  discardDraft: () => notConfigured('flow store'),
+  activate: () => notConfigured('flow store'),
+  reset: () => notConfigured('flow store'),
+  getVersion: () => notConfigured('flow store'),
+  versions: () => notConfigured('flow store'),
+  catalog: () => notConfigured('flow store'),
+  detail: () => notConfigured('flow store'),
+};
+const unconfiguredEmailSettingsStore: EmailSettingsStore = {
+  getSettings: () => notConfigured('email settings store'),
+  putSettings: () => notConfigured('email settings store'),
+  listTemplates: () => notConfigured('email settings store'),
+  listArchivedTemplates: () => notConfigured('email settings store'),
+  putTemplate: () => notConfigured('email settings store'),
+  createTemplate: () => notConfigured('email settings store'),
+  setTemplateArchived: () => notConfigured('email settings store'),
+};
+/** A deployment with no customer mail: no provider, so no site can send. */
+const unconfiguredCustomerEmail: CustomerEmail = {
+  environment: {
+    providerReady: false,
+    contactHash: () => {
+      throw new Error('customer email is not configured');
+    },
+  },
+  available: async () => false,
+};
+const unconfiguredCatalog = () => notConfigured('property catalogue');
+
+function credentialSummary(record: ServiceCredentialRecord) {
+  return {
+    id: record.id,
+    scopes: record.scopes,
+    createdAt: record.createdAt,
+    revokedAt: record.revokedAt,
+  };
+}
+
+function session(req: Request) {
+  const value = req.staffSession;
+  if (!value) throw new Error('staff session middleware did not run');
+  return value;
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  if ('code' in error && error.code === '23505') return true;
+  if (!('cause' in error) || typeof error.cause !== 'object' || error.cause === null) return false;
+  return 'code' in error.cause && error.cause.code === '23505';
+}
+
+export function createStaffRouter(dependencies: StaffRouteDependencies): Router {
+  const router = Router();
+  router.use(requireStaffSession(dependencies.sessionVerifier, dependencies.rateLimit));
+
+  const authorize = createAuthorize({ accessStore: dependencies.store });
+  const propertyStore = dependencies.propertyStore ?? unconfiguredPropertyStore;
+
+  /**
+   * Every handler's last-resort failure path: a scrubbed log record plus the
+   * error tracker, so a staff-side 500 is never silent. Neither the body, the
+   * headers nor the error message reach the log.
+   */
+  function reportFailure(req: Request, error: unknown): void {
+    const workspaceId =
+      typeof req.params['workspaceId'] === 'string' ? req.params['workspaceId'] : undefined;
+    const routePath: unknown = req.route?.path;
+    const route = `${req.baseUrl}${typeof routePath === 'string' ? routePath : req.path}`;
+    const connection = isConnectionLevelError(error);
+    logRequestError({
+      requestId: req.id,
+      workspaceId,
+      route,
+      code: connection ? 'persistence_unavailable' : 'internal_error',
+      flag: connection ? 'retryable' : 'not_retryable',
+    });
+    dependencies.errorTracker?.captureException(error, {
+      requestId: req.id,
+      workspaceId,
+      actorId: req.staffSession?.actorId,
+      route,
+      release: process.env['RELEASE_SHA'] ?? 'unknown',
+      environment: process.env['DEPLOYMENT_ENV'] ?? process.env['NODE_ENV'],
+    });
+  }
+
+  /** One live authorization decision for this actor and workspace. */
+  async function decide(req: Request, workspaceId: string, action: StaffAction) {
+    const actor = session(req);
+    const decision = await authorize({ actorId: actor.actorId, workspaceId, action });
+    return { actor, decision };
+  }
+
+  /**
+   * Whether this actor may see a lead's name, email and phone. Only roles that
+   * work leads or money see contact details; read-only roles get leads without
+   * them. Decided from the access snapshot the request's own authorization
+   * already loaded, so it adds no database round trips: three extra membership
+   * reads here were most of the leads inbox's latency.
+   */
+  function canSeeContacts(access: StaffAccessSnapshot): boolean {
+    return (['lead.manage', 'order.manage', 'financial.read'] as const).some(
+      (action) => decideAccess(access, action).allowed,
+    );
+  }
+
+  /** The site's property catalogue, read once per request after the caller is authorized. */
+  function siteCatalog(
+    req: Request,
+    workspaceId: string,
+    actorId: string,
+  ): Promise<PropertyCatalog> {
+    return propertyStore.catalog({ workspaceId, actorId, requestId: req.id });
+  }
+
+  function leadAccessOf(access: StaffAccessSnapshot): LeadAccess {
+    return {
+      contacts: canSeeContacts(access),
+      manage: decideAccess(access, 'lead.manage').allowed,
+      revealSensitive: decideAccess(access, 'sensitive.reveal').allowed,
+      export: decideAccess(access, 'lead.export').allowed,
+      revenue: decideAccess(access, 'revenue.view').allowed,
+    };
+  }
+
+  // The countdown date comes from the form, which these roles never see; a
+  // row's property columns carry form and custom values alike.
+  function withoutContact(lead: LeadListItem): LeadListItem {
+    const { properties: _properties, ...rest } = lead;
+    return { ...rest, contact: {}, countdownDate: null };
+  }
+
+  /**
+   * The lead as a caller without `revenue.view` sees it: the frozen plan's
+   * commission left out of its order details (the key, not a null).
+   */
+  function withMoneyFor(access: StaffAccessSnapshot, lead: LeadDetail): LeadDetail {
+    if (decideAccess(access, 'revenue.view').allowed || !lead.order?.plan) return lead;
+    const { commission: _commission, ...plan } = lead.order.plan;
+    return { ...lead, order: { ...lead.order, plan } };
+  }
+
+  // Custom values and the order travel with contact visibility, as the form does.
+  function withoutPersonalDetails(lead: LeadDetail): LeadDetail {
+    const { customValues: _customValues, order: _order, ...rest } = lead;
+    return { ...withoutContact(rest), form: null };
+  }
+
+  /** The lead work store, or a logged 500 when this deployment was built without it. */
+  function leadWork(req: Request, res: Response): LeadWorkStore | undefined {
+    if (dependencies.leadWorkStore) return dependencies.leadWorkStore;
+    reportFailure(req, new Error('lead work store is not configured'));
+    sendStaffAuthError(res, req.id, 'internal_error', 500);
+    return undefined;
+  }
+
+  /** Two route parameters as uuids, or a 400 already sent. */
+  function uuidParams(
+    req: Request,
+    res: Response,
+    second: 'leadId' | 'taskId',
+  ): { workspaceId: string; id: string } | undefined {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const id = z.uuid().safeParse(req.params[second]);
+    if (!workspaceId.success || !id.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return undefined;
+    }
+    return { workspaceId: workspaceId.data, id: id.data };
+  }
+
+  function sendTaskOutcome(req: Request, res: Response, outcome: TaskOutcome, created: boolean) {
+    switch (outcome.status) {
+      case 'saved':
+        res.status(created ? 201 : 200).json({ task: outcome.task, requestId: req.id });
+        return;
+      case 'not_found':
+        sendDomainError(res, req.id, created ? 'lead_not_found' : 'task_not_found', 404);
+        return;
+      case 'trashed':
+        sendDomainError(res, req.id, 'lead_trashed', 409);
+        return;
+      case 'assignee_not_found':
+        sendDomainError(res, req.id, 'assignee_not_found', 422);
+        return;
+    }
+  }
+
+  router.get('/workspaces', async (req, res) => {
+    try {
+      const actor = session(req);
+      const workspaces = await dependencies.store.bootstrapStaff({
+        actorId: actor.actorId,
+        verifiedEmail: actor.verifiedEmail,
+        requestId: req.id,
+      });
+      res.json({ workspaces, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/access', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    if (!workspaceId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      const workspaces = await dependencies.store.bootstrapStaff({
+        actorId: actor.actorId,
+        verifiedEmail: actor.verifiedEmail,
+        requestId: req.id,
+      });
+      const workspace = workspaces.find((item) => item.id === workspaceId.data);
+      if (!workspace) {
+        sendStaffAuthError(res, req.id, 'workspace_not_found', 404);
+        return;
+      }
+      res.json({
+        workspace,
+        permissions: decision.access.permissions
+          .filter((permission) => permission.effect === 'allow')
+          .map((permission) => permission.name),
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  /** The caller's own display name, on every site they actively belong to. */
+  router.patch('/profile', async (req, res) => {
+    const body = updateStaffProfileRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const actor = session(req);
+      const memberships = await dependencies.store.setDisplayName({
+        actorId: actor.actorId,
+        displayName: body.data.displayName,
+        requestId: req.id,
+      });
+      res.json({ displayName: body.data.displayName, memberships, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/leads', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = listWorkspaceLeadsQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const access = leadAccessOf(decision.access);
+      const parsedSort = query.data.sort ? parseLeadSort(query.data.sort) : undefined;
+      // Searching, filtering, sorting by name or a property, or requesting
+      // property columns reveals contact or form details these roles never see,
+      // whatever the keys: refused before the catalogue is read.
+      if (
+        !access.contacts &&
+        (query.data.q !== undefined ||
+          query.data.where !== undefined ||
+          query.data.columns !== undefined ||
+          parsedSort?.field === 'fullName' ||
+          parsedSort?.propertyKey !== undefined)
+      ) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      // Filters, sort and columns name the site's properties, as it defines them now.
+      const catalog = await siteCatalog(req, workspaceId.data, actor.actorId);
+      if (
+        (query.data.where !== undefined &&
+          !areValidLeadPropertyFilters(query.data.where, query.data.type, catalog)) ||
+        (query.data.sort !== undefined &&
+          !isValidLeadSort(query.data.sort, query.data.type, catalog)) ||
+        (query.data.columns !== undefined &&
+          !areValidLeadColumns(query.data.columns, query.data.type, catalog))
+      ) {
+        sendStaffAuthError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+
+      const result = await dependencies.leadStore.listLeads({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        status: query.data.status,
+        leadType: query.data.type,
+        stage: query.data.stage,
+        assignee: query.data.assignee,
+        search: query.data.q,
+        view: query.data.view,
+        dueBy: query.data.dueBy,
+        where: query.data.where,
+        sort: query.data.sort,
+        columns: query.data.columns,
+        catalog,
+        page: query.data.page,
+        pageSize: query.data.pageSize,
+      });
+      const leads = access.contacts ? result.leads : result.leads.map(withoutContact);
+      res.json({ leads, page: result.page, access, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // Registered before `/leads/:leadId` so the literal segments win.
+  router.get('/workspaces/:workspaceId/leads/summary', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = leadsSummaryQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const summary = await store.summary({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        dueBy: query.data.dueBy,
+      });
+      res.json({
+        ...summary,
+        // `trash` is the deprecated twin of `archived`: the same number.
+        trash: summary.archived,
+        access: leadAccessOf(decision.access),
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // Counts only (no lead, no contact), so every role that reads the site may see them.
+  router.get('/workspaces/:workspaceId/leads/stats', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = leadStatsQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const stats = await store.stats({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        leadType: query.data.leadType,
+        days: query.data.days,
+      });
+      res.json({
+        leadType: query.data.leadType,
+        days: query.data.days ?? null,
+        ...stats,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/leads/board', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = leadBoardQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const access = leadAccessOf(decision.access);
+      if (!access.contacts && (query.data.q !== undefined || query.data.where !== undefined)) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const catalog = await siteCatalog(req, workspaceId.data, actor.actorId);
+      if (
+        query.data.where !== undefined &&
+        !areValidLeadPropertyFilters(query.data.where, query.data.type, catalog)
+      ) {
+        sendStaffAuthError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const columns = await store.board(
+        {
+          workspaceId: workspaceId.data,
+          actorId: actor.actorId,
+          leadType: query.data.type,
+          assignee: query.data.assignee,
+          search: query.data.q,
+          where: query.data.where,
+          catalog,
+        },
+        query.data.perStage ?? 50,
+      );
+      res.json({
+        leadType: query.data.type,
+        columns: access.contacts
+          ? columns
+          : columns.map((column) => ({ ...column, leads: column.leads.map(withoutContact) })),
+        access,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/leads/:leadId', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const access = {
+        ...leadAccessOf(decision.access),
+        emailCustomer:
+          decideAccess(decision.access, 'lead.manage').allowed &&
+          ((await dependencies.customerEmail?.available({
+            workspaceId: params.workspaceId,
+            actorId: actor.actorId,
+          })) ??
+            false),
+        downloadDocuments: decideAccess(decision.access, 'document.download').allowed,
+        reviewDocuments: decideAccess(decision.access, 'order.manage').allowed,
+        overrideDocuments: decideAccess(decision.access, 'order.override').allowed,
+        decideChanges: decideAccess(decision.access, 'lead.manage').allowed,
+      };
+      // Form details, notes and tasks carry personal details as freely as
+      // the contact fields do, so they travel only with contact visibility.
+      const result = await store.getLead({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        leadId: params.id,
+        includeWork: access.contacts,
+        catalog: await siteCatalog(req, params.workspaceId, actor.actorId),
+      });
+      if (!result) {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      res.json({
+        lead: access.contacts
+          ? withMoneyFor(decision.access, result.lead)
+          : withoutPersonalDetails(result.lead),
+        activities: result.activities,
+        tasks: result.tasks,
+        allowedMoves: allowedStageMoves(result.lead.leadType, result.lead.stage),
+        // Which requests belong to one person is personal data as well.
+        related: access.contacts ? result.related : [],
+        identities: access.contacts ? result.identities : [],
+        documents: access.contacts ? result.documents : [],
+        // The customer's own values: with contact visibility only.
+        changeRequest: access.contacts ? result.changeRequest : null,
+        access,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.patch('/workspaces/:workspaceId/leads/:leadId', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    const body = updateWorkspaceLeadRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      // Only the owner and Orders members may move an order on without its
+      // documents approved; refused before the store is asked.
+      if (
+        body.data.documentsOverrideReason !== undefined &&
+        !decideAccess(decision.access, 'order.override').allowed
+      ) {
+        sendDomainError(res, req.id, 'documents_override_not_allowed', 409);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.updateLead({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        leadId: params.id,
+        stage: body.data.stage,
+        assignedActorId: body.data.assignedActorId,
+        contact: body.data.contact,
+        form: body.data.form,
+        customValues: body.data.customValues,
+        order: body.data.order,
+        documentsOverrideReason: body.data.documentsOverrideReason,
+        catalog: await siteCatalog(req, params.workspaceId, actor.actorId),
+      });
+      if (outcome.status !== 'updated') {
+        sendLeadUpdateRefusal(res, req.id, outcome);
+        return;
+      }
+      res.json({
+        lead: withMoneyFor(decision.access, outcome.lead),
+        activities: outcome.activities,
+        allowedMoves: allowedStageMoves(outcome.lead.leadType, outcome.lead.stage),
+        ...(outcome.emailSkipped ? { emailSkipped: outcome.emailSkipped } : {}),
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // A customer's change request (Get Canada Sim's `/track`): staff who work
+  // leads approve it, applying the values as their own edit, or reject it.
+  for (const decision of ['approve', 'reject'] as const) {
+    router.post(
+      `/workspaces/:workspaceId/leads/:leadId/change-requests/:changeRequestId/${decision}`,
+      async (req, res) => {
+        const params = uuidParams(req, res, 'leadId');
+        if (!params) return;
+        const changeRequestId = z.uuid().safeParse(req.params['changeRequestId']);
+        const body = resolveChangeRequestRequestSchema.safeParse(req.body);
+        if (!changeRequestId.success || !body.success) {
+          sendStaffAuthError(res, req.id, 'invalid_request', 400);
+          return;
+        }
+        try {
+          const { actor, decision: allowed } = await decide(req, params.workspaceId, 'lead.manage');
+          if (!allowed.allowed) {
+            sendStaffAuthError(res, req.id, denyReasonOf(allowed), 403);
+            return;
+          }
+          const service = dependencies.changeRequests;
+          if (!service) {
+            reportFailure(req, new Error('change request service is not configured'));
+            sendStaffAuthError(res, req.id, 'internal_error', 500);
+            return;
+          }
+          const input = {
+            workspaceId: params.workspaceId,
+            actorId: actor.actorId,
+            requestId: req.id,
+            leadId: params.id,
+            changeRequestId: changeRequestId.data,
+            expectedVersion: body.data.expectedVersion,
+            catalog: await siteCatalog(req, params.workspaceId, actor.actorId),
+          };
+          const outcome =
+            decision === 'approve' ? await service.approve(input) : await service.reject(input);
+          switch (outcome.status) {
+            case 'approved':
+            case 'rejected':
+              res.json({
+                lead: withMoneyFor(allowed.access, outcome.lead),
+                activities: outcome.activities,
+                allowedMoves: allowedStageMoves(outcome.lead.leadType, outcome.lead.stage),
+                ...(outcome.emailSkipped ? { emailSkipped: outcome.emailSkipped } : {}),
+                requestId: req.id,
+              });
+              return;
+            case 'not_found':
+              sendDomainError(res, req.id, 'change_request_not_found', 404);
+              return;
+            case 'resolved':
+              sendDomainError(res, req.id, 'change_request_resolved', 409);
+              return;
+            case 'version_conflict':
+              sendDomainError(res, req.id, 'version_conflict', 409);
+              return;
+            case 'trashed':
+              sendDomainError(res, req.id, 'lead_trashed', 409);
+              return;
+            case 'invalid_field':
+              sendDomainError(res, req.id, 'validation_error', 400, { field: outcome.field });
+              return;
+          }
+        } catch (error) {
+          reportFailure(req, error);
+          sendStaffAuthError(res, req.id, 'internal_error', 500);
+        }
+      },
+    );
+  }
+
+  // `trash` is the old name of `archive`; both archive the lead with one handler.
+  for (const [path, archived] of [
+    ['archive', true],
+    ['trash', true],
+    ['restore', false],
+  ] as const) {
+    router.post(`/workspaces/:workspaceId/leads/:leadId/${path}`, async (req, res) => {
+      const params = uuidParams(req, res, 'leadId');
+      if (!params) return;
+      try {
+        const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+        if (!decision.allowed) {
+          sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+          return;
+        }
+        const store = leadWork(req, res);
+        if (!store) return;
+        const outcome = await store.setArchived({
+          workspaceId: params.workspaceId,
+          actorId: actor.actorId,
+          requestId: req.id,
+          leadId: params.id,
+          archived,
+        });
+        if (outcome.status === 'not_found') {
+          sendDomainError(res, req.id, 'lead_not_found', 404);
+          return;
+        }
+        res.json({
+          lead: withMoneyFor(decision.access, outcome.lead),
+          activity: outcome.activity,
+          requestId: req.id,
+        });
+      } catch (error) {
+        reportFailure(req, error);
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+      }
+    });
+  }
+
+  // The lead page reports that someone who works leads opened the lead, which
+  // clears its "New" badge for the whole team. Only the first open writes.
+  router.post('/workspaces/:workspaceId/leads/:leadId/opened', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.markOpened({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        leadId: params.id,
+      });
+      if (outcome.status === 'not_found') {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      res.json({ activity: outcome.activity, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // An owner opening a customer's SIN for the credit check. Audited in the
+  // transaction that reads it, and never cached anywhere on the way back.
+  router.post(
+    '/workspaces/:workspaceId/leads/:leadId/identities/:identityId/reveal',
+    async (req, res) => {
+      res.setHeader('cache-control', 'private, no-store');
+      const params = uuidParams(req, res, 'leadId');
+      if (!params) return;
+      const identityId = z.uuid().safeParse(req.params['identityId']);
+      if (!identityId.success) {
+        sendStaffAuthError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+      try {
+        const { actor, decision } = await decide(req, params.workspaceId, 'sensitive.reveal');
+        if (!decision.allowed) {
+          sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+          return;
+        }
+        const store = dependencies.identityStore;
+        if (!store) {
+          sendDomainError(res, req.id, 'feature_not_ready', 409);
+          return;
+        }
+        const outcome = await store.revealSin({
+          workspaceId: params.workspaceId,
+          actorId: actor.actorId,
+          requestId: req.id,
+          leadId: params.id,
+          identityId: identityId.data,
+        });
+        if (outcome.status === 'revealed') {
+          res.json({ sin: outcome.sin, requestId: req.id });
+          return;
+        }
+        if (outcome.status === 'not_found') {
+          sendDomainError(res, req.id, 'identity_not_found', 404);
+          return;
+        }
+        // Sealed under another key: the key was changed, which loses every SIN.
+        reportFailure(req, new Error('sealed identity cannot be opened'));
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+      } catch (error) {
+        reportFailure(req, error);
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+      }
+    },
+  );
+
+  router.post('/workspaces/:workspaceId/leads/:leadId/notes', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    const body = createLeadNoteRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.addNote({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        leadId: params.id,
+        body: body.data.body,
+      });
+      if (outcome.status === 'not_found') {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      if (outcome.status === 'trashed') {
+        sendDomainError(res, req.id, 'lead_trashed', 409);
+        return;
+      }
+      res.status(201).json({ activity: outcome.activity, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // A mail to the lead's customer (a SIM order's number), queued for the
+  // outbox and sent from the site's own sender. Refused while the site cannot
+  // send, so staff learn it now rather than from a failed job.
+  router.post('/workspaces/:workspaceId/leads/:leadId/customer-emails', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    const body = queueCustomerEmailRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const mail = dependencies.customerEmail;
+      if (
+        !mail ||
+        !(await mail.available({ workspaceId: params.workspaceId, actorId: actor.actorId }))
+      ) {
+        sendDomainError(res, req.id, 'feature_not_ready', 409);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.queueCustomerEmail({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        leadId: params.id,
+        template: body.data.template,
+      });
+      if (outcome.status === 'not_found') {
+        sendDomainError(res, req.id, 'lead_not_found', 404);
+        return;
+      }
+      if (outcome.status === 'trashed') {
+        sendDomainError(res, req.id, 'lead_trashed', 409);
+        return;
+      }
+      if (outcome.status === 'no_sender') {
+        sendDomainError(res, req.id, 'feature_not_ready', 409);
+        return;
+      }
+      if (outcome.status === 'missing') {
+        sendDomainError(res, req.id, 'conflict', 409, { missing: outcome.missing });
+        return;
+      }
+      res.status(202).json({ activity: outcome.activity, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/leads/:leadId/tasks', async (req, res) => {
+    const params = uuidParams(req, res, 'leadId');
+    if (!params) return;
+    const body = createLeadTaskRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.createTask({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        leadId: params.id,
+        title: body.data.title,
+        dueAt: body.data.dueAt,
+        assignedActorId: body.data.assignedActorId,
+      });
+      sendTaskOutcome(req, res, outcome, true);
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.patch('/workspaces/:workspaceId/tasks/:taskId', async (req, res) => {
+    const params = uuidParams(req, res, 'taskId');
+    if (!params) return;
+    const body = updateLeadTaskRequestSchema.safeParse(req.body);
+    if (!body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, params.workspaceId, 'lead.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const outcome = await store.updateTask({
+        workspaceId: params.workspaceId,
+        actorId: actor.actorId,
+        requestId: req.id,
+        taskId: params.id,
+        ...body.data,
+      });
+      sendTaskOutcome(req, res, outcome, false);
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/tasks', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = listWorkspaceTasksQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      // Task titles name people and what was agreed with them.
+      const access = leadAccessOf(decision.access);
+      if (!access.contacts) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const store = leadWork(req, res);
+      if (!store) return;
+      const page = query.data.page ?? 1;
+      const pageSize = query.data.pageSize ?? 50;
+      const result = await store.listTasks(
+        {
+          workspaceId: workspaceId.data,
+          actorId: actor.actorId,
+          assignee: query.data.assignee ?? 'me',
+          status: query.data.status ?? 'active',
+          dueBy: query.data.dueBy,
+          completedSince: query.data.completedSince,
+        },
+        page,
+        pageSize,
+      );
+      res.json({
+        tasks: result.tasks,
+        page: { page, pageSize, total: result.total },
+        access,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  /** Active staff members of this workspace, for the assignment controls. */
+  router.get('/workspaces/:workspaceId/members', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    if (!workspaceId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const members = await dependencies.store.listAssignableMembers(
+        workspaceId.data,
+        actor.actorId,
+      );
+      res.json({ members, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/jobs', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    if (!workspaceId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const actor = session(req);
+      const decision = await authorize({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        action: 'workspace.read',
+      });
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!dependencies.jobStore) {
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+        return;
+      }
+      const { jobs, total } = await dependencies.jobStore.listActive(
+        workspaceId.data,
+        actor.actorId,
+      );
+      const retryDecision = await authorize({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        action: 'integration.manage',
+      });
+      res.json({
+        jobs: jobs.map((job) => ({
+          ...job,
+          availableAt: job.availableAt.toISOString(),
+          leaseExpiresAt: job.leaseExpiresAt?.toISOString() ?? null,
+          createdAt: job.createdAt.toISOString(),
+          updatedAt: job.updatedAt.toISOString(),
+        })),
+        total,
+        canRetry: retryDecision.allowed,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/jobs/:jobId/retry', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const jobId = z.uuid().safeParse(req.params['jobId']);
+    if (!workspaceId.success || !jobId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'integration.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!dependencies.jobStore) {
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+        return;
+      }
+      const outcome = await dependencies.jobStore.retry({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        jobId: jobId.data,
+        requestId: req.id,
+      });
+      if (outcome === 'not_found') {
+        sendDomainError(res, req.id, 'job_not_found', 404);
+        return;
+      }
+      if (outcome === 'not_failed') {
+        sendDomainError(res, req.id, 'job_not_retryable', 409);
+        return;
+      }
+      res.json({ jobId: jobId.data, status: 'pending', requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // Staff record whether an uncertain job reached the provider.
+  router.post('/workspaces/:workspaceId/jobs/:jobId/resolve', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const jobId = z.uuid().safeParse(req.params['jobId']);
+    const body = resolveUncertainJobRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !jobId.success || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'integration.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!dependencies.jobStore) {
+        sendStaffAuthError(res, req.id, 'internal_error', 500);
+        return;
+      }
+      const outcome = await dependencies.jobStore.resolveUncertain({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        jobId: jobId.data,
+        requestId: req.id,
+        delivered: body.data.delivered,
+      });
+      if (outcome === 'not_found') {
+        sendDomainError(res, req.id, 'job_not_found', 404);
+        return;
+      }
+      if (outcome === 'not_uncertain') {
+        sendDomainError(res, req.id, 'job_not_uncertain', 409);
+        return;
+      }
+      res.json({ jobId: jobId.data, status: outcome, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/invitations', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const body = inviteStaffRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'staff.invite');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      const membershipId = await dependencies.store.inviteStaff({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        normalizedEmail: body.data.email.trim().toLowerCase(),
+        roleNames: body.data.roles,
+        requestId: req.id,
+      });
+      res.status(201).json({ membershipId, status: 'pending', requestId: req.id });
+    } catch (error) {
+      if (!isUniqueViolation(error)) reportFailure(req, error);
+      sendStaffAuthError(
+        res,
+        req.id,
+        isUniqueViolation(error) ? 'membership_conflict' : 'internal_error',
+        isUniqueViolation(error) ? 409 : 500,
+      );
+    }
+  });
+
+  router.delete('/workspaces/:workspaceId/memberships/:membershipId', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const membershipId = z.uuid().safeParse(req.params['membershipId']);
+    if (!workspaceId.success || !membershipId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'staff.remove');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      const result = await dependencies.store.revokeStaff({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        membershipId: membershipId.data,
+        requestId: req.id,
+      });
+      if (result === 'not_found') {
+        sendStaffAuthError(res, req.id, 'membership_not_found', 404);
+        return;
+      }
+      if (result === 'self') {
+        sendStaffAuthError(res, req.id, 'invalid_request', 400);
+        return;
+      }
+      res.json({ membershipId: membershipId.data, status: 'revoked', requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/service-credentials', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const body = createServiceCredentialRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'integration.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      // The plaintext secret exists only in this response; only its hash persists.
+      const { secret, secretHash } = generateServiceSecret();
+      const record = await dependencies.credentialStore.createCredential({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        scopes: body.data.scopes,
+        secretHash,
+        requestId: req.id,
+      });
+      res.status(201).json({ credential: credentialSummary(record), secret, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.get('/workspaces/:workspaceId/service-credentials', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    if (!workspaceId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'integration.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      const records = await dependencies.credentialStore.listCredentials({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+      });
+      res.json({ credentials: records.map(credentialSummary), requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.delete('/workspaces/:workspaceId/service-credentials/:credentialId', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const credentialId = z.uuid().safeParse(req.params['credentialId']);
+    if (!workspaceId.success || !credentialId.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'integration.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+
+      const result = await dependencies.credentialStore.revokeCredential({
+        actorId: actor.actorId,
+        workspaceId: workspaceId.data,
+        credentialId: credentialId.data,
+        requestId: req.id,
+      });
+      if (result.status === 'not_found') {
+        sendWebsiteError(res, req.id, 'credential_not_found', 404);
+        return;
+      }
+      // Idempotent: revoking an already-revoked credential returns its first revocation time.
+      res.json({ id: credentialId.data, revokedAt: result.revokedAt, requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // ---- Documents -----------------------------------------------------------
+  // Downloading an original requires the separately-grantable
+  // `document.download` permission; approve/reject is a lead-management action.
+
+  // The site's documents waiting on staff (Documents page). It names customers,
+  // so it needs contact access; reviewing and downloading recheck their own.
+  router.get('/workspaces/:workspaceId/documents/review-queue', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = documentReviewQueueQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!leadAccessOf(decision.access).contacts) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const page = query.data.page ?? 1;
+      const queue = dependencies.documentReviewQueue ?? new DatabaseDocumentReviewQueue();
+      const result = await queue.list(
+        { workspaceId: workspaceId.data, actorId: actor.actorId },
+        { status: query.data.status ?? 'to_review', page },
+      );
+      res.json({
+        items: result.items,
+        counts: result.counts,
+        page: { page, pageSize: DOCUMENT_REVIEW_PAGE_SIZE, total: result.total },
+        access: {
+          review: decideAccess(decision.access, 'order.manage').allowed,
+          download: decideAccess(decision.access, 'document.download').allowed,
+        },
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/files/:fileId/review', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const fileId = z.uuid().safeParse(req.params['fileId']);
+    const body = reviewFileRequestSchema.safeParse(req.body);
+    if (!workspaceId.success || !fileId.success || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'order.manage');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!dependencies.documentService) {
+        sendDomainError(res, req.id, 'feature_not_ready', 409);
+        return;
+      }
+      const outcome = await dependencies.documentService.review({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        requestId: req.id,
+        fileId: fileId.data,
+        decision: body.data.decision,
+        ...(body.data.note ? { note: body.data.note } : {}),
+      });
+      if (outcome.status === 'not_found') {
+        sendDomainError(res, req.id, 'file_not_found', 404);
+        return;
+      }
+      res.json({ file: toStaffFile(outcome.file), requestId: req.id });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.post('/workspaces/:workspaceId/files/:fileId/download-link', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const fileId = z.uuid().safeParse(req.params['fileId']);
+    // A body is optional: without one the link downloads, as it always did.
+    const body = createDownloadLinkRequestSchema.safeParse(req.body ?? {});
+    if (!workspaceId.success || !fileId.success || !body.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      // Download of an original is gated on the explicit document.download
+      // permission — not merely workspace membership.
+      const { actor, decision } = await decide(req, workspaceId.data, 'document.download');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!dependencies.documentService) {
+        sendDomainError(res, req.id, 'feature_not_ready', 409);
+        return;
+      }
+      const outcome = await dependencies.documentService.issueDownload({
+        workspaceId: workspaceId.data,
+        actorId: actor.actorId,
+        fileId: fileId.data,
+        requestId: req.id,
+        disposition: body.data.disposition ?? 'attachment',
+      });
+      if (outcome.status === 'issued') {
+        res.json({
+          url: outcome.url,
+          expiresAt: outcome.expiresAt.toISOString(),
+          requestId: req.id,
+        });
+        return;
+      }
+      if (outcome.status === 'not_available') {
+        sendDomainError(res, req.id, 'file_not_available', 409);
+        return;
+      }
+      sendDomainError(res, req.id, 'file_not_found', 404);
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  router.use(createPropertyRoutes({ store: propertyStore, decide, reportFailure }));
+
+  router.use(
+    createEmailSettingsRoutes({
+      store: dependencies.emailSettingsStore ?? unconfiguredEmailSettingsStore,
+      customerEmail: dependencies.customerEmail ?? unconfiguredCustomerEmail,
+      withTenantTx: dependencies.withTenantTx ?? withTenantTx,
+      decide,
+      reportFailure,
+      ...(dependencies.loadPropertyCatalog
+        ? { loadCatalog: dependencies.loadPropertyCatalog }
+        : {}),
+    }),
+  );
+
+  router.use(
+    createPlanRoutes({
+      store: dependencies.planStore ?? unconfiguredPlanStore,
+      decide,
+      reportFailure,
+    }),
+  );
+
+  router.use(
+    createReportRoutes({
+      store: dependencies.reportStore ?? unconfiguredReportStore,
+      decide,
+      reportFailure,
+    }),
+  );
+
+  router.use(
+    createLeadExportRoutes({
+      store: dependencies.leadExportStore ?? unconfiguredLeadExportStore,
+      decide,
+      reportFailure,
+      canSeeContacts,
+      loadCatalog: (ctx) => propertyStore.catalog(ctx),
+      ...(dependencies.rateLimit === undefined ? {} : { rateLimit: dependencies.rateLimit }),
+    }),
+  );
+
+  router.use(
+    createAnalyticsRoutes({
+      store: dependencies.analyticsStore ?? unconfiguredAnalyticsStore,
+      decide,
+      reportFailure,
+    }),
+  );
+
+  router.use(
+    createAutomationRoutes({
+      store: dependencies.flowStore ?? unconfiguredFlowStore,
+      customerEmail: dependencies.customerEmail,
+      withTenantTx: dependencies.withTenantTx ?? withTenantTx,
+      decide,
+      canSeeContacts,
+      reportFailure,
+      ...(dependencies.rateLimit === undefined ? {} : { rateLimit: dependencies.rateLimit }),
+    }),
+  );
+
+  router.use(
+    createSavedViewRoutes({
+      store: dependencies.savedViewStore ?? unconfiguredSavedViewStore,
+      loadCatalog: dependencies.loadPropertyCatalog ?? unconfiguredCatalog,
+      decide,
+      canSeeContacts,
+      reportFailure,
+    }),
+  );
+
+  const ai = dependencies.ai ?? {
+    config: loadAiAssistantConfig(),
+    siteContext: new DatabaseAiSiteContextStore(),
+  };
+  router.use(
+    createAiAssistantRoutes({
+      flows: dependencies.flowStore ?? unconfiguredFlowStore,
+      automationAuthoring: new AutomationAuthoringStore(),
+      ...(dependencies.leadWorkStore === undefined ? {} : { work: dependencies.leadWorkStore }),
+      listAssignees: (scope) =>
+        dependencies.store.listAssignableMembers(scope.workspaceId, scope.actorId),
+      config: ai.config,
+      loadAccess: (actorId, workspaceId) =>
+        dependencies.store.loadStaffAccess(actorId, workspaceId),
+      siteContext: ai.siteContext,
+      reads: ai.reads ?? new DatabaseAiReadService(),
+      reports: dependencies.reportStore ?? unconfiguredReportStore,
+      ...(ai.engine === undefined ? {} : { engine: ai.engine }),
+      rateLimit: ai.rateLimit ?? rateLimitHit,
+      ...(ai.turns === undefined ? {} : { turns: ai.turns }),
+      ...(ai.now === undefined ? {} : { now: ai.now }),
+      reportFailure,
+    }),
+  );
+
+  return router;
+}

@@ -1,0 +1,183 @@
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import type { FlowDraft, FlowRun } from '@canadian-plans/contracts';
+
+import { AutomationRuns } from './automation-runs';
+
+const NOW = Date.now();
+
+function run(overrides: Partial<FlowRun> & Pick<FlowRun, 'id' | 'leadId'>): FlowRun {
+  return {
+    leadName: null,
+    status: 'completed',
+    reason: null,
+    detail: null,
+    triggerKind: 'stage_entered',
+    version: 1,
+    startedAt: new Date(NOW - 5 * 60 * 1000).toISOString(),
+    finishedAt: new Date(NOW - 5 * 60 * 1000).toISOString(),
+    resumeAt: null,
+    legacy: false,
+    steps: [],
+    ...overrides,
+  };
+}
+
+const runs: FlowRun[] = [
+  run({
+    id: '40000000-0000-4000-8000-000000000001',
+    leadId: '30000000-0000-4000-8000-000000000001',
+    leadName: 'Ada Lovelace',
+    status: 'waiting',
+    resumeAt: '2026-11-03T19:00:00.000Z',
+    finishedAt: null,
+    version: 2,
+    steps: [
+      {
+        stepId: 's_if',
+        stepKind: 'if_else',
+        outcome: 'done',
+        branch: 'yes',
+        reason: null,
+        detail: null,
+        at: new Date(NOW - 5 * 60 * 1000).toISOString(),
+      },
+      {
+        stepId: 's_mail',
+        stepKind: 'send_email',
+        outcome: 'skipped',
+        branch: null,
+        reason: 'missing_fill_in',
+        detail: 'first name',
+        at: new Date(NOW - 5 * 60 * 1000).toISOString(),
+      },
+    ],
+  }),
+  run({
+    id: '40000000-0000-4000-8000-000000000002',
+    leadId: '3abcdef0-0000-4000-8000-000000000002',
+    status: 'skipped',
+    reason: 'stage_unavailable',
+    detail: 'paid',
+    startedAt: new Date(NOW - 2 * 24 * 60 * 60 * 1000).toISOString(),
+  }),
+  run({
+    id: '40000000-0000-4000-8000-000000000003',
+    leadId: '30000000-0000-4000-8000-000000000003',
+    leadName: 'Grace Hopper',
+    legacy: true,
+    version: null,
+    triggerKind: null,
+  }),
+];
+
+describe('AutomationRuns', () => {
+  it('uses the immutable run version rather than the current action with the same step id', async () => {
+    const oldDefinition: FlowDraft = {
+      schemaVersion: 1,
+      trigger: null,
+      steps: [{ id: 's_mail', kind: 'send_email', template: 'dispatched' }],
+    };
+    const currentDefinition: FlowDraft = {
+      ...oldDefinition,
+      steps: [{ id: 's_mail', kind: 'send_email', template: 'cancelled' }],
+    };
+    const first = runs[0]!;
+    const onLoadRun = vi.fn().mockResolvedValue({ run: first, definition: oldDefinition });
+    render(
+      <AutomationRuns
+        workspaceSlug="canadawide"
+        runs={[first]}
+        definition={currentDefinition}
+        definitionVersion={3}
+        onLoadRun={onLoadRun}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Steps for Ada Lovelace' }));
+    const stepList = screen.getByRole('list', { name: 'Step outcomes for Ada Lovelace' });
+    expect(await within(stepList).findByText(/Send the Dispatched email/)).toBeTruthy();
+    expect(within(stepList).queryByText(/Cancelled email/)).toBeNull();
+    expect(onLoadRun).toHaveBeenCalledWith(first);
+  });
+
+  it('does not invent historical actions when their version cannot be loaded', () => {
+    render(
+      <AutomationRuns
+        workspaceSlug="canadawide"
+        runs={[runs[0]!]}
+        definition={{
+          schemaVersion: 1,
+          trigger: null,
+          steps: [{ id: 's_mail', kind: 'send_email', template: 'cancelled' }],
+        }}
+        definitionVersion={3}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Steps for Ada Lovelace' }));
+    const stepList = screen.getByRole('list', { name: 'Step outcomes for Ada Lovelace' });
+    expect(within(stepList).getByText('Send email')).toBeTruthy();
+    expect(within(stepList).queryByText(/Cancelled email/)).toBeNull();
+  });
+
+  it('lists each run with its lead, status in words, version and time', () => {
+    render(<AutomationRuns workspaceSlug="canadawide" runs={runs} />);
+    const items = within(screen.getByRole('list', { name: 'Recent runs' })).getAllByRole(
+      'listitem',
+    );
+    expect(items).toHaveLength(3);
+
+    const [first, second, third] = items.map((item) => within(item));
+    expect(first?.getByRole('link', { name: 'Ada Lovelace' }).getAttribute('href')).toBe(
+      '/w/canadawide/leads/30000000-0000-4000-8000-000000000001',
+    );
+    expect(first?.getByText('Waiting until 3 Nov 14:00')).toBeTruthy();
+    expect(first?.getByText('Version 2')).toBeTruthy();
+    expect(first?.getByText('5m ago')).toBeTruthy();
+
+    expect(second?.getByText('Skipped: names a stage that no longer exists (paid)')).toBeTruthy();
+    expect(second?.getByText('2d ago')).toBeTruthy();
+    // A phase 4 run reads as completed, with no version.
+    expect(third?.getByText('Completed')).toBeTruthy();
+    expect(third?.queryByText(/Version/)).toBeNull();
+  });
+
+  it('expands a run to show each step outcome and reason in plain words, and pages with Load more', () => {
+    const onLoadMore = vi.fn();
+    render(
+      <AutomationRuns
+        workspaceSlug="canadawide"
+        runs={runs}
+        nextBefore="40000000-0000-4000-8000-000000000003"
+        onLoadMore={onLoadMore}
+      />,
+    );
+    const stepsBtn = screen.getByRole('button', { name: 'Steps for Ada Lovelace' });
+    expect(stepsBtn.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(stepsBtn);
+    expect(stepsBtn.getAttribute('aria-expanded')).toBe('true');
+
+    const stepList = screen.getByRole('list', { name: 'Step outcomes for Ada Lovelace' });
+    expect(within(stepList).getByText('Done (Yes branch)')).toBeTruthy();
+    expect(
+      within(stepList).getByText(
+        'Skipped: the email needs fill-ins the lead does not have (first name)',
+      ),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it('names a lead the viewer may not see by the start of its id', () => {
+    render(<AutomationRuns workspaceSlug="canadawide" runs={runs} />);
+    expect(screen.getByRole('link', { name: 'Lead 3abcdef0' }).getAttribute('href')).toBe(
+      '/w/canadawide/leads/3abcdef0-0000-4000-8000-000000000002',
+    );
+  });
+
+  it('says when the flow has not run yet', () => {
+    render(<AutomationRuns workspaceSlug="canadawide" runs={[]} />);
+    expect(screen.getByText('No runs yet.')).toBeTruthy();
+    expect(screen.queryByRole('list')).toBeNull();
+  });
+});
