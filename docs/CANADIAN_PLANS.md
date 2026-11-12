@@ -62,13 +62,13 @@ Inherited documents still link to some of these; those links are dead.
 
 ## The deployment (set up 2026-11-12)
 
-| Part     | Where                                                                                                                                                                                                                           |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Database | Supabase project `canadianplans` (`ixbhodlvfyxjctpsjibj`, `us-west-2`, org "Canadian Plan", free plan). The old platform's `app` and `drizzle` schemas were dropped first.                                                      |
-| Backend  | Railway project `canadian-plans-backend`, service `backend` (`39140e07-670e-4529-945d-37764ccfd0c8`), region `sfo`, built from this repository's `main`. Health: `/api/v1/health` on `backend-production-ebbb6.up.railway.app`. |
-| Admin    | Vercel team `canadian-plans`. See "Not done yet".                                                                                                                                                                               |
-| Email    | Resend domain `canadianplans.com` (verified). The service keeps the Resend variables it already had.                                                                                                                            |
-| Site     | `canadianplans` (`60942550-3167-41dd-9256-c712cd8a7bc5`), with the seven roles, six permissions and a pending owner invitation.                                                                                                 |
+| Part     | Where                                                                                                                                                                                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database | Supabase project `canadianplans` (`ixbhodlvfyxjctpsjibj`, `us-west-2`, org "Canadian Plan", free plan). The old platform's `app` and `drizzle` schemas were dropped first.                                                                                  |
+| Backend  | Railway project `canadian-plans-backend`, service `backend` (`39140e07-670e-4529-945d-37764ccfd0c8`), region `sfo`, built from this repository's `main`. Health: `/api/v1/health` on `backend-production-ebbb6.up.railway.app`.                             |
+| Admin    | Vercel team `canadian-plans`, project `canadianplans-web-app-admin` (the old admin's project, reconnected to this repository on 2026-11-12; root `apps/admin`, region `sfo1`), at `apex.canadianplans.com`. Its variables were already right and were kept. |
+| Email    | Resend domain `canadianplans.com` (verified). The service keeps the Resend variables it already had.                                                                                                                                                        |
+| Site     | `canadianplans` (`60942550-3167-41dd-9256-c712cd8a7bc5`), with the seven roles, six permissions and a pending owner invitation.                                                                                                                             |
 
 How it was done, for the next time:
 
@@ -95,12 +95,7 @@ How it was done, for the next time:
 
 ## Not done yet
 
-1. **The admin.** The Vercel project `canadianplans-web-app-admin` (domain
-   `apex.canadianplans.com`) still builds the old admin from
-   `canadianplans-web-app`. Its variables already fit this product. In its
-   Settings → Git, connect `Canadian-Plans/canadianplans-crm` (root
-   `apps/admin`, production branch `main`) and redeploy. Then check that the
-   backend's `ADMIN_ORIGIN` equals the admin's address.
+1. **Owner's first sign-in**, to confirm the invitation is claimed.
 2. **Auth settings** in Supabase (Site URL and redirect URL = the admin's
    address; custom SMTP through Resend for invitations).
 3. **The Resend webhook** entry in `MACHINE_REGISTRY_JSON` (none now, so
