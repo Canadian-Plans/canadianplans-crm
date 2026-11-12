@@ -93,6 +93,24 @@ How it was done, for the next time:
   `SITE_1_STATIC_CATALOGUE_WORKSPACE_ID`, `UMAMI_*`); remove them when
   convenient.
 
+## Plans (loaded 2026-11-12)
+
+The 23 launch plans of the old platform's repository catalogue
+(`docs/LAUNCH_PLANS.md` there, confirmed by the owner on 20 October 2026) were
+inserted into `app.plans` for the site: 14 internet (one per offer and
+province, the province in the name), 3 mobility and 6 `sim_order`, all active,
+no payment required, no required documents. Internet and mobile plans that had
+no billing period there are `month` here. Review them under Settings → Plans.
+
+Six custom plan properties were added with "Show on website" on, because the
+storefront reads them (`canadianplans-web-app`, `apps/site-1/src/lib/offers.ts`):
+`custom_product_key`, `custom_regions`, `custom_product_title`,
+`custom_best_for`, `custom_features` and `custom_promotion`. Keep the keys;
+labels and values can change.
+
+The `sim_order` form also takes `currentCountry` (optional), which the
+storefront's pre-arrival form sends.
+
 ## Not done yet
 
 1. **Owner's first sign-in**, to confirm the invitation is claimed.
@@ -105,8 +123,9 @@ How it was done, for the next time:
    (`docs/RUNBOOKS/backup.md`). **Until then the three scheduled backup
    workflows fail every run**; disable them in the Actions tab if the failure
    mails are unwanted.
-5. **A site key** for the storefront (Settings in the admin), email settings
-   (Settings → Email) and the plans (Settings → Plans).
+5. **A site key** for the storefront (Settings in the admin; scopes
+   `leads:write`, `uploads:customer`, `tracking`) and the email settings
+   (Settings → Email).
 6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
    off.
 
