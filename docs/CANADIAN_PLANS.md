@@ -60,31 +60,64 @@ Inherited documents still link to some of these; those links are dead.
   docs/review/**: the design record. Their live systems, ids, owner steps and
   dates are GT Sales'.
 
-## What is not set up yet
+## The deployment (set up 2026-11-12)
 
-Nothing is deployed. This deployment needs, each created by the owner:
+| Part     | Where                                                                                                                                                                                                                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database | Supabase project `canadianplans` (`ixbhodlvfyxjctpsjibj`, `us-west-2`, org "Canadian Plan", free plan). The old platform's `app` and `drizzle` schemas were dropped first.                                                      |
+| Backend  | Railway project `canadian-plans-backend`, service `backend` (`39140e07-670e-4529-945d-37764ccfd0c8`), region `sfo`, built from this repository's `main`. Health: `/api/v1/health` on `backend-production-ebbb6.up.railway.app`. |
+| Admin    | Vercel team `canadian-plans`. See "Not done yet".                                                                                                                                                                               |
+| Email    | Resend domain `canadianplans.com` (verified). The service keeps the Resend variables it already had.                                                                                                                            |
+| Site     | `canadianplans` (`60942550-3167-41dd-9256-c712cd8a7bc5`), with the seven roles, six permissions and a pending owner invitation.                                                                                                 |
 
-1. A Supabase project (database, Auth, Storage): migrations applied, the
-   `app_runtime` and `backup_reader` passwords set, Auth email sign-in, a
-   Storage bucket with S3 keys. See `docs/RUNBOOKS/database.md`.
-2. A Railway service for `apps/backend` (`railway.json`,
-   `apps/backend/Dockerfile`), in the region nearest the database.
-3. A Vercel project for `apps/admin` (root `apps/admin`, Node 22).
-4. A Resend sending domain.
-5. Backups: a Backblaze B2 bucket and key, an `age` recovery key pair, and the
-   GitHub Environment `backup-canadian-plans` with its secrets
+How it was done, for the next time:
+
+- **Migrations** `0000` to `0033` were applied on 2026-11-12, each file in one
+  transaction as `postgres`, with its Drizzle tracker row (`sha256` of the file
+  and the journal's `when`), so `db:migrate` continues from here. The session
+  could not reach the database port and Supabase does not let `postgres`
+  change its own password over SQL, so the files were posted to a temporary,
+  key-checked Edge Function (`crm-migrate-once`) that ran them through
+  `SUPABASE_DB_URL`. That function now answers 410; delete it in the dashboard.
+- **The Railway service was reused**, so the secrets it already held stayed in
+  place and were never read: `DATABASE_URL` (the `app_runtime` role, which
+  survived the wipe with its password), `CRON_SECRET`, the Resend, storage
+  (`R2_*`, still Cloudflare R2), tracking, Turnstile and Sentry variables. Set
+  new: `MACHINE_REGISTRY_JSON` (one scheduler, `railway-scheduler`, for the
+  site above, its secret a reference to `CRON_SECRET`; no webhooks),
+  `JOB_RUNNER_SELECTOR`, `SENSITIVE_FIELDS_KEY`, `SUPABASE_URL`,
+  `SUPABASE_ANON_KEY` (the publishable key), `DEPLOYMENT_ENV`.
+- Variables of the old platform that this backend does not read are still on
+  the service (`SANITY_*`, `CATALOGUE_SYNC_SELECTOR`, `SYNTHETIC_*`,
+  `QUOTE_WITHDRAWAL_POLICY`, `ORDER_OPERATIONAL_TRANSITIONS`,
+  `SITE_1_STATIC_CATALOGUE_WORKSPACE_ID`, `UMAMI_*`); remove them when
+  convenient.
+
+## Not done yet
+
+1. **The admin.** The Vercel project `canadianplans-web-app-admin` (domain
+   `apex.canadianplans.com`) still builds the old admin from
+   `canadianplans-web-app`. Its variables already fit this product. In its
+   Settings → Git, connect `Canadian-Plans/canadianplans-crm` (root
+   `apps/admin`, production branch `main`) and redeploy. Then check that the
+   backend's `ADMIN_ORIGIN` equals the admin's address.
+2. **Auth settings** in Supabase (Site URL and redirect URL = the admin's
+   address; custom SMTP through Resend for invitations).
+3. **The Resend webhook** entry in `MACHINE_REGISTRY_JSON` (none now, so
+   delivery and bounce events are not ingested).
+4. **Backups**: a Backblaze B2 bucket and key, an `age` recovery key pair, the
+   `backup_reader` password and the GitHub Environment `backup-canadian-plans`
    (`docs/RUNBOOKS/backup.md`). **Until then the three scheduled backup
    workflows fail every run**; disable them in the Actions tab if the failure
    mails are unwanted.
-6. The first site ("Add a site" in `docs/RUNBOOKS/database.md`), the owner's
-   invitation and a site key for the storefront.
-
-Every variable is listed in `docs/ENV.md`. No secret goes in this repository
-or in a chat.
+5. **A site key** for the storefront (Settings in the admin), email settings
+   (Settings → Email) and the plans (Settings → Plans).
+6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
+   off.
 
 ## What comes next
 
-1. Stand up the deployment (the list above).
+1. Finish the list above.
 2. Connect the storefront. It stays in `Canadian-Plans/canadianplans-web-app`,
    which becomes a website-only repository. Its forms must be mapped onto this
    product's website API (`docs/HANDOFF.md` §2.6): `POST /website/leads` with a
