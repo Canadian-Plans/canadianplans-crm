@@ -16,6 +16,17 @@ import {
 import { getStaffAuth, isStaffAuthConfigured } from '../../lib/supabase-auth';
 import { AuthFrame } from '../../components/auth-frame';
 
+const PASSWORD_MAX_BYTES = 72;
+const PASSWORD_TOO_LONG = 'That password is too long. Use 72 characters or fewer.';
+
+/** Why the provider refused the new password, in words the person can act on. */
+function updateFailure(code: string | undefined): string {
+  if (code === 'validation_failed') return PASSWORD_TOO_LONG;
+  if (code === 'weak_password') return 'That password is too weak. Choose a longer one.';
+  if (code === 'same_password') return 'That is your current password. Choose a different one.';
+  return 'The password could not be updated. Request a new recovery email.';
+}
+
 export default function RecoveryPage() {
   const [updateMode, setUpdateMode] = useState(false);
   const configured = isStaffAuthConfigured();
@@ -35,8 +46,16 @@ export default function RecoveryPage() {
     const auth = getStaffAuth();
     try {
       if (updateMode) {
+        // The sign-in provider stores at most 72 bytes of a password and refuses more.
+        if (new TextEncoder().encode(password).length > PASSWORD_MAX_BYTES) {
+          setMessage(PASSWORD_TOO_LONG);
+          return;
+        }
         const result = await auth.updateUser({ password });
-        if (result.error) throw result.error;
+        if (result.error) {
+          setMessage(updateFailure(result.error.code));
+          return;
+        }
         setMessage('Password updated. Sign in with the new password.');
       } else {
         await auth.resetPasswordForEmail(email, {
@@ -76,7 +95,7 @@ export default function RecoveryPage() {
                   type="password"
                   autoComplete="new-password"
                   minLength={8}
-                  maxLength={128}
+                  maxLength={72}
                   required
                   disabled={!configured || busy}
                   value={password}

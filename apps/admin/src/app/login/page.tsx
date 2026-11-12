@@ -99,7 +99,7 @@ export default function LoginPage() {
                 type="password"
                 autoComplete={acceptingInvitation ? 'new-password' : 'current-password'}
                 minLength={8}
-                maxLength={128}
+                maxLength={72}
                 required
                 disabled={!configured || busy}
                 value={password}
