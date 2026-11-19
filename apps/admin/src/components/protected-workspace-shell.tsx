@@ -2,7 +2,9 @@
 
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useEffect, type ReactNode } from 'react';
-import { SidebarInset, SidebarProvider } from '@canadian-plans/ui';
+import { Button, SidebarInset, SidebarProvider } from '@canadian-plans/ui';
+
+import { describeError, isRetryable } from '../lib/error-text';
 
 import { AppSidebar } from './app-sidebar';
 import { useStaffSession } from './staff-session-provider';
@@ -10,6 +12,34 @@ import { TopBar } from './top-bar';
 import { AssistantPanel } from './ai/assistant-panel';
 import { AssistantProvider } from './ai/assistant-provider';
 import { LoadingSkeleton } from './crm/loading-skeleton';
+
+/** The loading shape of the page a path opens: the shell's skeleton draws the same one. */
+function pageShape(pathname: string | null) {
+  const [, , , section, subpage] = pathname?.split('/') ?? [];
+  switch (section) {
+    case 'dashboard':
+      return 'dashboard';
+    case 'analytics':
+      return 'analytics';
+    case 'leads':
+      return subpage ? 'record' : 'table';
+    case 'tasks':
+      return 'tasks';
+    case 'documents':
+      return 'documents';
+    case 'mail':
+      return 'mail';
+    // The chat is a list beside a thread, as Mail is.
+    case 'chat':
+      return 'mail';
+    case 'automations':
+      return subpage ? 'flow' : 'list';
+    case 'settings':
+      return subpage === undefined || subpage === 'email' ? 'form' : 'list';
+    default:
+      return 'list';
+  }
+}
 
 const LEAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -42,15 +72,44 @@ export function ProtectedWorkspaceShell({
   const searchParams = useSearchParams();
   const staff = useStaffSession();
   const workspace = staff.workspaces.find((item) => item.slug === workspaceSlug);
+  // The CRM did not answer the access check (offline, a timeout, an outage):
+  // that says nothing about the person's access, so it is shown here with a
+  // retry instead of the "Access denied" page.
+  const unreachable =
+    staff.status === 'error' && isRetryable(staff.failure ?? staff.reason ?? 'internal_error');
 
   useEffect(() => {
     if (staff.status === 'signed_out') router.replace('/login');
-    if (staff.status === 'error')
+    if (staff.status === 'error' && !unreachable) {
       router.replace(`/denied?reason=${staff.reason ?? 'internal_error'}`);
+    }
     if (staff.status === 'signed_in' && !workspace) {
       router.replace('/denied?reason=workspace_not_found');
     }
-  }, [router, staff.reason, staff.status, workspace]);
+  }, [router, staff.reason, staff.status, unreachable, workspace]);
+
+  if (unreachable) {
+    return (
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="flex flex-col items-start gap-3 p-6 outline-none"
+      >
+        <h1 className="text-2xl font-semibold">The CRM is not responding</h1>
+        <p role="alert" className="max-w-prose text-muted-foreground">
+          {describeError(staff.failure ?? staff.reason, 'check your access to this site')}
+        </p>
+        <div className="flex gap-2">
+          <Button type="button" onClick={() => void staff.retry()}>
+            Try again
+          </Button>
+          <Button type="button" variant="outline" onClick={() => void staff.signOut()}>
+            Sign out
+          </Button>
+        </div>
+      </main>
+    );
+  }
 
   if (staff.status === 'configuration_missing') {
     return (
@@ -65,7 +124,11 @@ export function ProtectedWorkspaceShell({
   if (staff.status !== 'signed_in' || !workspace) {
     return (
       <main id="main-content" tabIndex={-1} className="outline-none" aria-busy="true">
-        <LoadingSkeleton label="Checking workspace access" variant="workspace" />
+        <LoadingSkeleton
+          label="Checking workspace access"
+          variant="workspace"
+          content={pageShape(pathname)}
+        />
       </main>
     );
   }
@@ -81,7 +144,7 @@ export function ProtectedWorkspaceShell({
       >
         <AppSidebar workspace={workspace.slug} />
         <div className="crm-workspace flex min-w-0 flex-1 flex-col bg-background">
-          <TopBar workspace={workspace} onSignOut={staff.signOut} />
+          <TopBar workspace={workspace} />
           <SidebarInset
             id="main-content"
             tabIndex={-1}

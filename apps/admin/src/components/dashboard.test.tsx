@@ -251,6 +251,35 @@ describe('Dashboard analytics', () => {
     expect(screen.queryByRole('heading', { name: 'Commission earned' })).toBeNull();
   });
 
+  it('leaves out the money and mix blocks a site has nothing recorded for', async () => {
+    resetMocks({
+      ...counts,
+      kpis: { ...counts.kpis, paid: { current: 0, previous: null } },
+      mix: {
+        plans: [{ planId: null, name: 'No plan matched', total: 12 }],
+        delivery: [],
+        leadTypes: [{ leadType: 'sim_order', total: 12 }],
+      },
+      statuses: {
+        payment: [{ key: '(not set)', total: 12 }],
+        commission: [{ key: '(not set)', total: 12 }],
+      },
+    });
+    render(<Dashboard workspaceSlug="getcanadasim" />);
+    await screen.findByRole('heading', { name: 'Funnel by stage' });
+    expect(kpi('New orders')).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Paid' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Carrier commission' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Mix' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Payment and commission status' })).toBeNull();
+    // The analytics overview leads, with actionable follow-ups directly below it.
+    const followUps = screen.getByRole('heading', { name: 'Follow-ups due' });
+    const trend = screen.getByRole('heading', { name: 'New leads over time' });
+    expect(
+      trend.compareDocumentPosition(followUps) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it('draws the funnel, sources, mix, statuses and team, each with a data table', async () => {
     render(<Dashboard workspaceSlug="getcanadasim" />);
     const funnel = await screen.findByRole('list', { name: 'Funnel by stage' });
@@ -280,7 +309,7 @@ describe('Dashboard analytics', () => {
     expect(within(trend).getAllByRole('row')).toHaveLength(3);
   });
 
-  it('writes the period, comparison, grouping and filters to the URL', async () => {
+  it('writes the period, comparison and filters to the URL', async () => {
     const view = render(<Dashboard workspaceSlug="getcanadasim" />);
     await screen.findByRole('heading', { name: 'New orders' });
     const periodButton = () => screen.getByRole('button', { name: /change the period/ });
@@ -294,12 +323,7 @@ describe('Dashboard analytics', () => {
       scroll: false,
     });
     view.rerender(<Dashboard workspaceSlug="getcanadasim" />);
-    fireEvent.click(screen.getByRole('button', { name: 'Week' }));
-    expect(navigation.replace).toHaveBeenLastCalledWith(
-      '/w/getcanadasim/dashboard?period=7d&group=week',
-      { scroll: false },
-    );
-    view.rerender(<Dashboard workspaceSlug="getcanadasim" />);
+    expect(screen.queryByRole('group', { name: 'Group by' })).toBeNull();
     fireEvent.click(periodButton());
     fireEvent.change(await screen.findByRole('combobox', { name: 'Compare with' }), {
       target: { value: 'none' },
@@ -310,21 +334,21 @@ describe('Dashboard analytics', () => {
     fireEvent.change(await screen.findByRole('combobox', { name: 'Delivery' }), {
       target: { value: 'pickup' },
     });
-    expect(navigation.search).toBe('period=7d&compare=none&group=week&delivery=pickup');
+    expect(navigation.search).toBe('period=7d&compare=none&delivery=pickup');
     view.rerender(<Dashboard workspaceSlug="getcanadasim" />);
     await waitFor(() =>
       expect(mocks.getAnalytics).toHaveBeenLastCalledWith('staff-token', WORKSPACE, {
         from: addDays(TODAY, -6),
         to: TODAY,
         compare: 'none',
-        group: 'week',
+        group: 'day',
         leadType: 'sim_order',
         delivery: 'pickup',
       }),
     );
     // The active filter shows as a chip with its own remove button.
     fireEvent.click(screen.getByRole('button', { name: 'Remove Delivery: Physical SIM' }));
-    expect(navigation.search).toBe('period=7d&compare=none&group=week');
+    expect(navigation.search).toBe('period=7d&compare=none');
   });
 
   it('takes a custom range from the calendar', async () => {
@@ -362,7 +386,7 @@ describe('Dashboard analytics', () => {
   it('says when the analytics could not load', async () => {
     mocks.getAnalytics.mockRejectedValue(new Error('boom'));
     render(<Dashboard workspaceSlug="getcanadasim" />);
-    expect((await screen.findByRole('alert')).textContent).toMatch(/Could not load the dashboard/);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/couldn't load the dashboard/);
   });
 });
 
@@ -409,6 +433,10 @@ describe('Dashboard follow-ups due', () => {
     const { BackendError } = await import('../lib/api');
     mocks.listStaffTasks.mockRejectedValue(new BackendError('permission_denied', 403, 'x'));
     render(<Dashboard workspaceSlug="getcanadasim" />);
-    expect(await screen.findByText('Your role does not include lead tasks.')).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'Your role does not include lead tasks. Ask the owner if you need them.',
+      ),
+    ).toBeTruthy();
   });
 });

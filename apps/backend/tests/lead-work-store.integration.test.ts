@@ -4,11 +4,16 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { createDatabaseClient, type DatabaseClient } from '@canadian-plans/db';
 import {
   codePropertyCatalog,
+  CUSTOMER_MAIL_ACTOR_ID,
   leadActivitySchema,
   leadDetailSchema,
   leadTaskSchema,
 } from '@canadian-plans/contracts';
 
+import { DatabaseInboundReplyStore } from '../src/email/inbound.js';
+import { DatabaseMailbox } from '../src/email/mailbox.js';
+import { resetReplyAddressingForTests } from '../src/email/queue.js';
+import { loadReplyAddressing } from '../src/email/reply-address.js';
 import { hashContact } from '../src/email/hash.js';
 import { customerEmailEnvironmentFromEnv } from '../src/email/senders.js';
 import { DatabaseLeadStore } from '../src/leads/store.js';
@@ -1430,7 +1435,7 @@ databaseTest('DatabaseLeadWorkStore', () => {
       },
     });
     expect(JSON.stringify(jobs[0]?.payload)).toContain('+1 778-555-0142');
-    // Only the job holds the address and the number.
+    // The address stays in the job alone; the audit holds neither it nor the number.
     const stored = await admin<{ data: unknown; after: unknown }[]>`
       select a.data, e.after
       from app.lead_activities a, app.audit_events e
@@ -1447,7 +1452,205 @@ databaseTest('DatabaseLeadWorkStore', () => {
       leadId,
       includeWork: true,
     });
-    expect(page?.activities[0]).toMatchObject({ event: 'customer_emailed' });
+    // The Mail tab's copy: what was written, and where the send stands.
+    expect(page?.activities[0]).toMatchObject({ event: 'customer_emailed', mailStatus: 'queued' });
+    const sent = page?.activities[0];
+    if (sent?.kind !== 'system') throw new Error('expected the mail entry');
+    expect(sent.subject).toBeTruthy();
+    expect(sent.text).toContain('+1 778-555-0142');
+    expect(JSON.stringify(sent)).not.toContain('mail.person');
+
+    // A message staff wrote themselves, to the lead's own address.
+    const written = await mailWork.queueWrittenEmail({
+      ...mailScope,
+      requestId: crypto.randomUUID(),
+      leadId,
+      subject: 'About your order',
+      body: 'Hello,\n\nYour SIM ships tomorrow.',
+    });
+    expect(written).toMatchObject({
+      status: 'queued',
+      activity: { event: 'customer_emailed', subject: 'About your order' },
+    });
+    if (written.status !== 'queued' || written.activity.kind !== 'system') {
+      throw new Error('expected the written mail to queue');
+    }
+    expect(written.activity.text).toContain('Your SIM ships tomorrow.');
+    const [writtenJob] = await admin<
+      { payload: { toAddress: string; rendered: { subject: string } } }[]
+    >`
+      select payload from app.outbox_jobs
+      where workspace_id = ${OTHER_WORKSPACE} and payload ->> 'leadId' = ${leadId}
+      order by created_at desc limit 1
+    `;
+    expect(writtenJob?.payload).toMatchObject({
+      toAddress: 'mail.person@example.test',
+      rendered: { subject: 'About your order' },
+    });
+    // The provider's report, once there is one, is what the tab shows.
+    await admin`
+      insert into app.email_messages (workspace_id, message_id, template, message_class, lead_id, contact_hash, status)
+      select workspace_id, message_id, payload ->> 'template', 'transactional', ${leadId}, 'h', 'delivered'
+      from app.outbox_jobs
+      where workspace_id = ${OTHER_WORKSPACE} and id = (
+        select (data ->> 'jobId')::uuid from app.lead_activities where id = ${written.activity.id}
+      )
+    `;
+    const after = await work.getLead({
+      workspaceId: OTHER_WORKSPACE,
+      catalog: codePropertyCatalog,
+      actorId: ACTOR,
+      leadId,
+      includeWork: true,
+    });
+    expect(after?.activities.find((entry) => entry.id === written.activity.id)).toMatchObject({
+      mailStatus: 'delivered',
+    });
+
+    // The site's Mail page: this customer once, with their latest mail and how many.
+    const mailbox = new DatabaseMailbox(database);
+    const people = await mailbox.list(
+      { workspaceId: OTHER_WORKSPACE, actorId: ACTOR },
+      { page: 1 },
+    );
+    const person = people.items.filter((item) => item.lead.id === leadId);
+    expect(person).toHaveLength(1);
+    expect(person[0]).toMatchObject({
+      id: written.activity.id,
+      subject: 'About your order',
+      mailStatus: 'delivered',
+      mails: 2,
+      lead: { leadType: 'sim_order', name: 'Mail Person' },
+    });
+    // And that customer's conversation, newest first.
+    const sentBox = await mailbox.list(
+      { workspaceId: OTHER_WORKSPACE, actorId: ACTOR },
+      { page: 1, leadId },
+    );
+    expect(sentBox.total).toBe(2);
+    expect(sentBox.items.map((item) => item.subject)).toEqual(['About your order', sent.subject]);
+    expect(sentBox.items[0]?.text).toContain('Your SIM ships tomorrow.');
+    expect(sentBox.items[0]?.mails).toBeUndefined();
+    expect(JSON.stringify(sentBox)).not.toContain('mail.person@');
+
+    // The customer answers: the reply is kept once on the lead, beside the mails.
+    const inbound = new DatabaseInboundReplyStore(database);
+    const reply = {
+      workspaceId: OTHER_WORKSPACE,
+      leadId,
+      inboundId: `in_${crypto.randomUUID()}`,
+      subject: 'Re: About your order',
+      text: 'Thanks, that works for me.',
+    };
+    expect(await inbound.record(reply)).toBe('recorded');
+    // The provider delivers an event more than once.
+    expect(await inbound.record(reply)).toBe('duplicate');
+    expect(await inbound.record({ ...reply, leadId: '53000000-0000-4000-8000-0000000000ef' })).toBe(
+      'no_lead',
+    );
+    const answered = await work.getLead({
+      workspaceId: OTHER_WORKSPACE,
+      catalog: codePropertyCatalog,
+      actorId: ACTOR,
+      leadId,
+      includeWork: true,
+    });
+    expect(answered?.activities[0]).toMatchObject({
+      kind: 'system',
+      event: 'customer_replied',
+      actorId: CUSTOMER_MAIL_ACTOR_ID,
+      subject: 'Re: About your order',
+      text: 'Thanks, that works for me.',
+    });
+    expect(answered?.activities[0]).not.toHaveProperty('otherSender');
+    // A mail from another address (a forward, an auto-responder) says so; the address is not kept.
+    expect(
+      await inbound.record({
+        ...reply,
+        inboundId: `in_${crypto.randomUUID()}`,
+        subject: 'Fwd: About your order',
+        from: 'someone.else@example.test',
+      }),
+    ).toBe('recorded');
+    const [forwarded] = await admin<{ data: Record<string, unknown>; body: string }[]>`
+      select data, body from app.lead_activities
+      where workspace_id = ${OTHER_WORKSPACE} and lead_id = ${leadId}
+        and data ->> 'event' = 'customer_replied'
+      order by created_at desc, id desc limit 1
+    `;
+    expect(forwarded?.data).toMatchObject({ otherSender: true });
+    expect(JSON.stringify(forwarded)).not.toContain('someone.else@');
+    const withReply = await mailbox.list(
+      { workspaceId: OTHER_WORKSPACE, actorId: ACTOR },
+      { page: 1, leadId },
+    );
+    expect(withReply.items.map((item) => item.direction)).toEqual(['in', 'in', 'out', 'out']);
+    const latest = (
+      await mailbox.list({ workspaceId: OTHER_WORKSPACE, actorId: ACTOR }, { page: 1 })
+    ).items.find((item) => item.lead.id === leadId);
+    expect(latest).toMatchObject({
+      direction: 'in',
+      subject: 'Fwd: About your order',
+      otherSender: true,
+      mails: 4,
+    });
+
+    // With replies configured, a mail to a lead answers to the lead's own address.
+    const before = {
+      domain: process.env['EMAIL_INBOUND_DOMAIN'],
+      sites: process.env['EMAIL_INBOUND_SITES'],
+      hook: process.env['RESEND_INBOUND_WEBHOOK_SECRET'],
+      key: process.env['RESEND_API_KEY'],
+    };
+    process.env['RESEND_INBOUND_WEBHOOK_SECRET'] = 'whsec_dGVzdA==';
+    process.env['RESEND_API_KEY'] = 're_test';
+    process.env['EMAIL_INBOUND_DOMAIN'] = 'reply.example.test';
+    process.env['EMAIL_INBOUND_SITES'] = JSON.stringify([
+      { workspaceId: OTHER_WORKSPACE, tag: 'tst' },
+    ]);
+    resetReplyAddressingForTests();
+    try {
+      const routed = await mailWork.queueWrittenEmail({
+        ...mailScope,
+        requestId: crypto.randomUUID(),
+        leadId,
+        subject: 'One more thing',
+        body: 'Reply to this one.',
+      });
+      expect(routed.status).toBe('queued');
+      const [routedJob] = await admin<{ payload: { sender: { replyToAddress?: string } } }[]>`
+        select payload from app.outbox_jobs
+        where workspace_id = ${OTHER_WORKSPACE} and payload ->> 'leadId' = ${leadId}
+        order by created_at desc limit 1
+      `;
+      const replyTo = routedJob?.payload.sender.replyToAddress ?? '';
+      expect(replyTo).toMatch(/^tst-[0-9a-f]{32}-[0-9a-f]{16}@reply\.example\.test$/);
+      expect(loadReplyAddressing()?.resolve(replyTo)).toEqual({
+        workspaceId: OTHER_WORKSPACE,
+        leadId,
+      });
+    } finally {
+      if (before.domain === undefined) delete process.env['EMAIL_INBOUND_DOMAIN'];
+      else process.env['EMAIL_INBOUND_DOMAIN'] = before.domain;
+      if (before.sites === undefined) delete process.env['EMAIL_INBOUND_SITES'];
+      else process.env['EMAIL_INBOUND_SITES'] = before.sites;
+      if (before.hook === undefined) delete process.env['RESEND_INBOUND_WEBHOOK_SECRET'];
+      else process.env['RESEND_INBOUND_WEBHOOK_SECRET'] = before.hook;
+      if (before.key === undefined) delete process.env['RESEND_API_KEY'];
+      else process.env['RESEND_API_KEY'] = before.key;
+      resetReplyAddressingForTests();
+    }
+    expect(
+      await work
+        .queueWrittenEmail({
+          ...mailScope,
+          requestId: crypto.randomUUID(),
+          leadId,
+          subject: 's',
+          body: 'b',
+        })
+        .then((o) => o.status),
+    ).toBe('no_sender');
 
     await work.setArchived({ ...mailScope, leadId, archived: true });
     expect(await queue()).toEqual({ status: 'trashed' });

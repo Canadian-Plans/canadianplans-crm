@@ -41,6 +41,8 @@ import {
   DialogTitle,
 } from '@canadian-plans/ui';
 import Link from 'next/link';
+import { ArrowLeftIcon, LayoutDashboardIcon, ListIcon } from 'lucide-react';
+import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 
 import {
@@ -60,6 +62,7 @@ import {
   testAutomation,
   updateAutomation,
 } from '../../lib/api';
+import { describeError } from '../../lib/error-text';
 import { useResource } from '../../lib/use-resource';
 import { useStaffSession } from '../staff-session-provider';
 import { AutomationRuns } from './automation-runs';
@@ -258,6 +261,7 @@ function FlowPageEditor({
   flowKey: string;
 }): JSX.Element {
   const staff = useStaffSession();
+  const router = useRouter();
   const workspace = staff.workspaces.find((item) => item.slug === workspaceSlug);
   const workspaceId = workspace?.id;
   const accessToken = staff.accessToken;
@@ -295,7 +299,7 @@ function FlowPageEditor({
         : undefined,
     [accessToken, workspaceId, key],
   );
-  const { data, error, reload, mutate } = useResource(load);
+  const { data, error, failure, reload, mutate } = useResource(load);
   const names: FlowNames = useMemo(
     () => (data?.catalog ? namesFromCatalog(data.catalog) : namesFromCode()),
     [data?.catalog],
@@ -417,7 +421,7 @@ function FlowPageEditor({
             if (parsed.success) setServerIssues(parsed.data);
           }
           setSaveStatus('error');
-          setSaveErrorText(changeError(caught, 'The draft was not saved'));
+          setSaveErrorText(changeError(caught, 'save the draft'));
           return undefined;
         }
       });
@@ -534,9 +538,11 @@ function FlowPageEditor({
         if (!saved) return 'The draft was not saved. Save or reload it before archiving.';
       }
       replaceDetail(await archiveAutomation(accessToken, workspaceId, key), true);
+      // An archived flow is done with: back to the list (Restore lives in its Archived view).
+      router.push(`/w/${workspaceSlug}/automations`);
       return undefined;
     } catch (caught) {
-      return changeError(caught, 'The flow was not archived');
+      return changeError(caught, 'archive the flow');
     } finally {
       endAction();
     }
@@ -548,7 +554,7 @@ function FlowPageEditor({
       replaceDetail(await restoreAutomation(accessToken, workspaceId, key), true);
       return undefined;
     } catch (caught) {
-      return changeError(caught, 'The flow was not restored');
+      return changeError(caught, 'restore the flow');
     }
   }
 
@@ -579,7 +585,7 @@ function FlowPageEditor({
           const parsed = flowIssueSchema.array().safeParse(caught.details?.issues);
           if (parsed.success) setServerIssues(parsed.data);
         }
-        setActionError(changeError(caught, 'The flow was not activated'));
+        setActionError(changeError(caught, 'activate the flow'));
       }
     } finally {
       endAction();
@@ -608,7 +614,7 @@ function FlowPageEditor({
       setSaveStatus('idle');
       setSelectedNodeId(undefined);
     } catch (caught) {
-      setActionError(changeError(caught, 'The draft was not discarded'));
+      setActionError(changeError(caught, 'discard the draft'));
     } finally {
       endAction();
     }
@@ -628,7 +634,7 @@ function FlowPageEditor({
       setSaveStatus('saved');
       setSelectedNodeId(undefined);
     } catch (caught) {
-      setActionError(changeError(caught, 'The flow was not reset'));
+      setActionError(changeError(caught, 'reset the flow'));
     } finally {
       endAction();
     }
@@ -653,7 +659,7 @@ function FlowPageEditor({
       setSelectedNodeId(undefined);
     } catch (caught) {
       if (request === historyRequestRef.current) {
-        setActionError(changeError(caught, 'The version could not be loaded'));
+        setActionError(changeError(caught, 'load the version'));
       }
     }
   }
@@ -685,14 +691,18 @@ function FlowPageEditor({
         runsNextBefore: page.nextBefore,
       }));
     } catch (caught) {
-      setActionError(changeError(caught, 'More runs could not be loaded'));
+      setActionError(changeError(caught, 'load more runs'));
     } finally {
       setLoadingMoreRuns(false);
     }
   }
 
   const back = (
-    <Link className="text-sm underline" href={`/w/${workspaceSlug}/automations`}>
+    <Link
+      className="inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground hover:underline"
+      href={`/w/${workspaceSlug}/automations`}
+    >
+      <ArrowLeftIcon className="size-4" aria-hidden="true" />
       All automations
     </Link>
   );
@@ -713,7 +723,9 @@ function FlowPageEditor({
       <div className="flex flex-col items-start gap-2">
         {back}
         <p role="alert" className="text-sm text-destructive">
-          The automation could not be loaded. Reason: {error}.
+          {error === 'automation_not_found'
+            ? 'This automation no longer exists. Go back to Automations and pick another one.'
+            : describeError(failure, 'load the automation')}
         </p>
         <Button type="button" size="sm" variant="outline" onClick={() => void reload()}>
           Try again
@@ -768,7 +780,7 @@ function FlowPageEditor({
       });
       setTestResult(response);
     } catch (caught) {
-      setTestError(changeError(caught, 'The test run could not be completed'));
+      setTestError(changeError(caught, 'run the test'));
     } finally {
       setTestBusy(false);
     }
@@ -849,7 +861,7 @@ function FlowPageEditor({
     isDirty;
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex min-w-0 flex-col gap-4">
       {back}
 
       {data.warnings.map((warning) => (
@@ -864,60 +876,49 @@ function FlowPageEditor({
         </p>
       ))}
 
-      <header className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-xl font-semibold">{flow.name}</h1>
-          {flow.origin === 'builtin' ? <Badge variant="secondary">Built in</Badge> : null}
-          {flow.archived ? <Badge variant="outline">Archived</Badge> : null}
-          {viewingHistoryVersion ? (
-            <Badge variant="outline">Viewing version {viewingHistoryVersion.version}</Badge>
-          ) : detail.draft !== null || isDirty ? (
-            <Badge variant="outline">Viewing draft</Badge>
-          ) : flow.activeVersion !== null ? (
-            <Badge variant="outline">Viewing active</Badge>
-          ) : null}
-        </div>
-        <p className="text-sm text-muted-foreground">
-          {viewingHistoryVersion
-            ? 'You are viewing a past version. Return to the current draft to edit.'
-            : flow.archived
-              ? 'Archived · Restore this flow before editing it or starting new runs.'
-              : flow.enabled
-                ? 'On · New matching leads run the active version. Draft edits are not live until activated.'
-                : flow.activeVersion !== null
-                  ? 'Off · An active version is ready, but new leads will not enter until you switch this flow on.'
-                  : 'Draft · Set a trigger, add actions, then review and activate. Switch on when you are ready for new runs.'}
-        </p>
-        {flow.description ? (
-          <p className="text-sm text-muted-foreground">{flow.description}</p>
-        ) : null}
-        <div className="flex flex-wrap items-start gap-4">
+      <header className="flex flex-col gap-2 rounded-xl border bg-card px-4 py-3">
+        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            <h1 className="min-w-0 text-xl font-semibold tracking-tight break-words">
+              {flow.name}
+            </h1>
+            {flow.origin === 'builtin' ? <Badge variant="secondary">Built in</Badge> : null}
+            {flow.archived ? <Badge variant="outline">Archived</Badge> : null}
+            {viewingHistoryVersion ? (
+              <Badge variant="outline">Viewing version {viewingHistoryVersion.version}</Badge>
+            ) : detail.draft !== null || isDirty ? (
+              <Badge variant="outline">Viewing draft</Badge>
+            ) : null}
+            {flow.activeVersion === null ? (
+              <Badge variant="outline">Not activated</Badge>
+            ) : (
+              <Badge variant="outline">Active, version {flow.activeVersion}</Badge>
+            )}
+            <StatusChip flow={flow} hideNotActivated />
+            {saveStatus === 'unsaved' ? (
+              <span role="status" className="text-xs text-muted-foreground">
+                Unsaved changes
+              </span>
+            ) : saveStatus === 'saving' ? (
+              <span role="status" className="text-xs text-muted-foreground">
+                Saving…
+              </span>
+            ) : saveStatus === 'saved' ? (
+              <span role="status" className="text-xs text-muted-foreground">
+                Saved
+              </span>
+            ) : null}
+          </div>
           <FlowSwitch
             flow={flow}
             canManage={detail.canManage}
             permissionNoteId={permissionNoteId}
             onToggle={onToggle}
           />
-          <p className="text-sm">
-            {flow.activeVersion === null
-              ? 'Not activated'
-              : `Active, version ${flow.activeVersion}`}
-          </p>
-          <StatusChip flow={flow} hideNotActivated />
-          {saveStatus === 'unsaved' ? (
-            <span role="status" className="text-xs text-muted-foreground">
-              Unsaved changes
-            </span>
-          ) : saveStatus === 'saving' ? (
-            <span role="status" className="text-xs text-muted-foreground">
-              Saving…
-            </span>
-          ) : saveStatus === 'saved' ? (
-            <span role="status" className="text-xs text-muted-foreground">
-              Saved
-            </span>
-          ) : null}
         </div>
+        {flow.description ? (
+          <p className="text-sm text-muted-foreground">{flow.description}</p>
+        ) : null}
         {detail.canManage ? null : (
           <p id={permissionNoteId} className="text-sm text-muted-foreground">
             {NEEDS_INTEGRATIONS}
@@ -964,7 +965,7 @@ function FlowPageEditor({
         </p>
       ) : null}
 
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-2">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-2">
         <div
           role="tablist"
           aria-label="Flow sections"
@@ -1032,6 +1033,7 @@ function FlowPageEditor({
                 aria-pressed={currentViewMode === 'canvas'}
                 onClick={() => setViewMode('canvas')}
               >
+                <LayoutDashboardIcon className="size-4" aria-hidden="true" />
                 Canvas view
               </Button>
               <Button
@@ -1041,6 +1043,7 @@ function FlowPageEditor({
                 aria-pressed={currentViewMode === 'list'}
                 onClick={() => setViewMode('list')}
               >
+                <ListIcon className="size-4" aria-hidden="true" />
                 List view
               </Button>
             </div>
@@ -1135,7 +1138,7 @@ function FlowPageEditor({
           aria-labelledby={`${sectionTabsId}-flow`}
         >
           <section aria-labelledby="flow-definition-heading" className="flex flex-col gap-3">
-            <h2 id="flow-definition-heading" className="text-base font-semibold">
+            <h2 id="flow-definition-heading" className="sr-only">
               What it does
             </h2>
             {displayedDefinition && canEdit ? (
@@ -1152,7 +1155,7 @@ function FlowPageEditor({
             {!uncorruptedDefinition || displayedDefinition === null ? (
               <NoDefinition detail={detail} />
             ) : (
-              <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
                 <div className="min-w-0 flex-1">
                   {displayedDefinition.trigger === null &&
                   displayedDefinition.steps.length === 0 ? (

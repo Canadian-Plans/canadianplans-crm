@@ -15,6 +15,19 @@ import {
 } from '@canadian-plans/contracts';
 
 import { toLeadActivity } from '../leads/staff-queries.js';
+import { keptMailText } from './kept-text.js';
+import { loadReplyAddressing, type ReplyAddressing } from './reply-address.js';
+
+let cachedReplies: { value: ReplyAddressing | undefined } | undefined;
+/** Reply addressing from the environment, read once per process. */
+function replies(): ReplyAddressing | undefined {
+  cachedReplies ??= { value: loadReplyAddressing() };
+  return cachedReplies.value;
+}
+/** Test helper: read the reply settings again on the next mail. */
+export function resetReplyAddressingForTests(): void {
+  cachedReplies = undefined;
+}
 
 /** The flow a mail is queued for: what the timeline and the audit name. */
 export interface QueuedByAutomation {
@@ -31,8 +44,9 @@ export interface QueuedByAutomation {
  * naming the template, its version and the flow that sent it (null when staff
  * did: the entry carries the flow's key and name, and a site-made template's
  * name; the audit `{ key, version, runId }`); for a staff test, an
- * `email.test_sent` audit event. The address and
- * the mail's words live only in the job's payload. A dedupe key already used
+ * `email.test_sent` audit event. The address lives
+ * only in the job's payload; a lead's mail also keeps its subject and text on
+ * the timeline entry (`keptMailText`), for the lead's Mail tab. A dedupe key already used
  * for the site queues nothing and records nothing (`queued: false`).
  */
 export async function queueComposedEmail(
@@ -54,10 +68,16 @@ export async function queueComposedEmail(
     aiCardId?: string;
   },
 ): Promise<{ queued: boolean; jobId: string | null; activity: LeadActivity | null }> {
-  const { payload } = input;
-  if ((payload.leadId ?? null) !== input.leadId) {
+  if ((input.payload.leadId ?? null) !== input.leadId) {
     throw new Error('the composed mail is for a different lead');
   }
+  // A mail to a lead answers to the lead's own reply address, so the
+  // customer's reply comes back to its conversation (reply-address.ts).
+  const replyTo =
+    input.leadId === null ? undefined : replies()?.addressFor(input.workspaceId, input.leadId);
+  const payload: CustomerEmailJobPayload = replyTo
+    ? { ...input.payload, sender: { ...input.payload.sender, replyToAddress: replyTo } }
+    : input.payload;
 
   const [job] = await tx
     .insert(outboxJobs)
@@ -92,6 +112,7 @@ export async function queueComposedEmail(
     return { queued: true, jobId: job.id, activity: null };
   }
 
+  const kept = keptMailText(payload.rendered);
   const [entry] = await tx
     .insert(leadActivities)
     .values({
@@ -99,8 +120,13 @@ export async function queueComposedEmail(
       leadId: input.leadId,
       actorId: input.actorId,
       kind: 'system',
+      // What was written, for the lead's Mail tab. It sits in `body` with the
+      // notes, so erasing the customer's data removes it the same way.
+      body: kept.body,
       data: {
         event: 'customer_emailed',
+        jobId: job.id,
+        ...(kept.cut ? { textCut: true } : {}),
         ...(input.aiActionId && !input.automation ? { viaAi: true } : {}),
         template: payload.template,
         templateVersion: payload.templateVersion,
@@ -154,6 +180,11 @@ export async function queueComposedEmail(
   return {
     queued: true,
     jobId: job.id,
-    activity: toLeadActivity({ ...entry, createdAt: entry.createdAt.toISOString() }),
+    // Just queued: the outbox has not picked it up yet.
+    activity: toLeadActivity({
+      ...entry,
+      createdAt: entry.createdAt.toISOString(),
+      mailStatus: 'queued',
+    }),
   };
 }

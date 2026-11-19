@@ -42,6 +42,13 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+const navigation = vi.hoisted(() => ({ push: vi.fn() }));
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: navigation.push, replace: vi.fn(), back: vi.fn(), prefetch: vi.fn() }),
+  usePathname: () => '/w/canadawide/automations',
+  useSearchParams: () => new URLSearchParams(),
+}));
+
 vi.mock('../../lib/api', () => ({ ...mocks, BackendError: mocks.FakeBackendError }));
 
 vi.mock('../staff-session-provider', () => ({
@@ -420,7 +427,8 @@ describe('FlowPage', () => {
     expect(within(stepOutcomes).getByText('Waiting')).toBeTruthy();
   });
 
-  it('asks before archiving, then shows the flow archived', async () => {
+  it('asks before archiving, then goes back to the automations list', async () => {
+    navigation.push.mockReset();
     mocks.archiveAutomation.mockResolvedValue(
       detail({ automation: summary({ archived: true, enabled: false }) }),
     );
@@ -432,8 +440,7 @@ describe('FlowPage', () => {
     await waitFor(() =>
       expect(mocks.archiveAutomation).toHaveBeenCalledWith('staff-token', WORKSPACE, FLOW),
     );
-    expect(await screen.findByRole('button', { name: 'Restore' })).toBeTruthy();
-    expect(screen.getByText('Archived')).toBeTruthy();
+    await waitFor(() => expect(navigation.push).toHaveBeenCalledWith('/w/canadawide/automations'));
   });
 
   it('a built-in has Reset to default and no Archive; a new flow says No trigger yet', async () => {
@@ -478,7 +485,7 @@ describe('FlowPage', () => {
     mocks.getAutomation.mockRejectedValueOnce(new mocks.FakeBackendError('automation_not_found'));
     render(<FlowPage workspaceSlug="canadawide" flowKey={FLOW} />);
     expect((await screen.findByRole('alert')).textContent).toBe(
-      'The automation could not be loaded. Reason: automation_not_found.',
+      'This automation no longer exists. Go back to Automations and pick another one.',
     );
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(
@@ -545,7 +552,8 @@ describe('FlowPage', () => {
       saving.resolve(detail({ revision: 4 }));
     });
     await waitFor(() => expect(mocks.discardAutomationDraft).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText('Viewing active')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('Viewing draft')).toBeNull());
+    expect(screen.getByText('Active, version 1')).toBeTruthy();
   });
 
   it('offers Reload for the backend revision_conflict and keeps unsaved edits', async () => {

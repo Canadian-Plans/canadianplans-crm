@@ -1,6 +1,8 @@
 # Canadian Plans CRM: state of this repository
 
-Written 2026-11-12, when the repository was created. Keep it current.
+Written 2026-11-12, when the repository was created, and updated
+2026-11-19, when it was brought up to date with the GT Sales CRM. Keep it
+current.
 
 ## Where this came from
 
@@ -46,7 +48,7 @@ Inherited documents still link to some of these; those links are dead.
 
 ## What was kept as it is
 
-- **Every migration** (`packages/db/drizzle/0000` to `0033`), unedited. The
+- **Every migration** (`packages/db/drizzle/0000` onwards), unedited. The
   steps written for GT Sales check for its site slugs or legacy tables and do
   nothing on a fresh database. Apply them all with the migrator
   (`pnpm --filter @canadian-plans/db db:migrate`).
@@ -56,9 +58,44 @@ Inherited documents still link to some of these; those links are dead.
 - **The synthetic seed** (`packages/db/src/seed.ts`) and test fixtures, which
   still use the made-up sites `getcanadasim` and `canadawide`. They are test
   data only; the seed refuses hosted databases.
-- **docs/HANDOFF.md, docs/PLAN.md, docs/superpowers/, docs/briefs/,
-  docs/review/**: the design record. Their live systems, ids, owner steps and
-  dates are GT Sales'.
+- **docs/HANDOFF.md and docs/PLAN.md**: the design record. Their live
+  systems, ids, owner steps and dates are GT Sales'.
+
+## Brought up to date with GT Sales (2026-11-19)
+
+Everything GT Sales merged after `fadda10`, up to `b1d59bb` (PRs 53 to 70),
+was carried across with the same renaming as the copy: GT Sales at `fadda10`
+and at `b1d59bb` were renamed, and the difference between the two applied to
+this repository as a three-way merge, so the changes made here since the copy
+were kept. What came across:
+
+- **Admin and leads:** plain-language error messages, the top loading bar, one
+  loading screen per page, the leads toolbar with stage and assignee changed
+  in place and bulk archive, the lead page and side panel redesign, a shorter
+  dashboard, the source report opened from the dashboard (the Reports page is
+  gone), board columns that fill the window.
+- **Mail:** the lead's Mail tab (every mail sent to the customer, and writing
+  one), the site's Mail page as conversations with Ask AI drafts, messages
+  written in the CRM sent as a plain letter, and customer replies landing on
+  the lead (`EMAIL_INBOUND_*`, docs/ENV.md).
+- **Analytics:** a site's website traffic read from Umami (`UMAMI_API_URL`,
+  `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`).
+- **Ask AI:** the Gateway host pinning (`AI_GATEWAY_PROVIDERS`), the CRM
+  how-to guide, and the saved chat: a full page at `/w/<site>/chat` with
+  stored, private conversations, file attachments, Normal and High effort, and
+  Settings → AI usage for the owner (docs/design/ai-chat.md).
+- **Reliability and security:** a dead database connection no longer freezes
+  the CRM, the backup retries Backblaze errors, a failed query no longer sends
+  customer values to the error tracker, a rate-limited mail is retried, a
+  closed draft the customer finishes becomes a new order, and Next.js 16.4.6.
+- **Clean-up:** code nothing used was removed, including the Amazon SES email
+  adapter and its AWS SDK dependency, and the finished plans, specs and
+  reviews under `docs/` (except the cutover page below and the two pages it
+  rests on).
+
+Kept as they are here: this repository's browser-tab and home-screen icons
+(GT Sales' own icons were not brought), the SIM order's removed delivery
+letter link, the `sim_order` form's `currentCountry`, and this page.
 
 ## The deployment (set up 2026-11-12)
 
@@ -128,6 +165,18 @@ storefront's pre-arrival form sends.
    (Settings → Email).
 6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
    off.
+7. **Migrations `0034` to `0037`** (Ask AI's saved chat, its sweep and its
+   effort level), brought across on 2026-11-19, are not applied. Apply them
+   with the migrator, or as `0000` to `0033` were, after the backend and the
+   admin with them are both live (docs/RUNBOOKS/database.md). Until then Ask
+   AI works as before, without saved conversations. They matter only once the
+   AI assistant is on (item 6).
+8. **Features that need configuration before they show** (docs/ENV.md): the
+   Analytics page (`UMAMI_API_URL`, `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`;
+   check the old platform's `UMAMI_*` variables on the Railway service against
+   these names before removing them), customer replies (`EMAIL_INBOUND_DOMAIN`,
+   `EMAIL_INBOUND_SITES`, `RESEND_INBOUND_WEBHOOK_SECRET`), Ask AI attachments
+   (`AI_ATTACHMENT_KINDS`) and High effort (`AI_HIGH_EFFORT_ENABLED`).
 
 ## What comes next
 
@@ -149,4 +198,6 @@ storefront's pre-arrival form sends.
 `docs/superpowers/phases/phase-7-canadian-plans-cutover.md` was written for the
 same move when it was planned as a second deployment of the GT Sales
 repository; its decisions list and task breakdown still apply, read with this
-page.
+page. It is kept here, with the phase README and the merge design it rests on,
+though GT Sales removed them; the other pages it names are no longer in the
+repository.

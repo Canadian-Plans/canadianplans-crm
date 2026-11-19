@@ -138,7 +138,14 @@ describe('LeadRecord', () => {
     expect(screen.getByText('avery@example.test')).toBeTruthy();
     expect(screen.getByText('12 Example Street')).toBeTruthy();
     // Read as words, with the raw label kept as the tooltip.
-    expect(screen.getByText('Google · paid').getAttribute('title')).toBe('utm:google/cpc');
+    // The key facts row names the source too; the Source section keeps the raw label.
+    expect(
+      screen
+        .getAllByText('Google · paid')
+        .some((el) => el.getAttribute('title') === 'utm:google/cpc'),
+    ).toBe(true);
+    const facts = screen.getByRole('group', { name: 'Key facts' });
+    expect(within(facts).getByText('Next task')).toBeTruthy();
     expect(mocks.getStaffLead).toHaveBeenCalledWith('staff-token', WORKSPACE, LEAD);
   });
 
@@ -418,7 +425,7 @@ describe('LeadRecord ID check', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'Download photo' }));
     expect((await screen.findByRole('alert')).textContent).toBe(
-      'You need the document download permission for this.',
+      "You don't have permission to download photos. Ask the owner to give your role the document download permission.",
     );
     open.mockRestore();
   });
@@ -507,7 +514,7 @@ describe('LeadRecord documents', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'View Passport' }));
     expect((await screen.findByRole('alert')).textContent).toBe(
-      'This document is not available yet.',
+      'This document is not available yet. Wait a minute and reload the page.',
     );
     expect(screen.queryByRole('dialog')).toBeNull();
   });
@@ -917,7 +924,8 @@ describe('LeadRecord order details', () => {
 
     it('views the request’s document through an inline link', async () => {
       mocks.getStaffLead.mockResolvedValue(loaded());
-      mocks.createFileDownloadLink.mockResolvedValueOnce({
+      // The card's thumbnail asks for the same inline link before View does.
+      mocks.createFileDownloadLink.mockResolvedValue({
         url: 'https://storage.example.test/held',
         expiresAt: NOW,
         requestId: NOW,
@@ -950,7 +958,11 @@ describe('LeadRecord order details', () => {
         new BackendError('file_not_available', 409, NOW),
       );
       fireEvent.click(screen.getByRole('button', { name: 'View Passport' }));
-      expect(await screen.findByText('This document is not available yet.')).toBeTruthy();
+      expect(
+        await screen.findByText(
+          'This document is not available yet. Wait a minute and reload the page.',
+        ),
+      ).toBeTruthy();
       expect(tab.close).toHaveBeenCalledTimes(1);
     });
 
@@ -987,9 +999,9 @@ describe('LeadRecord order details', () => {
     expect(screen.getByText('eSIM')).toBeTruthy();
     expect(screen.getByText('Call after 6pm')).toBeTruthy();
     const staff = screen.getByRole('region', { name: 'Staff details' });
-    expect(within(staff).queryByText('SIM number')).toBeNull();
-    // An empty section says what can be recorded instead of showing a bare heading.
-    expect(within(staff).getByText('Not recorded yet: SIM number.')).toBeTruthy();
+    // An empty section lists what can be recorded, each as a dash in its own row.
+    expect(within(staff).getByText('SIM number')).toBeTruthy();
+    expect(within(staff).getByTitle('Not recorded yet').textContent).toBe('—');
     fireEvent.click(within(staff).getByRole('button', { name: 'Edit' }));
     expect(within(staff).getByLabelText('SIM number')).toBeTruthy();
   });
@@ -1086,12 +1098,9 @@ describe('LeadRecord order details', () => {
     const ask = await screen.findByRole('group', { name: 'Email the customer this number?' });
     fireEvent.click(within(ask).getByRole('button', { name: 'Email the customer' }));
     await waitFor(() =>
-      expect(mocks.emailLeadCustomer).toHaveBeenCalledWith(
-        'staff-token',
-        WORKSPACE,
-        LEAD,
-        'sim_number_ready',
-      ),
+      expect(mocks.emailLeadCustomer).toHaveBeenCalledWith('staff-token', WORKSPACE, LEAD, {
+        template: 'sim_number_ready',
+      }),
     );
     expect((await screen.findByRole('status')).textContent).toContain('within a minute');
     const timeline = screen.getByRole('region', { name: 'Timeline' });
@@ -1377,7 +1386,7 @@ describe('LeadRecord stage moves', () => {
     );
     expect(screen.queryByRole('dialog')).toBeNull();
     expect((await screen.findByRole('alert')).textContent).toBe(
-      'That move is not allowed from Pending.',
+      'That move is not allowed from Pending. Pick one of the stages offered.',
     );
   });
 });
@@ -1645,7 +1654,9 @@ describe('LeadRecord from the site layout', () => {
     });
     fireEvent.click(within(custom).getByRole('button', { name: 'Save' }));
     const alert = await within(custom).findByRole('alert');
-    expect(alert.textContent).toBe('The change was not saved. Reason: validation_error.');
+    expect(alert.textContent).toBe(
+      "Some of the details aren't valid, so the CRM couldn't save the change. Check the fields and try again.",
+    );
     expect(alert.className).toContain('text-destructive');
     expect(within(custom).getByLabelText('Referral code')).toBeTruthy();
   });
@@ -1733,10 +1744,15 @@ describe('LeadRecord from the site layout', () => {
       target: { value: 'Draft name' },
     });
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Notes' }), { button: 0 });
+    expect(screen.queryByRole('combobox', { name: 'Stage' })).toBeNull();
+    expect(screen.queryByRole('combobox', { name: 'Assignee' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Copy info' })).toBeTruthy();
     fireEvent.change(screen.getByRole('textbox', { name: 'Add a note' }), {
       target: { value: 'Call tomorrow' },
     });
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Home' }), { button: 0 });
+    expect(screen.getByRole('combobox', { name: 'Stage' })).toBeTruthy();
+    expect(screen.getByRole('combobox', { name: 'Assignee' })).toBeTruthy();
     expect(screen.getByRole('textbox', { name: 'Name' }).getAttribute('value')).toBe('Draft name');
     fireEvent.mouseDown(screen.getByRole('tab', { name: 'Notes' }), { button: 0 });
     expect(screen.getByRole('textbox', { name: 'Add a note' }).textContent).toBe('Call tomorrow');

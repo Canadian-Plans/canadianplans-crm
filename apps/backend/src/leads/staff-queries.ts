@@ -52,6 +52,7 @@ import {
 import { LATEST_REVIEW, currentLeadDocuments } from './documents-check.js';
 import { toLeadOrder } from './order.js';
 import { deriveSource } from './source.js';
+import { sentMailOf } from '../email/kept-text.js';
 
 /**
  * The staff side's lead reads, as plain SQL with explicit table aliases. The
@@ -905,7 +906,9 @@ export async function selectLeadBoard(
  * opened, with `dueBy` how many have a follow-up due, and the size of the
  * archive, for the transaction's own site: the site comes from the tenant
  * context and the day travels as a validated literal, so the statement binds
- * nothing and costs one round trip, not two.
+ * nothing and costs one round trip, not two. The opened leads are read once
+ * as a set and joined: a `not exists` inside the aggregate's filter runs once
+ * per lead, about a second for a site of 100,000 leads.
  */
 export async function selectLeadSummary(
   tx: TenantTransaction,
@@ -934,19 +937,17 @@ export async function selectLeadSummary(
     select
       l.lead_type as "leadType",
       count(*) filter (where l.deleted_at is null)::int as active,
-      count(*) filter (
-        where l.deleted_at is null
-          and not exists (
-            select 1 from app.lead_activities opened
-            where opened.workspace_id = l.workspace_id
-              and opened.lead_id = l.id
-              and opened.kind = 'system'
-              and opened.data ->> 'event' = 'opened'
-          )
-      )::int as unopened,
+      count(*) filter (where l.deleted_at is null and opened.lead_id is null)::int as unopened,
       ${followUpsDue} as "followUpsDue",
       count(*) filter (where l.deleted_at is not null)::int as trashed
     from app.leads l
+    left join (
+      select distinct activity.lead_id
+      from app.lead_activities activity
+      where activity.workspace_id = ${contextWorkspaceId}
+        and activity.kind = 'system'
+        and activity.data ->> 'event' = 'opened'
+    ) opened on opened.lead_id = l.id
     where l.workspace_id = ${contextWorkspaceId} and l.customer_data_restricted_at is null
     group by l.lead_type
     order by l.lead_type
@@ -1107,7 +1108,37 @@ export interface ActivityRow {
   body: string | null;
   data: unknown;
   createdAt: string;
+  /** How a `customer_emailed` entry's send went; read with the lead page only. */
+  mailStatus?: string | null;
 }
+
+/** The entries that are a mail: one the CRM sent, or the customer's reply. Both keep their words in `body`. */
+const MAIL_EVENTS: ReadonlySet<unknown> = new Set(['customer_emailed', 'customer_replied']);
+
+/**
+ * How the mail behind a `customer_emailed` entry `a` went: the provider's
+ * last report when the send got that far, else where its outbox job stands.
+ * Null for other entries and for mails queued before entries named their job.
+ */
+export const MAIL_STATUS = sql.raw(`(
+  select case
+    when m.status is not null and m.status <> 'queued' then m.status
+    when j.status in ('pending', 'processing') then 'queued'
+    when j.status in ('failed', 'uncertain') then j.status
+    when j.provider_id like 'skipped:%' then 'skipped'
+    else 'sent'
+  end
+  from app.outbox_jobs j
+  left join app.email_messages m
+    on m.workspace_id = j.workspace_id and m.message_id = j.message_id
+  where a.kind = 'system'
+    and a.data ->> 'event' = 'customer_emailed'
+    and j.workspace_id = a.workspace_id
+    and j.id = case
+      when a.data ->> 'jobId' ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+      then (a.data ->> 'jobId')::uuid
+    end
+)`);
 
 /**
  * A stored timeline row as the contract's entry. `data` carries the kind's
@@ -1118,12 +1149,22 @@ export interface ActivityRow {
 export function toLeadActivity(row: ActivityRow): LeadActivity {
   const data =
     typeof row.data === 'object' && row.data !== null && !Array.isArray(row.data) ? row.data : {};
+  // A mail to the customer keeps its subject and text in `body` (keptMailText).
+  const mail =
+    row.kind === 'system' &&
+    Object.hasOwn(data, 'event') &&
+    MAIL_EVENTS.has(Reflect.get(data, 'event'))
+      ? sentMailOf(row.body)
+      : undefined;
   const parsed = leadActivitySchema.safeParse({
     ...data,
+    ...(mail ?? {}),
+    ...(row.mailStatus ? { mailStatus: row.mailStatus } : {}),
     id: row.id,
     actorId: row.actorId,
     kind: row.kind,
-    body: row.body ?? undefined,
+    // A mail's body is served as `subject` and `text`, not twice.
+    body: mail ? undefined : (row.body ?? undefined),
     createdAt: row.createdAt,
   });
   if (parsed.success) return parsed.data;
@@ -1236,6 +1277,7 @@ export async function selectLeadWithWork(
           'kind', a.kind,
           'body', a.body,
           'data', a.data,
+          'mailStatus', ${MAIL_STATUS},
           'createdAt', ${iso('a.created_at')}
         ) order by a.created_at desc, a.id desc), '[]'::json)
         from (

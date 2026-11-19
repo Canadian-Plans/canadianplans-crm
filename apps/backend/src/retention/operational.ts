@@ -3,7 +3,7 @@ import { withTenantTx } from '@canadian-plans/db';
 
 /**
  * REL-19: deletes old operational rows through the bounded SECURITY DEFINER
- * function from migration 0026 (windows in docs/OPEN_INPUTS.md). Off unless
+ * function from migration 0026 (windows in docs/ENV.md). Off unless
  * OPERATIONAL_RETENTION_ENABLED=1: the owner turns it on only after the first
  * verified backup, because these deletes cannot be undone.
  */

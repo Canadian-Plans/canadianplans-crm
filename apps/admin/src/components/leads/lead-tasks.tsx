@@ -8,12 +8,12 @@ import {
   type LeadTaskStatus,
 } from '@canadian-plans/contracts';
 import { Button, cn, Input, NativeSelect } from '@canadian-plans/ui';
-import { ListTodoIcon, PlusIcon, XIcon } from 'lucide-react';
+import { CalendarDaysIcon, ListTodoIcon, PlusIcon, XIcon } from 'lucide-react';
 
 import { createLeadTask, updateLeadTask } from '../../lib/api';
 import { dueAtFromDay, dueSentence, dueTone } from '../../lib/dates';
 import { assigneeName, memberName } from '../../lib/people';
-import { errorReason } from '../../lib/use-resource';
+import { describeError } from '../../lib/error-text';
 import { PersonChip } from './lead-display';
 import { DUE_TONE_CLASS } from './leads-table';
 
@@ -60,6 +60,7 @@ export function TaskRow({
   canWrite,
   busy,
   onStatus,
+  compact = false,
   children,
 }: {
   task: LeadTask;
@@ -67,6 +68,7 @@ export function TaskRow({
   canWrite: boolean;
   busy: boolean;
   onStatus(status: LeadTaskStatus): void;
+  compact?: boolean;
   /** Extra detail under the title, e.g. the lead on "My tasks". */
   children?: ReactNode;
 }) {
@@ -79,8 +81,31 @@ export function TaskRow({
   const status = pending ?? task.status;
   const assignee = assigneeName(task.assignedActorId, members);
   const closed = !isActiveTaskStatus(status);
+  const due = (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1',
+        task.dueAt && !closed && DUE_TONE_CLASS[dueTone(task.dueAt)],
+      )}
+    >
+      {compact ? <CalendarDaysIcon aria-hidden="true" className="size-3.5 shrink-0" /> : null}
+      {task.dueAt ? dueSentence(task.dueAt) : 'No due date'}
+    </span>
+  );
+  const person = assignee ? <PersonChip name={assignee} size="xs" /> : <span>Unassigned</span>;
+  const badge =
+    status === 'in_progress' ? (
+      <TaskStatusBadge status={status} />
+    ) : status === 'cancelled' ? (
+      <span>Cancelled</span>
+    ) : null;
   return (
-    <li className="flex items-start gap-3 py-2">
+    <li
+      className={cn(
+        'flex gap-3',
+        compact ? 'min-h-11 items-start px-3 py-2 hover:bg-muted/30' : 'items-start py-2',
+      )}
+    >
       <input
         type="checkbox"
         className="mt-0.5 size-4 shrink-0 accent-primary"
@@ -93,23 +118,36 @@ export function TaskRow({
         }}
         aria-label={`${status === 'done' ? 'Reopen' : 'Complete'} “${task.title}”`}
       />
-      <div className="min-w-0 flex-1 text-sm">
-        <p className={cn('break-words', closed && 'text-muted-foreground line-through')}>
-          {task.title}
-        </p>
+      <div
+        className={cn(
+          'min-w-0 flex-1 text-sm',
+          compact &&
+            'grid items-center gap-x-3 gap-y-1 md:grid-cols-[minmax(0,1fr)_minmax(7rem,0.6fr)_minmax(10rem,auto)]',
+        )}
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <p
+            className={cn(
+              'min-w-0 break-words',
+              compact && 'font-medium',
+              closed && 'text-muted-foreground line-through',
+            )}
+          >
+            {task.title}
+          </p>
+          {compact ? badge : null}
+        </div>
         {children}
-        <p className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-          {task.dueAt ? (
-            <span className={closed ? undefined : DUE_TONE_CLASS[dueTone(task.dueAt)]}>
-              {dueSentence(task.dueAt)}
-            </span>
-          ) : (
-            <span>No due date</span>
+        <div
+          className={cn(
+            'flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground',
+            compact ? 'md:justify-end' : 'mt-0.5',
           )}
-          {assignee ? <PersonChip name={assignee} size="xs" /> : <span>Unassigned</span>}
-          {status === 'in_progress' ? <TaskStatusBadge status={status} /> : null}
-          {status === 'cancelled' ? <span>Cancelled</span> : null}
-        </p>
+        >
+          {due}
+          {person}
+          {compact ? null : badge}
+        </div>
       </div>
       {canWrite && isActiveTaskStatus(status) ? (
         <Button
@@ -155,6 +193,9 @@ export function LeadTasks({
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string>();
   const [showClosed, setShowClosed] = useState(false);
+  // The form is one line until someone starts a task: the date and assignee come with the words.
+  const [formOpen, setFormOpen] = useState(false);
+  const expanded = formOpen || title !== '' || day !== '';
 
   const open = tasks.filter((task) => isActiveTaskStatus(task.status));
   const closed = tasks.filter((task) => !isActiveTaskStatus(task.status));
@@ -177,7 +218,7 @@ export function LeadTasks({
       setTitle('');
       setDay('');
     } catch (error) {
-      setMessage(`The task was not added. Reason: ${errorReason(error)}.`);
+      setMessage(describeError(error, 'add the task'));
     } finally {
       setSaving(false);
     }
@@ -190,7 +231,7 @@ export function LeadTasks({
       const result = await updateLeadTask(accessToken, workspaceId, task.id, { status });
       onChange(result.task);
     } catch (error) {
-      setMessage(`The task was not updated. Reason: ${errorReason(error)}.`);
+      setMessage(describeError(error, 'update the task'));
     } finally {
       setBusyId(undefined);
     }
@@ -223,53 +264,59 @@ export function LeadTasks({
       ) : null}
 
       {canWrite ? (
-        <form onSubmit={(event) => void add(event)} className="grid gap-4">
-          <label className="flex min-w-0 flex-col gap-1.5 text-xs font-medium">
-            <span>New task</span>
-            <Input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="What needs to be done?"
-              className="h-10"
-              maxLength={200}
-            />
-          </label>
-          <div className="grid min-w-0 grid-cols-2 gap-3">
-            <label className="flex min-w-0 flex-col gap-1.5 text-xs font-medium">
-              <span className="flex flex-wrap items-center gap-x-1.5">
-                Due date{' '}
-                <span aria-hidden="true" className="font-normal text-muted-foreground">
-                  Optional
-                </span>
-              </span>
-              <Input type="date" value={day} onChange={(event) => setDay(event.target.value)} />
+        <form onSubmit={(event) => void add(event)} className="grid gap-3">
+          <div className="flex items-end gap-2">
+            <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-xs font-medium">
+              <span className="sr-only">New task</span>
+              <Input
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                onFocus={() => setFormOpen(true)}
+                placeholder="Add a task: what needs to be done?"
+                className="h-9"
+                maxLength={200}
+              />
             </label>
-            <label className="flex min-w-0 flex-col gap-1.5 text-xs font-medium">
-              <span>Assign the task to</span>
-              <NativeSelect value={assignee} onChange={(event) => setAssignee(event.target.value)}>
-                <option value="self">Me</option>
-                <option value="none">Unassigned</option>
-                {members
-                  .filter((member) => !member.isSelf)
-                  .map((member) => (
-                    <option key={member.actorId} value={member.actorId}>
-                      {memberName(member)}
-                    </option>
-                  ))}
-              </NativeSelect>
-            </label>
-          </div>
-          <div className="flex justify-end border-t pt-3">
             <Button
               type="submit"
               size="sm"
-              className="h-9"
+              className="h-9 shrink-0"
               disabled={saving || title.trim() === ''}
             >
               <PlusIcon className="size-4" aria-hidden="true" />
               {saving ? 'Adding…' : 'Add task'}
             </Button>
           </div>
+          {expanded ? (
+            <div className="grid min-w-0 grid-cols-2 gap-3">
+              <label className="flex min-w-0 flex-col gap-1.5 text-xs font-medium">
+                <span className="flex flex-wrap items-center gap-x-1.5">
+                  Due date{' '}
+                  <span aria-hidden="true" className="font-normal text-muted-foreground">
+                    Optional
+                  </span>
+                </span>
+                <Input type="date" value={day} onChange={(event) => setDay(event.target.value)} />
+              </label>
+              <label className="flex min-w-0 flex-col gap-1.5 text-xs font-medium">
+                <span>Assign the task to</span>
+                <NativeSelect
+                  value={assignee}
+                  onChange={(event) => setAssignee(event.target.value)}
+                >
+                  <option value="self">Me</option>
+                  <option value="none">Unassigned</option>
+                  {members
+                    .filter((member) => !member.isSelf)
+                    .map((member) => (
+                      <option key={member.actorId} value={member.actorId}>
+                        {memberName(member)}
+                      </option>
+                    ))}
+                </NativeSelect>
+              </label>
+            </div>
+          ) : null}
         </form>
       ) : null}
 
