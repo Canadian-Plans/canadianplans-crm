@@ -106,6 +106,15 @@ browser journeys that test them. It brings **migration `0039_ai_chat_erasure`**,
 applied on 2026-11-19 (item 7 below). Ask AI as a whole is still switched
 off here (item 6), so none of this shows until it is switched on.
 
+Brought across the same way on 2026-11-19, from GT Sales `10c3c66` (branch
+`ccr-5ef11664-t12jb7`, after `8889ba5`): the Ask AI chat redesign, the
+regrouped sidebar and Settings menus with Settings → Properties renamed
+Fields and layouts, the Documents page removed (documents are reviewed on each
+lead's page; the admin page, the dashboard tile, the review-queue route and
+its client method are gone) and the new task composer (name, due date,
+assignee and lead chips) in My tasks, the board columns and the lead page. No
+migration.
+
 Kept as they are here: this repository's browser-tab and home-screen icons
 (GT Sales' own icons were not brought), the SIM order's removed delivery
 letter link, the `sim_order` form's `currentCountry`, and this page.
