@@ -93,6 +93,10 @@ were kept. What came across:
   reviews under `docs/` (except the cutover page below and the two pages it
   rests on).
 
+Brought across the same way on 2026-11-19, from GT Sales PR 71: plain tasks
+(a task with no lead, made from the Tasks page) and Ask AI creating a plain
+task and moving any task between stages.
+
 Kept as they are here: this repository's browser-tab and home-screen icons
 (GT Sales' own icons were not brought), the SIM order's removed delivery
 letter link, the `sim_order` form's `currentCountry`, and this page.
@@ -165,12 +169,13 @@ storefront's pre-arrival form sends.
    (Settings → Email).
 6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
    off.
-7. **Migrations `0034` to `0037`** (Ask AI's saved chat, its sweep and its
-   effort level), brought across on 2026-11-19, are not applied. Apply them
-   with the migrator, or as `0000` to `0033` were, after the backend and the
-   admin with them are both live (docs/RUNBOOKS/database.md). Until then Ask
-   AI works as before, without saved conversations. They matter only once the
-   AI assistant is on (item 6).
+7. **Migration `0038`** (plain tasks: a task's lead may be empty) is not
+   applied. Apply it after the admin and the backend with it are both live
+   (docs/RUNBOOKS/database.md); until then New task without a lead answers
+   that plain tasks are not available yet. Migrations `0034` to `0037` (Ask
+   AI's saved chat, its sweep and its effort level) were applied on
+   2026-11-19 through the Supabase SQL connection, each with its tracker row,
+   and checked against the runbook's verify queries (38 tracker rows).
 8. **Features that need configuration before they show** (docs/ENV.md): the
    Analytics page (`UMAMI_API_URL`, `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`;
    check the old platform's `UMAMI_*` variables on the Railway service against
