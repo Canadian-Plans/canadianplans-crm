@@ -30,7 +30,22 @@ import {
   type LeadTableColumn,
   type SavedView,
 } from '@canadian-plans/contracts';
-import { Button, cn, Input, NativeSelect, Popover, PopoverTrigger } from '@canadian-plans/ui';
+import {
+  Button,
+  cn,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  NativeSelect,
+  Popover,
+  PopoverTrigger,
+  Skeleton,
+} from '@canadian-plans/ui';
+import { TableSkeleton } from '../crm/loading-skeleton';
 import {
   ArchiveIcon,
   ArrowUpDownIcon,
@@ -43,6 +58,7 @@ import {
   SearchIcon,
   SlidersHorizontalIcon,
   TableIcon,
+  XIcon,
 } from 'lucide-react';
 
 import {
@@ -50,10 +66,12 @@ import {
   deleteSavedView,
   getLeadsSummary,
   listSavedViews,
+  setLeadArchived,
   updateSavedView,
 } from '../../lib/api';
 import { todayDay } from '../../lib/dates';
 import { memberName } from '../../lib/people';
+import { describeError } from '../../lib/error-text';
 import { errorReason, useResource } from '../../lib/use-resource';
 import { FilterChip } from '../crm/filter-chip';
 import { MenuItem, MenuPanel } from '../crm/menu';
@@ -87,8 +105,13 @@ import {
 const SEARCH_DELAY_MS = 300;
 
 /** Compact icon controls in the inbox header; their panels hold all view settings. */
-const TOOLBAR_BUTTON = 'relative size-8 shrink-0 rounded-full p-0';
+// An icon on narrow screens; from `xl` the button says what it is.
+const TOOLBAR_BUTTON = 'relative h-8 w-8 shrink-0 gap-1.5 rounded-full p-0 xl:w-auto xl:px-3';
+const TOOLBAR_LABEL = 'hidden text-xs font-normal xl:inline';
 const TOOLBAR_ICON = 'size-3.5 text-muted-foreground';
+const countFormat = new Intl.NumberFormat('en-CA');
+/** The most leads one bulk archive or restore changes. */
+const BULK_ARCHIVE_MAX = 100;
 
 function TabButton({
   active,
@@ -184,13 +207,19 @@ function keepUnreadProperties(
 /** What a failed saved-view call says to the person who made it. */
 function savedViewFailure(error: unknown): string {
   const reason = errorReason(error);
-  if (reason === 'saved_view_name_taken') return 'A view with that name already exists.';
-  if (reason === 'saved_view_limit') {
-    return `You already have ${SAVED_VIEW_LIMIT} views. Delete one first.`;
+  if (reason === 'saved_view_name_taken') {
+    return 'You already have a view with that name. Choose a different name.';
   }
-  if (reason === 'version_conflict') return 'This view changed elsewhere. Reload and try again.';
-  if (reason === 'saved_view_not_found') return 'This view no longer exists. Reload and try again.';
-  return `Could not save the view. Reason: ${reason}.`;
+  if (reason === 'saved_view_limit') {
+    return `You already have ${SAVED_VIEW_LIMIT} views. Delete one you no longer use first.`;
+  }
+  if (reason === 'version_conflict') {
+    return 'This view was changed in another tab or window. Reload the page and try again.';
+  }
+  if (reason === 'saved_view_not_found') {
+    return 'This view no longer exists. Reload the page to see your views.';
+  }
+  return describeError(error, 'save the view');
 }
 
 const LEGACY_HIDDEN_COLUMNS_KEY = 'gt-table-hidden-cols:';
@@ -267,12 +296,27 @@ function splitSort(sort: string | undefined): { field?: string; direction?: 'asc
 }
 
 /**
+ * The previous reference while `value` serializes the same (`undefined`
+ * included), so a re-parse of the URL does not hand consumers a new array.
+ */
+function useStableValue<T>(value: T): T {
+  const key = JSON.stringify(value) ?? 'undefined';
+  const [held, setHeld] = useState({ key, value });
+  if (held.key === key) return held.value;
+  setHeld({ key, value });
+  return value;
+}
+
+/**
  * The leads inbox: a tab per lead type the site has and the archive, with the
  * search and compact Filters, View options and Saved views menus at the end
  * of that row; the active filters as chips under it while
  * there are any; and a table or (for one type) a board. Every choice is in
  * the URL.
  */
+/** Each site's one lead type (or none), as last seen this session: see `soleType`. */
+const soleTypeBySite = new Map<string, string | undefined>();
+
 export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -281,9 +325,17 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
   const { workspaceId, accessToken, members } = useLeadWorkspace(workspaceSlug);
   const properties = usePropertyModel(workspaceId);
   const catalog = properties.catalog;
-  const query = useMemo(
+  const parsedQuery = useMemo(
     () => parseInboxQuery(new URLSearchParams(urlKey), catalog),
     [urlKey, catalog],
+  );
+  // Every parse builds new `where` and `cols` arrays; keep the old ones while
+  // their content is the same, so opening a panel does not reload the list.
+  const where = useStableValue(parsedQuery.where);
+  const columns = useStableValue(parsedQuery.columns);
+  const query = useMemo<InboxQuery>(
+    () => ({ ...parsedQuery, where, columns }),
+    [parsedQuery, where, columns],
   );
   // A link naming a custom property can only be read once the site's
   // catalogue is here; until then the list waits rather than load without it.
@@ -310,7 +362,22 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
   );
   // A site that holds one lead type opens on that type's tab: an "All leads"
   // tab beside it would only repeat the same list, without the board.
-  const soleType = summary.data && tabTypes.length === 1 ? tabTypes[0]?.leadType : undefined;
+  const knownSoleType = summary.data && tabTypes.length === 1 ? tabTypes[0]?.leadType : undefined;
+  useEffect(() => {
+    if (summary.data) soleTypeBySite.set(workspaceSlug, knownSoleType);
+  }, [summary.data, knownSoleType, workspaceSlug]);
+  // On a later visit the answer from the last one stands in until the summary
+  // is back, so the type's list starts loading at once.
+  const soleType = summary.data ? knownSoleType : soleTypeBySite.get(workspaceSlug);
+  // Until the site's lead types are known, a bare `/leads` cannot tell whether
+  // it will open on "All leads" or on the site's one type. Loading "All leads"
+  // first and then the type showed two lists in a row, so it waits.
+  const decidingType =
+    !query.type &&
+    !query.archived &&
+    !query.view &&
+    !summary.error &&
+    (!summary.data || soleType !== undefined);
   const access = summary.data?.access;
   const canUseProperties = access?.contacts === true && !query.archived;
   const totalActive = types.reduce((sum, entry) => sum + entry.total, 0);
@@ -775,6 +842,9 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
           className={TOOLBAR_BUTTON}
         >
           <FilterIcon aria-hidden="true" className={TOOLBAR_ICON} />
+          <span aria-hidden="true" className={TOOLBAR_LABEL}>
+            Filter
+          </span>
           {filterCount > 0 ? (
             <span
               aria-hidden="true"
@@ -1041,12 +1111,9 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
           className={TOOLBAR_BUTTON}
         >
           <SlidersHorizontalIcon aria-hidden="true" className={TOOLBAR_ICON} />
-          {viewChanged ? (
-            <span
-              aria-hidden="true"
-              className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary ring-2 ring-background"
-            />
-          ) : null}
+          <span aria-hidden="true" className={TOOLBAR_LABEL}>
+            View
+          </span>
         </Button>
       </PopoverTrigger>
       <MenuPanel
@@ -1238,10 +1305,16 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
 
   // Export: the ticked leads, or every lead matching the filters as the list reads them.
   const canExport = access?.export === true;
+  // Archive (or, in the Archive tab, restore) the ticked leads, for whoever manages leads.
+  const canManage = access?.manage === true;
+  const canSelect = canExport || canManage;
   const [selection, setSelection] = useState<LeadSelection>(NO_LEAD_SELECTION);
   const [exportOpen, setExportOpen] = useState(false);
   const [exported, setExported] = useState<string>();
   const [tableTotal, setTableTotal] = useState<number>();
+  const [pageRowIds, setPageRowIds] = useState<readonly string[]>([]);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiving, setArchiving] = useState(false);
   const whereKey = JSON.stringify(query.where ?? []);
   const filterKey = [
     workspaceId,
@@ -1272,8 +1345,6 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
       ...(query.where && query.where.length > 0 ? { where: [...query.where] } : {}),
       ...(query.sort && !onBoard ? { sort: query.sort } : {}),
     }),
-    // `whereKey` stands for `query.where`, which is a new array on every parse.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       query.type,
       query.stage,
@@ -1282,7 +1353,7 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
       query.archived,
       query.due,
       query.sort,
-      whereKey,
+      query.where,
       onBoard,
       today,
     ],
@@ -1321,26 +1392,127 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
     () => (selection.allMatching ? [] : [...selection.selected]),
     [selection],
   );
-  const onTableLoaded = useCallback((info: { total: number }) => setTableTotal(info.total), []);
-  const exportButton = canExport ? (
-    <Button
-      type="button"
-      variant="outline"
-      size="icon"
-      aria-label="Export"
-      title="Export to Excel"
-      className={TOOLBAR_BUTTON}
-      onClick={() => setExportOpen(true)}
-    >
-      <DownloadIcon aria-hidden="true" className={TOOLBAR_ICON} />
-      {selection.allMatching || selection.selected.size > 0 ? (
-        <span
-          aria-hidden="true"
-          className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary ring-2 ring-background"
-        />
-      ) : null}
-    </Button>
-  ) : null;
+  const onTableLoaded = useCallback((info: { total: number; rowIds: readonly string[] }) => {
+    setTableTotal(info.total);
+    setPageRowIds(info.rowIds);
+  }, []);
+  const tickedCount = selection.allMatching ? (tableTotal ?? 0) : selection.selected.size;
+  const pageAllTicked =
+    !selection.allMatching &&
+    pageRowIds.length > 0 &&
+    pageRowIds.every((id) => selection.selected.has(id));
+  const canTakeAllMatching =
+    pageAllTicked && tableTotal !== undefined && tableTotal > selection.selected.size;
+  const restoring = query.archived;
+  async function archiveSelected() {
+    if (!accessToken || !workspaceId || selection.allMatching) return;
+    const ids = [...selection.selected].slice(0, BULK_ARCHIVE_MAX);
+    setArchiving(true);
+    let failed = 0;
+    // A few at a time: each one also stops the lead's automations on the server.
+    for (let start = 0; start < ids.length; start += 4) {
+      const results = await Promise.allSettled(
+        ids
+          .slice(start, start + 4)
+          .map((id) => setLeadArchived(accessToken, workspaceId, id, !restoring)),
+      );
+      failed += results.filter((result) => result.status === 'rejected').length;
+    }
+    setArchiving(false);
+    setArchiveOpen(false);
+    setSelection(NO_LEAD_SELECTION);
+    setListVersion((version) => version + 1);
+    void summary.reload();
+    const done = ids.length - failed;
+    const verb = restoring ? 'Restored' : 'Archived';
+    setExported(
+      failed === 0
+        ? `${verb} ${countFormat.format(done)} ${done === 1 ? 'lead' : 'leads'}.`
+        : `${verb} ${countFormat.format(done)} of ${countFormat.format(ids.length)}. ${countFormat.format(failed)} couldn’t be changed; try those again.`,
+    );
+  }
+  // With nothing ticked: the round export icon. Ticking a row grows it in place into
+  // the selection's actions, so the table below never moves.
+  const exportButton =
+    canSelect && tickedCount > 0 && !onBoard ? (
+      <div
+        role="group"
+        aria-label="Selected leads"
+        className="flex h-8 shrink-0 items-center gap-0.5 rounded-full border bg-background pr-1 pl-3 text-xs shadow-xs"
+      >
+        <span className="mr-1 font-medium whitespace-nowrap tabular-nums" aria-live="polite">
+          {selection.allMatching
+            ? `All ${countFormat.format(tickedCount)}`
+            : `${countFormat.format(tickedCount)} selected`}
+        </span>
+        {canTakeAllMatching ? (
+          <button
+            type="button"
+            className="h-6 rounded-full px-2 whitespace-nowrap text-primary outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => setSelection({ selected: new Set(), allMatching: true })}
+          >
+            Select all {countFormat.format(tableTotal ?? 0)}
+          </button>
+        ) : null}
+        {canExport ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 gap-1 rounded-full px-2 text-xs"
+            onClick={() => setExportOpen(true)}
+          >
+            <DownloadIcon aria-hidden="true" className="size-3.5" /> Export
+          </Button>
+        ) : null}
+        {canManage ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 gap-1 rounded-full px-2 text-xs"
+            disabled={selection.allMatching}
+            title={
+              selection.allMatching
+                ? `Tick leads on the page (up to ${BULK_ARCHIVE_MAX}) to ${restoring ? 'restore' : 'archive'} them`
+                : undefined
+            }
+            onClick={() => setArchiveOpen(true)}
+          >
+            {restoring ? (
+              <RotateCcwIcon aria-hidden="true" className="size-3.5" />
+            ) : (
+              <ArchiveIcon aria-hidden="true" className="size-3.5" />
+            )}
+            {restoring ? 'Restore' : 'Archive'}
+          </Button>
+        ) : null}
+        <button
+          type="button"
+          aria-label="Clear selection"
+          title="Clear selection"
+          className="grid size-6 place-items-center rounded-full text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => setSelection(NO_LEAD_SELECTION)}
+        >
+          <XIcon aria-hidden="true" className="size-3.5" />
+        </button>
+      </div>
+    ) : canExport ? (
+      <Button
+        type="button"
+        variant="outline"
+        size="icon"
+        aria-label="Export"
+        title="Export to Excel"
+        className={TOOLBAR_BUTTON}
+        onClick={() => setExportOpen(true)}
+      >
+        <DownloadIcon aria-hidden="true" className={TOOLBAR_ICON} />
+        <span aria-hidden="true" className={TOOLBAR_LABEL}>
+          Export
+        </span>
+      </Button>
+    ) : null;
 
   const chips =
     canUseProperties && activeWhere.length > 0
@@ -1365,7 +1537,9 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
           aria-label="Lead types"
           className="flex w-full min-w-0 overflow-x-auto overflow-y-hidden lg:w-auto lg:flex-1"
         >
-          {soleType ? null : (
+          {decidingType ? (
+            <Skeleton aria-hidden="true" className="my-1 h-8 w-28" />
+          ) : soleType ? null : (
             <TabButton
               active={!query.type && !query.archived}
               onClick={() =>
@@ -1477,18 +1651,18 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
 
       {summary.error ? (
         <p role="alert" className="text-sm text-muted-foreground">
-          Could not load the lead counts. Reason: {summary.error}.
+          {describeError(summary.failure, 'load the lead counts')}
         </p>
       ) : null}
       {savedViews.error ? (
         <p role="alert" className="text-sm text-muted-foreground">
-          Could not load your saved views. Reason: {savedViews.error}.
+          {describeError(savedViews.failure, 'load your saved views')}
         </p>
       ) : null}
       {catalogFailed ? (
         <p role="alert" className="text-sm text-muted-foreground">
-          Could not load the site&apos;s properties; showing built-in ones. Reason:{' '}
-          {properties.error}.
+          {describeError(properties.failure ?? properties.error, "load the site's properties")}{' '}
+          Showing the built-in properties for now.
         </p>
       ) : null}
       {exported ? (
@@ -1499,7 +1673,12 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
 
       <div className="flex min-w-0 items-start">
         <div data-slot="lead-list" className="min-w-0 flex-1">
-          {!accessToken || !workspaceId ? null : onBoard && query.type ? (
+          {!accessToken || !workspaceId ? null : decidingType ? (
+            <div role="status" aria-busy="true" aria-label="Loading leads…">
+              <span className="sr-only">Loading leads…</span>
+              <TableSkeleton />
+            </div>
+          ) : onBoard && query.type ? (
             <LeadsBoard
               // The board loads once per mount; a new key asks again.
               key={listVersion}
@@ -1530,17 +1709,8 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
               onSort={(next) => update({ sort: next })}
               onClearFilters={clearAllFilters}
               reloadToken={listVersion}
-              {...(canExport
-                ? {
-                    selection,
-                    onSelectionChange: setSelection,
-                    selectionActions: (
-                      <Button type="button" size="sm" onClick={() => setExportOpen(true)}>
-                        <DownloadIcon aria-hidden="true" />
-                        Export selected
-                      </Button>
-                    ),
-                  }
+              {...(canSelect
+                ? { selection, onSelectionChange: setSelection, selectionBar: false }
                 : {})}
               onLoaded={onTableLoaded}
               panel={{
@@ -1593,6 +1763,45 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
           </SidePanel>
         </div>
       </div>
+      {canManage ? (
+        <Dialog open={archiveOpen} onOpenChange={(open) => !archiving && setArchiveOpen(open)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                {restoring ? 'Restore' : 'Archive'}{' '}
+                {countFormat.format(Math.min(tickedCount, BULK_ARCHIVE_MAX))}{' '}
+                {tickedCount === 1 ? 'lead' : 'leads'}?
+              </DialogTitle>
+              <DialogDescription>
+                {restoring
+                  ? 'They go back to the active list where they were.'
+                  : 'They leave the active list and stop their automations. You can restore them from the Archive tab at any time.'}
+                {tickedCount > BULK_ARCHIVE_MAX
+                  ? ` Only the first ${BULK_ARCHIVE_MAX} are changed at once.`
+                  : ''}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={archiving}
+                onClick={() => setArchiveOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant={restoring ? 'default' : 'destructive'}
+                disabled={archiving}
+                onClick={() => void archiveSelected()}
+              >
+                {archiving ? 'Working…' : restoring ? 'Restore' : 'Archive'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {canExport && accessToken && workspaceId ? (
         <LeadExportDialog
           open={exportOpen}

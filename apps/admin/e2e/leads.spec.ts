@@ -95,11 +95,7 @@ test('the dashboard lists the follow-ups due, and Leads filters to them', async 
     .getByRole('button', { name: 'This year' })
     .click();
   await expect(page).toHaveURL(/\/dashboard\?period=this_year/);
-  await page.getByRole('button', { name: 'Month', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Month', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'true',
-  );
+  await expect(page.getByRole('group', { name: 'Group by' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'New leads over time' })).toBeVisible();
   await expect(page.getByRole('table', { name: 'New leads over time' })).toBeAttached();
   await page.reload();
@@ -127,8 +123,8 @@ test("the source report counts CanadaWide's internet leads per source and opens 
 }) => {
   const errors = trackErrors(page);
   await page.goto('/w/canadawide/dashboard');
-  await page.getByRole('link', { name: 'Reports' }).click();
-  await expect(page).toHaveURL(/\/w\/canadawide\/reports\/sources$/);
+  await expect(page.getByRole('link', { name: 'Reports' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'View full table' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Sources' })).toBeVisible();
 
   const period = page.getByRole('group', { name: 'Period' });
@@ -217,7 +213,13 @@ test('a lead is assigned, noted and given a task, which then shows in My tasks',
 
   await page.getByRole('link', { name: 'My tasks' }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'My tasks' })).toBeVisible();
-  await expect(page.getByText('Confirm the install window')).toBeVisible();
+  const installTask = page.getByText('Confirm the install window');
+  await expect(installTask).toBeVisible();
+  const overdue = page.locator('summary').filter({ hasText: 'Overdue' });
+  await overdue.press('Space');
+  await expect(installTask).toBeHidden();
+  await overdue.press('Space');
+  await expect(installTask).toBeVisible();
   await page.getByRole('checkbox', { name: 'Complete “Book the installer”' }).check();
   await expect(page.getByRole('checkbox', { name: 'Reopen “Book the installer”' })).toBeChecked();
 
@@ -331,6 +333,8 @@ test('SIM orders filter by permit type, sort by arrival ascending, add the Arriv
   await arrivalColumn.click();
   await expect(page).toHaveURL(/cols=arrivalDate/);
   await expect(arrivalColumn).toBeChecked();
+  // The menu sits over the column headers: close it before sorting by one.
+  await page.keyboard.press('Escape');
 
   await page.getByRole('button', { name: /Arrival in Canada/ }).click();
   await expect(page).toHaveURL(/sort=prop\.arrivalDate%3Aasc/);
@@ -372,10 +376,11 @@ test('ticked SIM orders are exported to Excel with the chosen fields, and the ch
   await page.keyboard.press('Space');
   await expect(arjun).toBeChecked();
   await expect(page).not.toHaveURL(/lead=/);
-  const bar = page.getByRole('status', { name: 'Selected leads' });
+  // The toolbar's export icon grows into the selection's actions.
+  const bar = page.getByRole('group', { name: 'Selected leads' });
   await expect(bar).toContainText('2 selected');
 
-  await bar.getByRole('button', { name: 'Export selected' }).click();
+  await bar.getByRole('button', { name: 'Export', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Export leads to Excel' });
   await expect(dialog.getByRole('radio', { name: 'Selected leads (2)' })).toBeChecked();
   await expect(
@@ -406,7 +411,7 @@ test('ticked SIM orders are exported to Excel with the chosen fields, and the ch
   await expect(page.getByText(/^Exported 2 leads to getcanadasim-leads-sim-order-/)).toBeVisible();
   // The ticks are still there, and the next export starts from the last choice.
   await expect(bar).toContainText('2 selected');
-  await page.getByRole('button', { name: 'Export', exact: true }).click();
+  await bar.getByRole('button', { name: 'Export', exact: true }).click();
   await expect(dialog.getByRole('checkbox', { name: 'Visa / permit type' })).toBeChecked();
   await dialog.getByRole('button', { name: 'Cancel' }).click();
   await expect(dialog).toBeHidden();
@@ -1218,8 +1223,9 @@ test('lead panel tabs preserve drafts and work on desktop and mobile', async ({
       height: button.getBoundingClientRect().height,
       radius: Number.parseFloat(getComputedStyle(button).borderRadius),
     }));
-    expect(dimensions.width).toBe(dimensions.height);
-    expect(dimensions.radius).toBeGreaterThanOrEqual(dimensions.width / 2);
+    // On a wide screen each is a pill that names itself beside its icon.
+    expect(dimensions.width).toBeGreaterThan(dimensions.height);
+    expect(dimensions.radius).toBeGreaterThanOrEqual(dimensions.height / 2);
   }
   await expect(page.getByLabel('Assignee', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Switch to dark mode' }).click();
@@ -1602,9 +1608,15 @@ test('loading screens show layout skeletons until their data arrives', async ({
     const table = page.getByRole('table');
     await expect(table).toHaveAttribute('aria-busy', 'true');
     await expect(table.locator('tbody tr')).toHaveCount(7);
-    expect(await table.locator('thead th').count()).toBe(
-      await table.locator('tbody tr').first().locator('td').count(),
-    );
+    // The checkbox column arrives with the caller's access, in a render of its
+    // own: two separate counts can straddle it, so compare until they agree.
+    await expect
+      .poll(async () => {
+        const head = await table.locator('thead th').count();
+        const body = await table.locator('tbody tr').first().locator('td').count();
+        return head - body;
+      })
+      .toBe(0);
     await expect(page.getByText(/Page 1 of 1 · 0 leads/)).not.toBeVisible();
     await page.screenshot({
       path: testInfo.outputPath('design-loading-leads.png'),
@@ -1638,6 +1650,11 @@ test('loading screens show layout skeletons until their data arrives', async ({
     await page.screenshot({ path: testInfo.outputPath('design-loading-board.png') });
   });
   await expect(name).toBeVisible();
+  await holdRequests(/\/workspaces\/[^/]+\/tasks(?:\?|$)/, async () => {
+    await page.goto('/w/canadawide/tasks');
+    await checkSkeleton('Loading tasks…');
+  });
+  await expect(page.getByText('Confirm the install window')).toBeVisible();
   await holdRequests(/\/email\/settings(?:\?|$)/, async () => {
     await page.goto('/w/getcanadasim/settings/email');
     await checkSkeleton('Loading the email settings…');

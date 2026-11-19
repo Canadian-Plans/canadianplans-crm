@@ -68,6 +68,7 @@ import { loadPlanForFreeze } from '../plans/store.js';
 import { findMissingDocuments } from './documents-check.js';
 import { isPlanAvailable, submittedOrder, toLeadOrder } from './order.js';
 import { planStageMove, todayInToronto, type StageMoveRefusal } from './stage-move.js';
+import { isClosingStage } from './types.js';
 import {
   iso,
   selectLeadBoard,
@@ -137,7 +138,7 @@ export type CustomerEmailOutcome =
 
 export interface QueueCustomerEmailInput extends WriteScope {
   leadId: string;
-  template: QueueCustomerEmailRequest['template'];
+  template: Extract<QueueCustomerEmailRequest, { template: unknown }>['template'];
 }
 
 export type TaskOutcome =
@@ -281,6 +282,10 @@ export interface LeadWorkStore {
     | { status: 'not_found' | 'trashed' | 'no_sender' | 'missing' | 'changed' }
   >;
   queueCustomerEmail(input: QueueCustomerEmailInput): Promise<CustomerEmailOutcome>;
+  /** Queues a message staff wrote themselves to the lead's own address. */
+  queueWrittenEmail(
+    input: WriteScope & { leadId: string; subject: string; body: string },
+  ): Promise<CustomerEmailOutcome>;
   createTask(input: CreateTaskInput): Promise<TaskOutcome>;
   updateTask(input: UpdateTaskInput): Promise<TaskOutcome>;
   listTasks(
@@ -684,25 +689,8 @@ async function editOrder(
   };
 }
 
-/**
- * The stages that close a lead as lost: the catalogue's `lost` outcome
- * stages (a SIM order's `cancelled`) and, for the types whose catalogue
- * names no outcomes, their lost, declined and closed stages. A staff move of a lead
- * the customer never submitted into one of them is no rescue (controller
- * ruling, fix round 1): the lead stays unsubmitted and no flow fires.
- */
-const CLOSING_STAGES: Readonly<Record<string, readonly string[]>> = {
-  sim_order: ['cancelled'],
-  internet: ['lost', 'non_serviceable_address'],
-  mobility: ['lost'],
-  partner_application: ['declined'],
-  contact_message: ['closed'],
-};
-
-export function isClosingStage(leadType: string, stage: string): boolean {
-  const lost = leadTypeEntry(leadType)?.outcomes?.lost.stages ?? [];
-  return lost.includes(stage) || (CLOSING_STAGES[leadType] ?? []).includes(stage);
-}
+// `isClosingStage` lives with the lead-type registry, which the lead store reads too.
+export { isClosingStage };
 
 /**
  * A rescued checkout's order, frozen as the website's submission would have
@@ -1552,7 +1540,12 @@ export class DatabaseLeadWorkStore implements LeadWorkStore {
         toAddress: lead.email.trim(),
         contactHash: this.emailEnvironment.contactHash(lead.email.trim()),
         sender: site.sender,
-        rendered: renderPlainCustomerEmail({ ...input.draft, branding: site.branding }),
+        rendered: renderPlainCustomerEmail({
+          subject: input.draft.subject,
+          body: input.draft.body,
+          branding: site.branding,
+          siteUrl: site.siteUrl,
+        }),
       });
       const queued = await queueComposedEmail(tx, {
         ...input,
@@ -1565,6 +1558,50 @@ export class DatabaseLeadWorkStore implements LeadWorkStore {
       });
       if (!queued.jobId) throw new Error('AI email queue did not return a job');
       return { status: 'queued', recordId: queued.jobId };
+    });
+  }
+
+  /** A message staff wrote in the lead's Mail tab: plain text, to the lead's own address. */
+  queueWrittenEmail(
+    input: WriteScope & { leadId: string; subject: string; body: string },
+  ): Promise<CustomerEmailOutcome> {
+    return this.database.withTenantTx(input, async (tx): Promise<CustomerEmailOutcome> => {
+      const lead = await lockLead(tx, input.workspaceId, input.leadId);
+      if (!lead) return { status: 'not_found' };
+      if (lead.trashed) return { status: 'trashed' };
+      if (!this.emailEnvironment.providerReady) return { status: 'no_sender' };
+      const site = await resolveSiteSender(tx, input.workspaceId);
+      if (!site) return { status: 'no_sender' };
+      const toAddress = customerEmailJobPayloadSchema.shape.toAddress.safeParse(lead.email?.trim());
+      if (!toAddress.success) return { status: 'missing', missing: ['customer email'] };
+      const payload = customerEmailJobPayloadSchema.parse({
+        leadId: input.leadId,
+        // A per-message custom-template transport label; never read as a saved template.
+        template: `tpl_${input.requestId.replace(/-/g, '').slice(0, 16)}`,
+        templateVersion: 0,
+        toAddress: toAddress.data,
+        contactHash: this.emailEnvironment.contactHash(toAddress.data),
+        sender: site.sender,
+        rendered: renderPlainCustomerEmail({
+          subject: input.subject,
+          body: input.body,
+          branding: site.branding,
+          siteUrl: site.siteUrl,
+        }),
+      });
+      const queued = await queueComposedEmail(tx, {
+        workspaceId: input.workspaceId,
+        actorId: input.actorId,
+        requestId: input.requestId,
+        leadId: input.leadId,
+        // One mail per request: sending again is a second, deliberate mail.
+        dedupeKey: `${input.leadId}:${input.requestId}`,
+        payload,
+        automation: null,
+        templateName: 'Written message',
+      });
+      if (!queued.activity) throw new Error('this request already queued its mail');
+      return { status: 'queued', activity: queued.activity };
     });
   }
 
@@ -1586,8 +1623,8 @@ export class DatabaseLeadWorkStore implements LeadWorkStore {
         return { status: 'missing', missing: composed.missing ?? [] };
       }
 
-      // Sent by the outbox, after this commits; the address and the mail's
-      // words live only in the job, never on the timeline or in the audit.
+      // Sent by the outbox, after this commits; the address lives only in
+      // the job, and the mail's words also on its timeline entry (Mail tab).
       const queued = await queueComposedEmail(tx, {
         workspaceId: input.workspaceId,
         actorId: input.actorId,

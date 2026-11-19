@@ -2,7 +2,7 @@
 
 Project: Supabase `gtsales-crm` (`xykrphbgpwisqacpyeiv`, Mumbai). The CRM
 owns the `app` schema. Get Canada Sim's live tables stay in `public` until
-the cutover (merge design §12); nothing here touches them.
+the cutover (docs/PLAN.md §7); nothing here touches them.
 
 ## How migrations are tracked
 
@@ -26,6 +26,33 @@ values ('<sha256 of the .sql file>', <journal "when">);
 
 Verify against the schema, not the trackers: `select … from pg_tables /
 pg_proc / pg_policies where schemaname = 'app'`.
+
+## Runtime role settings (2026-11-13)
+
+`app_runtime` carries `idle_in_transaction_session_timeout = 30s`, set by hand
+(not a migration; re-apply it on any rebuilt database):
+
+```sql
+alter role app_runtime set idle_in_transaction_session_timeout = '30s';
+select rolname, rolconfig from pg_roles where rolname = 'app_runtime';
+```
+
+Why: on 2026-11-13 a network blip between Railway and the Supabase pooler left
+all eight pooled backend connections half-open, each `idle in transaction`
+right after its `begin`. Every request then waited on them, so staff sign-in
+failed with "Invalid email or password" until the sessions were ended by hand.
+With the setting, Postgres ends such a session after 30 s and the backend's
+pool replaces it. The backend side has the matching connection timeouts
+(`RUNTIME_CONNECTION_TIMEOUTS` in `packages/db/src/index.ts`). No legitimate
+backend transaction sits idle that long: every one runs its statements back
+to back.
+
+If sign-in hangs again, check first:
+
+```sql
+select pid, now() - state_change as idle_for, left(query, 80)
+from pg_stat_activity where usename = 'app_runtime' and state = 'idle in transaction';
+```
 
 ## First install (2026-10-25)
 
@@ -127,8 +154,8 @@ pg_proc / pg_policies where schemaname = 'app'`.
 
 ## 0007_backup_reader + 0008_backup_reader_policies
 
-- The backup job's read-only login `backup_reader` (merge design spec §10,
-  [backup.md](backup.md)):
+- The backup job's read-only login `backup_reader` (merge decision 19,
+  docs/PLAN.md §1.1; [backup.md](backup.md)):
   `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS`,
   no password. It dumps with `pg_dump --enable-row-security`, so instead of
   `BYPASSRLS` or `pg_read_all_data` (both need a superuser, which Supabase's
@@ -200,8 +227,7 @@ pg_proc / pg_policies where schemaname = 'app'`.
 
 ## 0009_properties
 
-- Phase 2's property engine (docs/superpowers/plans/2026-10-29-phase-2-properties-layout-views.md),
-  generated from `packages/db/src/schema.ts`. Additive only: three new tables
+- Merge phase 2's property engine, generated from `packages/db/src/schema.ts`. Additive only: three new tables
   and one new column with a default, so it can go in before the code that
   reads them.
 - `app.properties`: a site's property definitions per `object` (`lead` now,
@@ -273,9 +299,7 @@ NULL` and its check. Record the date and the Supabase tracker versions
 
 ## 0011_plans
 
-- Phase 3's plans and order details
-  (docs/superpowers/plans/2026-10-30-phase-3-plans-stages-archive.md),
-  generated from `packages/db/src/schema.ts`. Additive: one new table and two
+- Merge phase 3's plans and order details, generated from `packages/db/src/schema.ts`. Additive: one new table and two
   new columns with constant defaults.
 - `app.plans`: a site's plans, one order lead type each. `lead_type`
   (`^[a-z0-9_]{1,64}$`), `name` (1–120 characters once trimmed),
@@ -387,9 +411,7 @@ Completed; carrier commission set to Invoiced (phase 3 migration)`, data
 
 ## 0013_order_tools
 
-- Phase 4's order tools and customer email
-  (docs/superpowers/plans/2026-10-30-phase-4-order-tools-email.md),
-  generated from `packages/db/src/schema.ts`. Additive: six new tables and
+- Merge phase 4's order tools and customer email, generated from `packages/db/src/schema.ts`. Additive: six new tables and
   one new nullable column, no data migration.
 - `app.idempotency_keys`: a website's double-submit protection. `scope`
   (`lead_submission`), `key_hash` (`^[0-9a-f]{64}$`), `request_fingerprint`
@@ -497,9 +519,7 @@ app_runtime`. The scheduler's `data_retention` run (on only with
 
 ## 0015_order_numbers
 
-- Merge phase 5, step A
-  (docs/superpowers/plans/2026-10-30-phase-5-gcs-orders-and-tracking.md),
-  generated from `packages/db/src/schema.ts`. Additive: one new table, no
+- Merge phase 5, step A, generated from `packages/db/src/schema.ts`. Additive: one new table, no
   data migration.
 - `app.site_counters`: a site's own running numbers, one row per site and
   counter. `workspace_id` (FK → workspaces, cascade), `counter` (check
@@ -558,9 +578,7 @@ app_runtime`. The scheduler's `data_retention` run (on only with
 
 ## 0017_customer_tracking
 
-- Merge phase 5, step B
-  (docs/superpowers/plans/2026-10-30-phase-5-gcs-orders-and-tracking.md),
-  generated from `packages/db/src/schema.ts`. Additive: two new tables, one
+- Merge phase 5, step B, generated from `packages/db/src/schema.ts`. Additive: two new tables, one
   new column with a constant default, three widened checks, no data
   migration.
 - `app.tracking_challenges`: one six-digit code a customer asked for on
@@ -629,7 +647,7 @@ lower(btrim(email)))`: the tracking lookups match a site's leads by the
   0018 tracker rows (both trackers) and run the paste file's verification
   selects for the prune function and the tracker rows.
 - Before applying, check that every sending site has saved Settings →
-  Email (docs/HANDOFF.md §5.1, check 1): the backend deployed after these
+  Email (docs/HANDOFF.md §5.1, the Senders check): the backend deployed after these
   migrations no longer reads `EMAIL_SENDERS_JSON`, so a site without saved
   settings stops sending customer mail at that deploy. On 2026-10-30
   production had no saved settings for either site and had sent no customer
@@ -668,10 +686,7 @@ lower(btrim(email)))`: the tracking lookups match a site's leads by the
 
 ## 0019_automation_flows
 
-- Merge phase 8, step A
-  (docs/superpowers/plans/2026-10-31-phase-8-automation-flows-step-a.md;
-  spec docs/superpowers/specs/2026-10-31-phase-8-automation-flows-design.md
-  §4), generated from `packages/db/src/schema.ts` and then reordered by hand
+- Merge phase 8, step A (automation flows), generated from `packages/db/src/schema.ts` and then reordered by hand
   before any apply (the `(workspace_id, id)` unique constraints on
   `automations` and `automation_runs` come before the composite FKs that
   reference them; `db:generate` reports no drift). Additive: every new
@@ -1036,6 +1051,133 @@ select pg_get_functiondef('app.accept_staff_invitations(text,uuid)'::regprocedur
 
 After applying, run the next nightly backup and check its row counts include
 `app.workspaces` (the backup's completeness guard compares them).
+
+## 0034_ai_conversations, 0035_ai_conversations_runtime and 0036_ai_attachment_sweep (2026-11-18, prepared, not applied)
+
+Ask AI's saved chat (docs/design/ai-chat.md). Not applied by the deploy; the
+owner applies them in order through the SQL editor (0034 and 0035 hold
+`ALTER`, 0036 holds `REVOKE`, which the Supabase tool holds for a
+confirmation prompt), then inserts the Drizzle tracker rows. The deploy and
+the migrations may go in either order: an older backend never touches the new
+tables, and its `ai_turns` insert leaves `input_tokens` to its default.
+
+Apply 0034 and 0035 only once BOTH the backend and the admin of this release
+are live, and let open admin tabs be reloaded first: the saved chat switches
+itself on when the tables appear, and the first message of a new chat carries
+`newConversation`, which this backend requires and an earlier build of the
+saved chat neither sends nor accepts. For the same reason, do not roll either
+app back to a build from before this release while the tables exist; to go
+back, switch Ask AI off (`AI_ASSISTANT_ENABLED`) instead.
+
+**0034 (generated).** Three tables, `app.ai_conversations` (a member's
+conversation; the id is chosen by the browser), `app.ai_messages` (one row per
+question and per answer) and `app.ai_attachments` (a message's files: rows
+only, the bytes in the `documents` bucket), with their checks and indexes, an
+owner policy each (`<table>_owner_policy`: site and actor, as `saved_views`
+has) and the backup login's read policy (`<table>_backup_reader_read`). The
+foreign keys to a conversation carry `actor_id`, and messages and files
+cascade from their conversation. `app.ai_turns` gets
+`input_tokens integer not null default 0` (metadata-only, no rewrite) and
+`ai_turns_counts_check` is re-added with it, which scans the table once (its
+rows of the last 90 days).
+
+**0035 (hand-written).** `FORCE ROW LEVEL SECURITY` on the three tables and
+the grants to `app_runtime`: `SELECT, INSERT, UPDATE, DELETE` on
+`ai_conversations` and `ai_attachments`, `SELECT, INSERT` only on
+`ai_messages` (a message is written once and goes only with its conversation,
+by cascade). `prune_operational_rows` is unchanged: conversations are kept
+until the member deletes them. `backup_reader` needs no grant (0007's default
+privileges).
+
+**0036 (hand-written).** `app.sweep_unsent_ai_attachments(site, before,
+limit)`, SECURITY DEFINER with an empty `search_path`, revoked from `PUBLIC`
+and executable by `app_runtime` only. For the transaction's own site, with an
+actor set, it deletes at most `limit` (1 to 1000) unsent files older than a day
+(whatever `before` says), skipping rows a turn has locked, and returns their
+bucket and key so the backend deletes the objects after the commit. The
+scheduler's `document_cleanup` task calls it.
+
+- **To apply** (owner): run the three files in order, then the tracker rows
+  (hash, `created_at`):
+  `0034_ai_conversations` `7b7abbfb41c92d94653b071f728b28b3655662e32a4c8a542696acce23354a18`, `1794971808423`;
+  `0035_ai_conversations_runtime` `de67006e751f07849a04d40045b419abd1b4822491332563c8f7c3f8b5584c2b`, `1794971816462`;
+  `0036_ai_attachment_sweep` `e1528958f575536d53c04a5d38cf392d38c8e19b3c7c4a9eac454e4f6b415f9d`, `1794974355695`.
+  (The hash is the SHA-256 of the file, `created_at` the journal's `when`.)
+- **After applying**: the backend checks the catalogue and switches the saved
+  chat on by itself within 5 minutes of 0034 and 0035, with no redeploy;
+  until then it answers as memory-only Ask AI. The sweep starts with the first
+  `document_cleanup` run after 0036. Then docs/RUNBOOKS/ai-assistant.md §12.
+- Rollback, after reverting the code, and only knowing it deletes every
+  member's stored conversations: `DROP FUNCTION
+app.sweep_unsent_ai_attachments(uuid, timestamptz, integer); DROP TABLE
+app.ai_attachments, app.ai_messages, app.ai_conversations;` and `ALTER TABLE
+app.ai_turns DROP CONSTRAINT ai_turns_counts_check, DROP COLUMN input_tokens,
+ADD CONSTRAINT ai_turns_counts_check CHECK (duration_ms >= 0 and
+output_tokens >= 0 and tool_calls >= 0 and records >= 0 and data_bytes >= 0);`.
+  The attached files' objects stay in the bucket under
+  `workspaces/<site>/ai-attachments/`. A backend that has seen the tables keeps
+  believing they exist until it restarts.
+- Verify against the schema:
+
+```sql
+select relname, relrowsecurity, relforcerowsecurity from pg_class
+ where oid in ('app.ai_conversations'::regclass, 'app.ai_messages'::regclass,
+               'app.ai_attachments'::regclass);                    -- 3 rows, true, true
+select has_table_privilege('app_runtime', 'app.ai_messages', 'update'),
+       has_table_privilege('app_runtime', 'app.ai_messages', 'delete'),
+       has_table_privilege('app_runtime', 'app.ai_attachments', 'delete');  -- false, false, true
+select polname from pg_policy where polrelid = 'app.ai_messages'::regclass;
+                                  -- ai_messages_owner_policy, ai_messages_backup_reader_read
+select column_name, column_default from information_schema.columns
+ where table_schema = 'app' and table_name = 'ai_turns' and column_name = 'input_tokens';  -- 1 row, 0
+select prosecdef, proconfig from pg_proc where proname = 'sweep_unsent_ai_attachments';    -- t, {search_path=""}
+select has_function_privilege('app_runtime',
+  'app.sweep_unsent_ai_attachments(uuid,timestamptz,integer)', 'execute');                -- true
+```
+
+## 0037_ai_effort (2026-11-18, prepared, not applied)
+
+Ask AI's effort levels (docs/design/ai-assistant.md §8). Not applied by the
+deploy; the owner applies it through the SQL editor after 0034–0036 (it holds
+`ALTER`), then inserts the Drizzle tracker row. The deploy and the migration
+may go in either order: an older backend never names the columns and its
+inserts take the defaults, and this backend runs before 0037 (below).
+
+**0037 (generated).** `app.ai_turns` gets `effort text not null default
+'normal'` with `ai_turns_effort_check` (`normal` or `high`), and
+`app.ai_messages` gets `effort text` (null for rows written before it) with
+`ai_messages_effort_check` (null, `normal` or `high`), set on both rows of a
+turn stored after it. Adding the columns is metadata-only (a constant default,
+no rewrite); each check scans its table once (`ai_turns` holds 90 days). No
+custom companion: the runtime role's table-level grants (0025 for `ai_turns`,
+0035 for `ai_messages`) cover every column of the table, and the owner and tenant policies
+are row policies, unchanged.
+
+- **To apply** (owner): run the file, then the tracker row (hash,
+  `created_at`): `0037_ai_effort`
+  `4621ff73aadcd0c0d05e26f6dffb1188d037bcbeafbb830bb2d48003d6096551`,
+  `1794983004391`.
+- **Before it is applied**: High effort works where it is switched on
+  (`AI_HIGH_EFFORT_ENABLED`); the backend leaves both columns out of its
+  inserts, a reloaded conversation shows no _High effort_ tag, and the usage
+  page counts every turn as Normal.
+- **After applying**: the backend checks the catalogue and starts writing the
+  level within 5 minutes, with no redeploy. Turns already recorded stay
+  `normal`; messages already stored stay null.
+- Rollback, after reverting the code: `ALTER TABLE app.ai_messages DROP COLUMN
+effort; ALTER TABLE app.ai_turns DROP COLUMN effort;` (the checks go with
+  their columns). Every recorded level is lost. A backend that has seen the
+  columns keeps naming them until it restarts.
+- Verify against the schema:
+
+```sql
+select table_name, column_default, is_nullable from information_schema.columns
+ where table_schema = 'app' and column_name = 'effort'
+   and table_name in ('ai_turns', 'ai_messages') order by table_name;
+                                  -- ai_messages, null, YES; ai_turns, 'normal'::text, NO
+select conname from pg_constraint
+ where conname in ('ai_turns_effort_check', 'ai_messages_effort_check');      -- 2 rows
+```
 
 ## Historical CanadaWide import (2026-10-27)
 

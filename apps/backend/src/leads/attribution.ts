@@ -10,8 +10,8 @@ const REFERRER_HOST_MAX = 253;
 const LANDING_PATH_MAX = 512;
 
 /**
- * Referrer origins whose traffic is attributed by hostname (REQ 35 "approved
- * referrer origins"). Anything else — including the raw URL, its query
+ * Referrer origins whose traffic is attributed by hostname (the approved
+ * referrer origins). Anything else — including the raw URL, its query
  * string or any embedded token — is reduced to its hostname. Extend this list
  * as new paid/organic channels are added; it is intentionally small at launch.
  */
@@ -20,17 +20,31 @@ const APPROVED_REFERRER_HOSTS = new Set([
   'www.google.com',
   'bing.com',
   'www.bing.com',
+  'duckduckgo.com',
+  'search.yahoo.com',
+  'ca.search.yahoo.com',
   'facebook.com',
+  'www.facebook.com',
+  'web.facebook.com',
   'm.facebook.com',
+  // Meta's link shims: what a click out of the Facebook or Instagram app reports.
   'l.facebook.com',
+  'lm.facebook.com',
   'instagram.com',
+  'www.instagram.com',
+  'l.instagram.com',
   'tiktok.com',
+  'www.tiktok.com',
   'youtube.com',
+  'www.youtube.com',
+  'm.youtube.com',
+  'linkedin.com',
+  'www.linkedin.com',
   't.co',
 ]);
 
 /**
- * Known landing-route templates (REQ 35 "known landing-route templates").
+ * Known landing-route templates.
  * A submitted path is reduced to its bare path (query string, fragment and
  * any token stripped first) and must fully match one of these before it is
  * stored; anything else — an arbitrary raw path — is dropped. Extend this
@@ -38,7 +52,7 @@ const APPROVED_REFERRER_HOSTS = new Set([
  */
 const LANDING_ROUTE_TEMPLATES: readonly RegExp[] = [
   /^\/$/,
-  /^\/(?:order|plans|privacy|terms|track)$/,
+  /^\/(?:order|plans|privacy|terms|track|mobility|plan)$/,
   /^\/plans\/[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/,
 ];
 
@@ -88,7 +102,7 @@ function sanitizeLandingPath(value: unknown): string | undefined {
 
 /**
  * Reduces arbitrary submitted attribution to the bounded, allowlisted shape
- * that is ever persisted (REQ 35). Never throws: an unrecognized field,
+ * that is ever persisted. Never throws: an unrecognized field,
  * overlong value, unapproved referrer, or unrecognized landing path is
  * silently dropped rather than failing the request. `partnerCode` itself is
  * always kept verbatim when present and bounded — whether it resolves to an

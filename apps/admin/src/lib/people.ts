@@ -1,6 +1,8 @@
 import { LEGACY_IMPORT_ACTOR_ID, type AssignableMember } from '@canadian-plans/contracts';
 import type { StaffRoleName } from '@canadian-plans/types';
 
+export const STAFF_DISPLAY_NAME_CHANGED = 'crm:staff-display-name-changed';
+
 /**
  * How staff appear to each other: the name a member chose for themselves
  * (Settings → Your name), or their role until they choose one. The members

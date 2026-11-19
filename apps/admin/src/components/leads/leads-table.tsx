@@ -2,18 +2,34 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
+  allowedStageMoves,
   leadCountdownField,
+  leadStageLabel,
   leadTypeLabel,
+  stageGates,
   type AssignableMember,
   type LeadListItem,
   type LeadTableColumn,
   type PropertyCatalog,
 } from '@canadian-plans/contracts';
-import { Button, Checkbox, cn } from '@canadian-plans/ui';
+import {
+  Button,
+  Checkbox,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from '@canadian-plans/ui';
+import { ChevronDownIcon } from 'lucide-react';
 
-import { getStaffLeads } from '../../lib/api';
+import { getStaffLeads, updateStaffLead } from '../../lib/api';
+import { notifyLeadWorkSaved } from '../../lib/lead-work-events';
+import { errorReason, useResource } from '../../lib/use-resource';
+import { stageMoveRefusal } from './stage-move-dialog';
 import {
   dateTimeLabel,
   dayLabel,
@@ -22,12 +38,19 @@ import {
   relativeTime,
   todayDay,
 } from '../../lib/dates';
-import { assigneeName } from '../../lib/people';
-import { useResource } from '../../lib/use-resource';
+import { assigneeName, memberName } from '../../lib/people';
+import { describeError } from '../../lib/error-text';
 import { PropertyValueText } from '../properties/property-value';
 import type { InboxQuery } from './inbox-query';
 import { TableRowsSkeleton } from '../crm/loading-skeleton';
-import { CountdownLabel, leadDisplayName, NewBadge, PersonChip, StageBadge } from './lead-display';
+import {
+  CountdownLabel,
+  leadDisplayName,
+  leadNameWeight,
+  NewBadge,
+  PersonChip,
+  StageBadge,
+} from './lead-display';
 import { propertyColumnLabel, propertyColumnProperty } from './lead-fields';
 import { readableSource } from '../../lib/source-label';
 
@@ -71,6 +94,13 @@ export interface LeadSelection {
 export const NO_LEAD_SELECTION: LeadSelection = { selected: new Set(), allMatching: false };
 
 const countFormat = new Intl.NumberFormat('en-CA');
+/** A menu renders in a portal, but its clicks still bubble to the row in React: stop them there. */
+const stopRowClick = (event: { stopPropagation(): void }) => event.stopPropagation();
+/** A cell's value as a quiet menu button: the arrow shows on hover and focus. */
+const QUICK_TRIGGER =
+  'group/quick -mx-1.5 inline-flex max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60';
+const QUICK_CHEVRON =
+  'size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/quick:opacity-100 group-focus-visible/quick:opacity-100 group-data-[state=open]/quick:opacity-100';
 
 export function cycleLeadSort(currentSort: string | undefined, field: string): string | undefined {
   if (currentSort === `${field}:asc`) return `${field}:desc`;
@@ -146,6 +176,7 @@ export function LeadsTable({
   selection,
   onSelectionChange,
   selectionActions,
+  selectionBar = true,
   onLoaded,
 }: {
   workspaceSlug: string;
@@ -176,8 +207,13 @@ export function LeadsTable({
   onSelectionChange?(next: LeadSelection): void;
   /** What can be done with the ticked leads, shown beside their count. */
   selectionActions?: ReactNode;
-  /** Told how many leads match the filters, each time a page arrives. */
-  onLoaded?(info: { total: number }): void;
+  /**
+   * False when the parent shows the count and actions itself (the inbox does,
+   * in its toolbar), so ticking a row does not push the table down.
+   */
+  selectionBar?: boolean;
+  /** Told how many leads match the filters, and which are on the page, each time a page arrives. */
+  onLoaded?(info: { total: number; rowIds: readonly string[] }): void;
 }) {
   const router = useRouter();
   const load = useMemo(
@@ -224,14 +260,18 @@ export function LeadsTable({
     seenToken.current = reloadToken;
     void reload();
   }, [reloadToken, reload]);
-  const loadedTotal = leads.data?.page.total;
+  const loadedPage = leads.data;
   const reportLoaded = useRef(onLoaded);
   useEffect(() => {
     reportLoaded.current = onLoaded;
   }, [onLoaded]);
   useEffect(() => {
-    if (loadedTotal !== undefined) reportLoaded.current?.({ total: loadedTotal });
-  }, [loadedTotal]);
+    if (loadedPage)
+      reportLoaded.current?.({
+        total: loadedPage.page.total,
+        rowIds: loadedPage.leads.map((lead) => lead.id),
+      });
+  }, [loadedPage]);
   const rows = leads.data?.leads ?? [];
   const page = leads.data?.page ?? { page: query.page, pageSize: PAGE_SIZE, total: 0 };
   const pages = Math.max(1, Math.ceil(page.total / page.pageSize));
@@ -264,6 +304,36 @@ export function LeadsTable({
     'activity',
   ];
   const selecting = selection !== undefined && onSelectionChange !== undefined;
+
+  // Stage and assignee change in place for whoever manages leads (not in the archive).
+  const canQuickEdit = leads.data?.access.manage === true && !query.archived;
+  const [quickBusy, setQuickBusy] = useState<string>();
+  const [quickMessage, setQuickMessage] = useState<string>();
+  async function quickUpdate(
+    lead: LeadListItem,
+    body: { stage: string } | { assignedActorId: string | null },
+  ) {
+    setQuickBusy(lead.id);
+    setQuickMessage(undefined);
+    try {
+      await updateStaffLead(accessToken, workspaceId, lead.id, body);
+      notifyLeadWorkSaved(workspaceId, lead.id);
+      await leads.reload();
+    } catch (error) {
+      const refusal =
+        'stage' in body
+          ? stageMoveRefusal(errorReason(error), lead.leadType, lead.stage)
+          : undefined;
+      setQuickMessage(refusal ?? describeError(error, 'save the change'));
+    } finally {
+      setQuickBusy(undefined);
+    }
+  }
+  function quickStage(lead: LeadListItem, to: string) {
+    // A move that asks for details or documents is made on the lead itself.
+    if (stageGates(lead.leadType, to).length > 0) openLead(lead);
+    else void quickUpdate(lead, { stage: to });
+  }
   const isTicked = (leadId: string) =>
     selecting && (selection.allMatching || selection.selected.has(leadId));
   const tickedOnPage = rows.filter((lead) => isTicked(lead.id)).length;
@@ -299,7 +369,7 @@ export function LeadsTable({
   if (leads.error) {
     return (
       <p role="alert" className="py-10 text-center text-sm text-muted-foreground">
-        Could not load leads. Reason: {leads.error}.{' '}
+        {describeError(leads.failure, 'load the leads')}{' '}
         <button type="button" className="underline" onClick={() => void leads.reload()}>
           Try again
         </button>
@@ -314,7 +384,7 @@ export function LeadsTable({
           Loading leads…
         </span>
       ) : null}
-      {selecting && tickedCount > 0 ? (
+      {selectionBar && selecting && tickedCount > 0 ? (
         <div
           role="status"
           aria-label="Selected leads"
@@ -343,6 +413,11 @@ export function LeadsTable({
           </button>
           {selectionActions ? <span className="ml-auto flex gap-2">{selectionActions}</span> : null}
         </div>
+      ) : null}
+      {quickMessage ? (
+        <p role="alert" className="text-sm text-destructive">
+          {quickMessage}
+        </p>
       ) : null}
       <div className="overflow-x-auto rounded-lg border">
         <table className="w-full min-w-[880px] text-sm" aria-busy={initialLoading || leads.loading}>
@@ -507,7 +582,10 @@ export function LeadsTable({
                         <Link
                           href={leadHref(lead)}
                           data-lead-id={lead.id}
-                          className="min-w-0 truncate font-medium text-foreground hover:underline"
+                          className={cn(
+                            'min-w-0 truncate text-foreground hover:underline',
+                            leadNameWeight(lead.isNew),
+                          )}
                           onClick={(event) => {
                             // A plain click opens the panel; a modifier-click opens a tab.
                             if (!panel || event.button !== 0) return;
@@ -534,13 +612,80 @@ export function LeadsTable({
                       </td>
                     )}
                     {showCol('stage') ? (
-                      <td className={CELL}>
-                        <StageBadge leadType={lead.leadType} stage={lead.stage} />
+                      <td className={CELL} {...(canQuickEdit ? { 'data-row-select': true } : {})}>
+                        {canQuickEdit && allowedStageMoves(lead.leadType, lead.stage).length > 0 ? (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              disabled={quickBusy === lead.id}
+                              aria-label={`Change stage of ${leadDisplayName(lead.contact)}, now ${leadStageLabel(lead.leadType, lead.stage)}`}
+                              className={QUICK_TRIGGER}
+                            >
+                              <StageBadge leadType={lead.leadType} stage={lead.stage} />
+                              <ChevronDownIcon aria-hidden="true" className={QUICK_CHEVRON} />
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="start" onClick={stopRowClick}>
+                              <DropdownMenuLabel>Move to</DropdownMenuLabel>
+                              {allowedStageMoves(lead.leadType, lead.stage).map((to) => (
+                                <DropdownMenuItem key={to} onSelect={() => quickStage(lead, to)}>
+                                  {leadStageLabel(lead.leadType, to)}
+                                  {stageGates(lead.leadType, to).length > 0 ? (
+                                    <span className="ml-auto pl-3 text-xs text-muted-foreground">
+                                      asks for details
+                                    </span>
+                                  ) : null}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        ) : (
+                          <StageBadge leadType={lead.leadType} stage={lead.stage} />
+                        )}
                       </td>
                     ) : null}
                     {showCol('assignee') ? (
-                      <td className={cn(CELL, 'max-w-[180px]')}>
-                        {assignee ? (
+                      <td
+                        className={cn(CELL, 'max-w-[180px]')}
+                        {...(canQuickEdit ? { 'data-row-select': true } : {})}
+                      >
+                        {canQuickEdit ? (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              disabled={quickBusy === lead.id}
+                              aria-label={`Change assignee of ${leadDisplayName(lead.contact)}, now ${assignee ?? 'unassigned'}`}
+                              className={QUICK_TRIGGER}
+                            >
+                              {assignee ? (
+                                <PersonChip name={assignee} size="xs" />
+                              ) : (
+                                <span className="text-muted-foreground">Unassigned</span>
+                              )}
+                              <ChevronDownIcon aria-hidden="true" className={QUICK_CHEVRON} />
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="start" onClick={stopRowClick}>
+                              <DropdownMenuLabel>Assign to</DropdownMenuLabel>
+                              {lead.assignedActorId !== null ? (
+                                <DropdownMenuItem
+                                  onSelect={() => void quickUpdate(lead, { assignedActorId: null })}
+                                >
+                                  Unassigned
+                                </DropdownMenuItem>
+                              ) : null}
+                              {members
+                                .filter((member) => member.actorId !== lead.assignedActorId)
+                                .map((member) => (
+                                  <DropdownMenuItem
+                                    key={member.actorId}
+                                    onSelect={() =>
+                                      void quickUpdate(lead, { assignedActorId: member.actorId })
+                                    }
+                                  >
+                                    {memberName(member)}
+                                    {member.isSelf ? ' (you)' : ''}
+                                  </DropdownMenuItem>
+                                ))}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        ) : assignee ? (
                           <PersonChip name={assignee} size="xs" />
                         ) : (
                           <span className="text-muted-foreground">—</span>

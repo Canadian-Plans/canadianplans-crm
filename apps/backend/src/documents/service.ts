@@ -22,7 +22,7 @@ import type { DocumentRecordStore, FileRow, StaffFileRow } from './store.js';
 
 /**
  * Resolves the commercial context a document needs: the allowed checklist types
- * for a parent record (so an off-checklist upload is refused — REQ 23) and,
+ * for a parent record (so an off-checklist upload is refused) and,
  * for the admin panel, the lead a submitted order came from. `found: false`
  * means the parent is not in this workspace, which is how a foreign or unknown
  * attachment id is rejected without leaking its existence.
@@ -113,8 +113,7 @@ export type ImportWebsiteDocumentOutcome =
 /**
  * Consulted by `runCleanup` so expired-upload sweeps cannot physically delete
  * an R2 object while the independent backup runner's referenced-object
- * manifest or copy step is in flight (IMPLEMENTATION_PLAN §13: "Prevent object
- * cleanup racing the archive with a snapshot reference set and lease."). The
+ * manifest or copy step is in flight. The
  * default no-op keeps every existing caller and test behaviour unchanged.
  */
 export interface BackupLeaseGate {
@@ -135,7 +134,7 @@ export interface DocumentServiceOptions {
 
 /**
  * Orchestrates the secure upload/verify/attach/download lifecycle. All external
- * R2 work happens outside any DB transaction/row lock (invariant 7); the store's
+ * R2 work happens outside any DB transaction/row lock; the store's
  * conditional updates provide the concurrency and idempotency guarantees.
  */
 export class DocumentService {
@@ -311,7 +310,7 @@ export class DocumentService {
    * passports, approval letters, SIM photos…) onto the lead it belongs to:
    * verified like an upload (size, signature, its own checksum), then current
    * for its type, shown as from the old admin. Storage work runs outside any
-   * transaction (invariant 7); a copy nothing records is removed again.
+   * transaction; a copy nothing records is removed again.
    */
   async importWebsiteDocument(
     input: ImportWebsiteDocumentInput,
@@ -381,8 +380,7 @@ export class DocumentService {
   /**
    * Copies an available file's verified object into another bucket at an exact
    * key: the transitional copy of an ID photo into the old admin's bucket
-   * (migrations 0005–0006). Storage work, so never inside a transaction
-   * (invariant 7).
+   * (migrations 0005–0006). Storage work, so never inside a transaction.
    */
   async copyAvailableToBucket(input: {
     workspaceId: string;
@@ -437,7 +435,7 @@ export class DocumentService {
       disposition,
     });
     // Audited after the presign, in its own short transaction: no external
-    // call ever runs inside a tenant transaction (invariant 7).
+    // call ever runs inside a tenant transaction.
     await this.store.recordDownloadIssued({
       workspaceId: input.workspaceId,
       actorId: input.actorId,

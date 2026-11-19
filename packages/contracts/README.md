@@ -1,8 +1,9 @@
 # @canadian-plans/contracts
 
-Zod request/response schemas, the error envelope, generated OpenAPI (added
-later), the typed API client, and browser-safe CMS schema definitions under
-an explicit `cms` export.
+Zod request/response schemas, the error envelope, the endpoint registry
+(`src/endpoints.ts`), the typed API client, and the OpenAPI generator
+(`pnpm --filter @canadian-plans/contracts build` writes `docs/api/openapi.json`,
+which CI diffs).
 
 ## Single responsibility
 
@@ -13,7 +14,7 @@ re-declaring it.
 ## Must never import
 
 - `@canadian-plans/db` — DB row types are not API response types
-  (PLATFORM_CONTEXT.md §4 invariant 14). Contracts expose only the fields
+  (docs/PLAN.md §3, rule 10). Contracts expose only the fields
   each audience is allowed to see.
 - `@canadian-plans/adapters` or any provider SDK/secret — this package is
   bundled into the browser.

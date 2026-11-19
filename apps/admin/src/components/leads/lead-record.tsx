@@ -8,6 +8,7 @@ import {
   leadOrderEditSchema,
   orderStorageKey,
   isActiveTaskStatus,
+  leadCountdownField,
   leadTypeEntry,
   leadTypeLabel,
   stageGates,
@@ -35,6 +36,9 @@ import {
 } from '@canadian-plans/ui';
 import {
   ArchiveIcon,
+  ChevronDownIcon,
+  MailIcon,
+  PhoneIcon,
   ArrowLeftIcon,
   CopyIcon,
   FilesIcon,
@@ -43,7 +47,6 @@ import {
   ListTodoIcon,
   StickyNoteIcon,
   RotateCcwIcon,
-  UserRoundIcon,
 } from 'lucide-react';
 
 import {
@@ -56,19 +59,21 @@ import {
   setLeadArchived,
   updateStaffLead,
 } from '../../lib/api';
-import { dateTimeLabel, relativeTime } from '../../lib/dates';
+import { dateTimeLabel, dayLabel, followUpLabel, relativeTime } from '../../lib/dates';
 import { downloadNavigation } from '../../lib/file-links';
 import { memberName } from '../../lib/people';
+import { describeError } from '../../lib/error-text';
 import { errorDetailList, errorReason, useResource } from '../../lib/use-resource';
 import { PropertySections } from '../properties/property-sections';
 import { usePropertyModel } from '../properties/use-property-model';
 import { ChangeRequestCard } from './change-request-card';
-import { leadDisplayName, StageBadge } from './lead-display';
+import { CountdownLabel, leadDisplayName, StageBadge } from './lead-display';
 import { IdentityCheck } from './identity-check';
 import { LeadDocuments, linkFailure } from './lead-documents';
 import type { PropertyEdits } from './lead-form-editor';
 import { leadSummaryText } from './lead-summary';
 import { LeadAttentionStrip, leadAttention, type LeadAttentionTarget } from './lead-attention';
+import { LeadMail } from './lead-mail';
 import { LeadTasks } from './lead-tasks';
 import { changeRequestText, LeadTimeline, pendingChangeRequest } from './lead-timeline';
 import { RelatedRequests } from './related-requests';
@@ -89,6 +94,33 @@ const ATTRIBUTION_LABELS: Record<string, string> = {
   landingPath: 'Landing page',
   referrerHost: 'Referrer',
 };
+
+/** Up to two initials for the avatar; a dot when there is no name to draw from. */
+function initials(name: string): string {
+  const letters = name
+    .split(/\s+/)
+    .map((part) => Array.from(part)[0] ?? '')
+    .filter((letter) => /\p{L}/u.test(letter));
+  if (letters.length === 0) return '·';
+  return (letters.length === 1 ? letters : [letters[0], letters[letters.length - 1]])
+    .join('')
+    .toUpperCase();
+}
+
+/** `not_needed` as staff read it: "Not needed". */
+function words(value: string): string {
+  const text = value.replace(/_/g, ' ');
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/**
+ * The details as one card: each section keeps its heading and Edit, divided by
+ * a rule instead of standing as a card of its own.
+ */
+const DETAILS_SIDEBAR =
+  'flex min-w-0 flex-col divide-y overflow-hidden rounded-xl border bg-card shadow-sm ' +
+  '[&_[data-slot=card]]:rounded-none [&_[data-slot=card]]:border-0 [&_[data-slot=card]]:bg-transparent [&_[data-slot=card]]:shadow-none ' +
+  '[&_.flex.flex-col.gap-4]:gap-0 [&_.flex.flex-col.gap-4]:divide-y';
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -273,7 +305,11 @@ export function LeadRecord({
         <Title className="text-xl font-semibold">
           {record.error === 'lead_not_found' ? 'Lead not found' : 'The lead could not be loaded'}
         </Title>
-        <p className="text-sm text-muted-foreground">Reason: {record.error}.</p>
+        <p className="text-sm text-muted-foreground">
+          {record.error === 'lead_not_found'
+            ? 'This lead no longer exists, or it is on another site. Go back to the leads list and reload it.'
+            : describeError(record.failure, 'load the lead')}
+        </p>
         {inPanel ? null : (
           <Link href={`/w/${workspaceSlug}/leads`} className="text-sm underline">
             Back to leads
@@ -366,7 +402,7 @@ export function LeadRecord({
       const code = errorReason(error);
       const refusal =
         body.stage === undefined ? undefined : stageMoveRefusal(code, lead.leadType, lead.stage);
-      setMessage(refusal ?? `The change was not saved. Reason: ${code}.`);
+      setMessage(refusal ?? describeError(error, 'save the change'));
       return undefined;
     } finally {
       setSaving(false);
@@ -436,8 +472,14 @@ export function LeadRecord({
       tab.show(link.url);
     } catch (error) {
       tab.close();
-      throw new Error(linkFailure(errorReason(error)));
+      throw new Error(linkFailure(error));
     }
+  }
+
+  /** An inline link for a change request document's thumbnail on its card. */
+  async function previewRequestDocument(fileId: string): Promise<string> {
+    if (!accessToken || !workspaceId) throw new Error('signed out');
+    return (await createFileDownloadLink(accessToken, workspaceId, fileId, 'inline')).url;
   }
 
   async function reviewed() {
@@ -477,7 +519,7 @@ export function LeadRecord({
       }
       return undefined;
     } catch (error) {
-      return `The change was not saved. Reason: ${errorReason(error)}.`;
+      return describeError(error, 'save the change');
     }
   }
 
@@ -486,7 +528,9 @@ export function LeadRecord({
     setSimEmail('sending');
     setSimEmailMessage(undefined);
     try {
-      const result = await emailLeadCustomer(accessToken, workspaceId, leadId, 'sim_number_ready');
+      const result = await emailLeadCustomer(accessToken, workspaceId, leadId, {
+        template: 'sim_number_ready',
+      });
       addActivities([result.activity]);
       setSimEmail('sent');
     } catch (error) {
@@ -502,8 +546,27 @@ export function LeadRecord({
             : reason === 'conflict'
               ? 'The order needs the customer’s email address and a SIM number first.'
               : reason === 'feature_not_ready'
-                ? 'Emailing customers is not set up for this site yet.'
-                : `The email was not sent. Reason: ${reason}.`,
+                ? 'Emailing customers is not set up for this site yet. Ask the owner to set up Settings → Email.'
+                : describeError(error, 'send the email'),
+      );
+    }
+  }
+
+  /** A message written in the Mail tab; throws the words to show when it cannot go. */
+  async function sendWrittenMail(mail: { subject: string; body: string }) {
+    if (!accessToken || !workspaceId) throw new Error('Sign in again to send email.');
+    try {
+      const result = await emailLeadCustomer(accessToken, workspaceId, leadId, mail);
+      addActivities([result.activity]);
+    } catch (error) {
+      const reason = errorReason(error);
+      throw new Error(
+        reason === 'conflict'
+          ? 'The customer has no usable email address.'
+          : reason === 'feature_not_ready'
+            ? 'Emailing customers is not set up for this site yet. Ask the owner to set up Settings → Email.'
+            : describeError(error, 'send the email'),
+        { cause: error },
       );
     }
   }
@@ -538,9 +601,7 @@ export function LeadRecord({
         activities: result.activity ? [result.activity, ...current.activities] : current.activities,
       }));
     } catch (error) {
-      setMessage(
-        `The lead was not ${archived ? 'archived' : 'restored'}. Reason: ${errorReason(error)}.`,
-      );
+      setMessage(describeError(error, archived ? 'archive the lead' : 'restore the lead'));
     } finally {
       setSaving(false);
     }
@@ -581,6 +642,72 @@ export function LeadRecord({
     changeRequestNo: record.data.changeRequest?.requestNo,
     contacts: access.contacts,
   });
+  // The handful of facts staff look for first, drawn from what is recorded.
+  const countdownField = leadCountdownField(lead.leadType);
+  const countdownDay =
+    countdownField && typeof payload[countdownField.key] === 'string'
+      ? String(payload[countdownField.key])
+      : undefined;
+  const planName =
+    lead.order?.plan?.name ?? (typeof payload.plan === 'string' ? payload.plan : undefined);
+  const nextTask = tasks
+    .filter((task) => isActiveTaskStatus(task.status) && task.dueAt !== null)
+    .sort((a, b) => (a.dueAt ?? '').localeCompare(b.dueAt ?? ''))[0];
+  const openTaskCount = tasks.filter((task) => isActiveTaskStatus(task.status)).length;
+  const unreviewed = documents.filter((document) => document.review === null).length;
+  const keyFacts: { label: string; value: ReactNode }[] = access.contacts
+    ? [
+        ...(planName ? [{ label: 'Plan', value: planName }] : []),
+        ...(countdownField && countdownDay
+          ? [
+              {
+                label: countdownField.label,
+                value: (
+                  <>
+                    {dayLabel(countdownDay)} <CountdownLabel day={countdownDay} />
+                  </>
+                ),
+              },
+            ]
+          : []),
+        ...(lead.order ? [{ label: 'Payment', value: words(lead.order.paymentStatus) }] : []),
+        ...(documents.length > 0
+          ? [
+              {
+                label: 'Documents',
+                value: unreviewed > 0 ? `${String(unreviewed)} to review` : 'All reviewed',
+              },
+            ]
+          : []),
+        {
+          label: 'Next task',
+          value: nextTask?.dueAt
+            ? followUpLabel(nextTask.dueAt)
+            : openTaskCount > 0
+              ? `${String(openTaskCount)} open, no due date`
+              : 'None',
+        },
+        { label: 'Source', value: readableSource(lead.source) },
+      ]
+    : [];
+  const keyFactsRow =
+    keyFacts.length > 1 ? (
+      <dl
+        role="group"
+        aria-label="Key facts"
+        className={cn(
+          'grid gap-px overflow-hidden rounded-lg border bg-border text-sm',
+          inPanel ? 'grid-cols-2' : 'grid-cols-2 sm:grid-cols-3 xl:grid-cols-6',
+        )}
+      >
+        {keyFacts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-card px-3 py-2">
+            <dt className="text-xs text-muted-foreground">{fact.label}</dt>
+            <dd className="truncate font-medium">{fact.value}</dd>
+          </div>
+        ))}
+      </dl>
+    ) : null;
   const anchorId = (target: LeadAttentionTarget) => `lead-${lead.id}-${target}`;
   // In the panel a card may sit on another tab: open it first, then scroll
   // once that tab has rendered. Focus moves to the card for keyboard users.
@@ -602,6 +729,8 @@ export function LeadRecord({
       </div>
     ) : null;
 
+  const activeTab = !access.contacts && panelTab !== 'files' ? 'home' : panelTab;
+  const showOverview = !inPanel || activeTab === 'home';
   const header = (
     <div
       className={cn('flex flex-col gap-4', !inPanel && 'rounded-2xl border bg-card p-5 md:p-6')}
@@ -616,15 +745,16 @@ export function LeadRecord({
           leads
         </Link>
       )}
-      <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
-        {!inPanel ? (
-          <span
-            className="flex size-12 items-center justify-center rounded-full border bg-muted/60"
-            aria-hidden="true"
-          >
-            <UserRoundIcon className="size-5 text-muted-foreground" />
-          </span>
-        ) : null}
+      <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
+        <span
+          className={cn(
+            'flex shrink-0 items-center justify-center rounded-full bg-primary/10 font-semibold text-primary',
+            inPanel ? 'size-10 text-sm' : 'size-12 text-base',
+          )}
+          aria-hidden="true"
+        >
+          {initials(leadDisplayName(lead.contact))}
+        </span>
         <div className="min-w-0 flex-1">
           <Title
             className={cn(
@@ -651,82 +781,113 @@ export function LeadRecord({
             </span>
           </div>
         </div>
-        <div className={cn('grid w-full grid-cols-2 gap-3', !inPanel && 'sm:max-w-md')}>
-          {canWrite ? (
-            <>
-              <label className="flex min-w-0 flex-col gap-1.5">
-                <span className="text-xs font-medium text-muted-foreground">Stage</span>
-                <NativeSelect
-                  value={lead.stage}
-                  disabled={saving}
-                  onChange={(event) => changeStage(event.target.value)}
-                >
-                  {stageListed ? null : <option value={lead.stage}>{lead.stage}</option>}
-                  {stageChoices.map((entry) => (
-                    <option key={entry.key} value={entry.key}>
-                      {entry.label}
-                    </option>
-                  ))}
-                </NativeSelect>
-              </label>
-              <label className="flex min-w-0 flex-col gap-1.5">
-                <span className="text-xs font-medium text-muted-foreground">Assignee</span>
-                <NativeSelect
-                  value={lead.assignedActorId ?? ''}
-                  disabled={saving}
-                  onChange={(event) => void update({ assignedActorId: event.target.value || null })}
-                >
-                  <option value="">Unassigned</option>
-                  {self ? <option value={self.actorId}>{memberName(self)} (you)</option> : null}
-                  {members
-                    .filter((member) => !member.isSelf)
-                    .map((member) => (
-                      <option key={member.actorId} value={member.actorId}>
-                        {memberName(member)}
-                      </option>
-                    ))}
-                  {lead.assignedActorId &&
-                  !members.some((member) => member.actorId === lead.assignedActorId) ? (
-                    <option value={lead.assignedActorId}>Former teammate</option>
-                  ) : null}
-                </NativeSelect>
-              </label>
-            </>
-          ) : (
-            <StageBadge leadType={lead.leadType} stage={lead.stage} />
-          )}
-        </div>
-        <div className="flex w-full flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
+        <div
+          className={cn('flex flex-wrap items-center gap-2', inPanel ? 'w-full' : 'justify-end')}
+        >
+          {access.contacts && lead.contact.email ? (
+            <Button asChild variant="outline" size="sm">
+              <a href={`mailto:${lead.contact.email}`}>
+                <MailIcon className="size-4" aria-hidden="true" /> Email
+              </a>
+            </Button>
+          ) : null}
+          {access.contacts && lead.contact.phone ? (
+            <Button asChild variant="outline" size="sm">
+              <a href={`tel:${lead.contact.phone}`}>
+                <PhoneIcon className="size-4" aria-hidden="true" /> Call
+              </a>
+            </Button>
+          ) : null}
           {access.contacts ? (
             <Button type="button" variant="outline" size="sm" onClick={() => void copySummary()}>
               <CopyIcon className="size-4" aria-hidden="true" /> {copied ? 'Copied' : 'Copy info'}
             </Button>
           ) : null}
-          {access.manage ? (
-            lead.deletedAt === null ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="ml-auto text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                disabled={saving}
-                onClick={() => void setArchived(true)}
-              >
-                <ArchiveIcon className="size-4" aria-hidden="true" /> Archive
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                size="sm"
-                disabled={saving}
-                onClick={() => void setArchived(false)}
-              >
-                <RotateCcwIcon className="size-4" aria-hidden="true" /> Restore
-              </Button>
-            )
-          ) : null}
+          <span className={inPanel ? 'ml-auto' : undefined}>
+            {access.manage ? (
+              lead.deletedAt === null ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+                  disabled={saving}
+                  onClick={() => void setArchived(true)}
+                >
+                  <ArchiveIcon className="size-4" aria-hidden="true" /> Archive
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={saving}
+                  onClick={() => void setArchived(false)}
+                >
+                  <RotateCcwIcon className="size-4" aria-hidden="true" /> Restore
+                </Button>
+              )
+            ) : null}
+          </span>
         </div>
       </div>
+      {showOverview ? (
+        <>
+          <div
+            className={cn(
+              'grid grid-cols-2 gap-3 rounded-lg border bg-muted/30 p-3',
+              !inPanel && 'sm:max-w-xl',
+            )}
+          >
+            {canWrite ? (
+              <>
+                <label className="flex min-w-0 flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">Stage</span>
+                  <NativeSelect
+                    value={lead.stage}
+                    disabled={saving}
+                    onChange={(event) => changeStage(event.target.value)}
+                  >
+                    {stageListed ? null : <option value={lead.stage}>{lead.stage}</option>}
+                    {stageChoices.map((entry) => (
+                      <option key={entry.key} value={entry.key}>
+                        {entry.label}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                </label>
+                <label className="flex min-w-0 flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">Assignee</span>
+                  <NativeSelect
+                    value={lead.assignedActorId ?? ''}
+                    disabled={saving}
+                    onChange={(event) =>
+                      void update({ assignedActorId: event.target.value || null })
+                    }
+                  >
+                    <option value="">Unassigned</option>
+                    {self ? <option value={self.actorId}>{memberName(self)} (you)</option> : null}
+                    {members
+                      .filter((member) => !member.isSelf)
+                      .map((member) => (
+                        <option key={member.actorId} value={member.actorId}>
+                          {memberName(member)}
+                        </option>
+                      ))}
+                    {lead.assignedActorId &&
+                    !members.some((member) => member.actorId === lead.assignedActorId) ? (
+                      <option value={lead.assignedActorId}>Former teammate</option>
+                    ) : null}
+                  </NativeSelect>
+                </label>
+              </>
+            ) : (
+              <StageBadge leadType={lead.leadType} stage={lead.stage} />
+            )}
+          </div>
+          {keyFactsRow}
+          <LeadAttentionStrip items={attention} onJump={jumpTo} />
+        </>
+      ) : null}
       {lead.deletedAt ? (
         <p
           role="status"
@@ -736,7 +897,6 @@ export function LeadRecord({
           again.
         </p>
       ) : null}
-      <LeadAttentionStrip items={attention} onJump={jumpTo} />
       {waitingChange ? (
         <p
           role="status"
@@ -957,21 +1117,30 @@ export function LeadRecord({
 
   const sourceSection = (
     <Card>
-      <CardContent className="flex flex-col gap-2">
-        <h2 className="text-base font-semibold">Source</h2>
-        <dl>
-          <Field label="Source">
-            <span title={lead.source}>{readableSource(lead.source)}</span>
-          </Field>
-          {attribution.map(([key, value]) => (
-            <Field key={key} label={ATTRIBUTION_LABELS[key] ?? key}>
-              {String(value)}
+      <CardContent>
+        {/* Rarely needed: closed until asked for. */}
+        <details className="group flex flex-col gap-2">
+          <summary className="flex cursor-pointer list-none items-center justify-between outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+            <h2 className="text-base font-semibold">Source</h2>
+            <ChevronDownIcon
+              aria-hidden="true"
+              className="size-4 text-muted-foreground transition-transform group-open:rotate-180"
+            />
+          </summary>
+          <dl className="mt-2">
+            <Field label="Source">
+              <span title={lead.source}>{readableSource(lead.source)}</span>
             </Field>
-          ))}
-          {lead.consentVersion ? <Field label="Consent">{lead.consentVersion}</Field> : null}
-          <Field label="Received">{dateTimeLabel(lead.createdAt)}</Field>
-          <Field label="Last activity">{dateTimeLabel(lead.updatedAt)}</Field>
-        </dl>
+            {attribution.map(([key, value]) => (
+              <Field key={key} label={ATTRIBUTION_LABELS[key] ?? key}>
+                {String(value)}
+              </Field>
+            ))}
+            {lead.consentVersion ? <Field label="Consent">{lead.consentVersion}</Field> : null}
+            <Field label="Received">{dateTimeLabel(lead.createdAt)}</Field>
+            <Field label="Last activity">{dateTimeLabel(lead.updatedAt)}</Field>
+          </dl>
+        </details>
       </CardContent>
     </Card>
   );
@@ -1006,9 +1175,35 @@ export function LeadRecord({
       }
       onDone={(result) => void changeDecided(shownRequest, result)}
       openDocument={openRequestDocument}
+      previewDocument={previewRequestDocument}
       onReload={() => void refresh()}
     />
   ) : null;
+
+  const customerEmail = lead.contact.email?.trim() || undefined;
+  const mailSection = (
+    <Card>
+      <CardContent>
+        <LeadMail
+          activities={activities}
+          members={members}
+          customerEmail={customerEmail}
+          canSend={access.emailCustomer === true && canWrite && customerEmail !== undefined}
+          cannotSendReason={
+            !canWrite
+              ? undefined
+              : !access.emailCustomer
+                ? 'Emailing customers is not set up for this site yet. The owner sets it up in Settings → Email.'
+                : customerEmail === undefined
+                  ? 'This customer has no email address. Add one to write to them.'
+                  : undefined
+          }
+          repliesEnabled={access.emailReplies === true}
+          onSend={sendWrittenMail}
+        />
+      </CardContent>
+    </Card>
+  );
 
   const timelineSection = (
     <Card>
@@ -1028,9 +1223,13 @@ export function LeadRecord({
   );
 
   if (inPanel) {
-    const activeTab = !access.contacts && panelTab !== 'files' ? 'home' : panelTab;
     return (
-      <Tabs value={activeTab} onValueChange={setPanelTab} className="min-w-0">
+      <Tabs
+        value={activeTab}
+        onValueChange={setPanelTab}
+        // The panel is narrow: cards sit closer, with less padding and no shadow.
+        className="min-w-0 [&_[data-slot=card-content]]:px-4 [&_[data-slot=card]]:gap-3 [&_[data-slot=card]]:rounded-lg [&_[data-slot=card]]:py-4 [&_[data-slot=card]]:shadow-none"
+      >
         <TabsList
           aria-label="Lead sections"
           className="sticky top-0 z-10 overflow-x-auto bg-background px-2"
@@ -1048,6 +1247,10 @@ export function LeadRecord({
               <TabsTrigger value="notes" className="gap-1.5 px-2 text-xs">
                 <StickyNoteIcon className="size-3.5" aria-hidden="true" />
                 Notes
+              </TabsTrigger>
+              <TabsTrigger value="mail" className="gap-1.5 px-2 text-xs">
+                <MailIcon className="size-3.5" aria-hidden="true" />
+                Mail
               </TabsTrigger>
             </>
           ) : null}
@@ -1067,15 +1270,17 @@ export function LeadRecord({
           value="home"
           hidden={activeTab !== 'home'}
           forceMount
-          className="flex flex-col gap-4 p-4"
+          className="flex flex-col gap-3 p-4"
         >
-          {contactSection}
-          {anchored('order', propertiesSection)}
-          {simEmailSection}
-          {identitySection}
-          {relatedSection}
           {access.contacts ? anchored('change-request', changeRequestSection) : null}
-          {sourceSection}
+          <div className={DETAILS_SIDEBAR}>
+            {contactSection}
+            {anchored('order', propertiesSection)}
+            {simEmailSection}
+            {identitySection}
+            {relatedSection}
+            {sourceSection}
+          </div>
         </TabsContent>
         {access.contacts ? (
           <>
@@ -1117,6 +1322,11 @@ export function LeadRecord({
           )}
         </TabsContent>
         {access.contacts ? (
+          <TabsContent value="mail" hidden={activeTab !== 'mail'} forceMount className="p-4">
+            {mailSection}
+          </TabsContent>
+        ) : null}
+        {access.contacts ? (
           <TabsContent
             value="activity"
             hidden={activeTab !== 'activity'}
@@ -1133,8 +1343,17 @@ export function LeadRecord({
   return (
     <div className="flex flex-col gap-6">
       {header}
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
-        <div className="flex flex-col gap-4">
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)] [&_[data-slot=card]]:gap-4 [&_[data-slot=card]]:py-5">
+        {/* The work gets the wide side; the details sit beside it as one divided card. */}
+        {access.contacts ? (
+          <div className="flex min-w-0 flex-col gap-4">
+            {anchored('change-request', changeRequestSection)}
+            {anchored('tasks', tasksSection)}
+            {mailSection}
+            {timelineSection}
+          </div>
+        ) : null}
+        <div className={DETAILS_SIDEBAR}>
           {contactSection}
           {identitySection}
           {anchored('documents', documentsSection)}
@@ -1143,13 +1362,6 @@ export function LeadRecord({
           {simEmailSection}
           {sourceSection}
         </div>
-        {access.contacts ? (
-          <div className="flex flex-col gap-4">
-            {anchored('tasks', tasksSection)}
-            {anchored('change-request', changeRequestSection)}
-            {timelineSection}
-          </div>
-        ) : null}
       </div>
     </div>
   );

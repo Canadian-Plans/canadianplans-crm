@@ -1,4 +1,7 @@
 import { DatabaseAiTurnStore, type AiTurnStore } from '../ai/turn-store.js';
+import { createAiChatDependenciesFromEnv } from '../ai/chat-factory.js';
+import { DatabaseAiChatSchemaProbe } from '../ai/chat-schema.js';
+import type { AiChatDependencies } from './ai-assistant.js';
 import { AutomationAuthoringStore } from '../ai/automation-authoring.js';
 import { createErrorTrackerFromEnv, type ErrorTracker } from '@canadian-plans/adapters';
 import { Router, type Request, type Response } from 'express';
@@ -31,6 +34,9 @@ import {
   type PropertyCatalog,
   DOCUMENT_REVIEW_PAGE_SIZE,
   documentReviewQueueQuerySchema,
+  MAILBOX_PAGE_SIZE,
+  mailboxQuerySchema,
+  webAnalyticsQuerySchema,
 } from '@canadian-plans/contracts';
 import {
   rateLimitHit,
@@ -96,6 +102,9 @@ import {
   DatabaseDocumentReviewQueue,
   type DocumentReviewQueueStore,
 } from '../documents/review-queue.js';
+import { DatabaseMailbox, type MailboxStore } from '../email/mailbox.js';
+import { loadReplyAddressing, type ReplyAddressing } from '../email/reply-address.js';
+import { loadWebAnalyticsReader, type WebAnalyticsReader } from '../analytics/web-analytics.js';
 import { createAutomationRoutes } from './automations.js';
 import { createAiAssistantRoutes } from './ai-assistant.js';
 import { createEmailSettingsRoutes } from './email-settings.js';
@@ -148,6 +157,9 @@ export interface StaffRouteDependencies {
   flowStore?: FlowStore;
   /** Documents → review queue; the database store when absent. */
   documentReviewQueue?: DocumentReviewQueueStore;
+  mailbox?: MailboxStore;
+  webAnalytics?: WebAnalyticsReader;
+  replyAddressing?: ReplyAddressing;
   /** The site's email settings and templates; omitted in route tests that do not reach them. */
   emailSettingsStore?: EmailSettingsStore;
   /** The transaction runner the test mail is composed and queued in; the database's by default. */
@@ -168,6 +180,11 @@ export interface StaffRouteDependencies {
     rateLimit?: (input: RateLimitInput) => Promise<RateLimitResult>;
     /** Per-turn usage records; the default dependencies write `app.ai_turns`. */
     turns?: AiTurnStore;
+    /**
+     * The saved chat: conversations, attachments and usage. Absent (as in
+     * most route tests) the assistant is memory-only, exactly as before.
+     */
+    chat?: AiChatDependencies;
     now?: () => Date;
   };
 }
@@ -185,6 +202,8 @@ export function createDefaultStaffRouteDependencies(): StaffRouteDependencies {
       }),
     );
   }
+  // One catalogue check shared by the saved chat and the turn records.
+  const aiSchema = new DatabaseAiChatSchemaProbe();
   return {
     sessionVerifier: defaultStaffSessionVerifier(),
     rateLimit: rateLimitHit,
@@ -215,11 +234,14 @@ export function createDefaultStaffRouteDependencies(): StaffRouteDependencies {
             engine: createGatewayEngine({
               apiKey: aiConfig.apiKey,
               modelId: aiConfig.modelId,
+              ...(aiConfig.providers ? { providers: aiConfig.providers } : {}),
+              ...(aiConfig.highEffort ? { highEffort: aiConfig.highEffort } : {}),
             }),
           }
         : {}),
       rateLimit: rateLimitHit,
-      turns: new DatabaseAiTurnStore(),
+      turns: new DatabaseAiTurnStore(undefined, aiSchema),
+      chat: createAiChatDependenciesFromEnv(process.env, aiSchema),
     },
   };
 }
@@ -326,6 +348,10 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 export function createStaffRouter(dependencies: StaffRouteDependencies): Router {
+  // One reader for the process: it keeps a short cache of each site's report.
+  const defaultWebAnalytics = loadWebAnalyticsReader();
+  // Whether a site's customers' replies come back to the CRM (email/reply-address.ts).
+  const replyAddressing = dependencies.replyAddressing ?? loadReplyAddressing();
   const router = Router();
   router.use(requireStaffSession(dependencies.sessionVerifier, dependencies.rateLimit));
 
@@ -400,10 +426,11 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
   }
 
   // The countdown date comes from the form, which these roles never see; a
-  // row's property columns carry form and custom values alike.
+  // row's property columns carry form and custom values alike. The contact ID
+  // also links requests for the same person, which is contact data.
   function withoutContact(lead: LeadListItem): LeadListItem {
     const { properties: _properties, ...rest } = lead;
-    return { ...rest, contact: {}, countdownDate: null };
+    return { ...rest, contact: {}, contactId: null, countdownDate: null };
   }
 
   /**
@@ -746,6 +773,7 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
             actorId: actor.actorId,
           })) ??
             false),
+        emailReplies: replyAddressing?.enabledFor(params.workspaceId) ?? false,
         downloadDocuments: decideAccess(decision.access, 'document.download').allowed,
         reviewDocuments: decideAccess(decision.access, 'order.manage').allowed,
         overrideDocuments: decideAccess(decision.access, 'order.override').allowed,
@@ -1071,7 +1099,8 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
     }
   });
 
-  // A mail to the lead's customer (a SIM order's number), queued for the
+  // A mail to the lead's customer (a SIM order's number, or a message staff
+  // wrote in the Mail tab), queued for the
   // outbox and sent from the site's own sender. Refused while the site cannot
   // send, so staff learn it now rather than from a failed job.
   router.post('/workspaces/:workspaceId/leads/:leadId/customer-emails', async (req, res) => {
@@ -1098,13 +1127,20 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
       }
       const store = leadWork(req, res);
       if (!store) return;
-      const outcome = await store.queueCustomerEmail({
+      const scope = {
         workspaceId: params.workspaceId,
         actorId: actor.actorId,
         requestId: req.id,
         leadId: params.id,
-        template: body.data.template,
-      });
+      };
+      const outcome =
+        'template' in body.data
+          ? await store.queueCustomerEmail({ ...scope, template: body.data.template })
+          : await store.queueWrittenEmail({
+              ...scope,
+              subject: body.data.subject,
+              body: body.data.body,
+            });
       if (outcome.status === 'not_found') {
         sendDomainError(res, req.id, 'lead_not_found', 404);
         return;
@@ -1592,6 +1628,74 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
     }
   });
 
+  // The site's website traffic (Analytics page), read from Umami. Totals only,
+  // no customer details, so any member of the site may read it.
+  router.get('/workspaces/:workspaceId/web-analytics', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = webAnalyticsQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      const reader = dependencies.webAnalytics ?? defaultWebAnalytics;
+      const outcome = await reader.read({
+        workspaceId: workspaceId.data,
+        days: query.data.days ?? 30,
+      });
+      res.json(
+        outcome.status === 'ok'
+          ? { report: outcome.report, requestId: req.id }
+          : { report: null, unavailable: outcome.status, requestId: req.id },
+      );
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
+  // The site's sent box (Mail page): every mail queued to a customer. It names
+  // customers and carries what was written, so it needs contact access.
+  router.get('/workspaces/:workspaceId/mail', async (req, res) => {
+    const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
+    const query = mailboxQuerySchema.safeParse(req.query);
+    if (!workspaceId.success || !query.success) {
+      sendStaffAuthError(res, req.id, 'invalid_request', 400);
+      return;
+    }
+    try {
+      const { actor, decision } = await decide(req, workspaceId.data, 'workspace.read');
+      if (!decision.allowed) {
+        sendStaffAuthError(res, req.id, denyReasonOf(decision), 403);
+        return;
+      }
+      if (!leadAccessOf(decision.access).contacts) {
+        sendStaffAuthError(res, req.id, 'permission_denied', 403);
+        return;
+      }
+      const page = query.data.page ?? 1;
+      const mailbox = dependencies.mailbox ?? new DatabaseMailbox();
+      const result = await mailbox.list(
+        { workspaceId: workspaceId.data, actorId: actor.actorId },
+        { page, ...(query.data.leadId ? { leadId: query.data.leadId } : {}) },
+      );
+      res.json({
+        items: result.items,
+        page: { page, pageSize: MAILBOX_PAGE_SIZE, total: result.total },
+        repliesEnabled: replyAddressing?.enabledFor(workspaceId.data) ?? false,
+        requestId: req.id,
+      });
+    } catch (error) {
+      reportFailure(req, error);
+      sendStaffAuthError(res, req.id, 'internal_error', 500);
+    }
+  });
+
   router.post('/workspaces/:workspaceId/files/:fileId/review', async (req, res) => {
     const workspaceId = z.uuid().safeParse(req.params['workspaceId']);
     const fileId = z.uuid().safeParse(req.params['fileId']);
@@ -1768,6 +1872,7 @@ export function createStaffRouter(dependencies: StaffRouteDependencies): Router 
       ...(ai.engine === undefined ? {} : { engine: ai.engine }),
       rateLimit: ai.rateLimit ?? rateLimitHit,
       ...(ai.turns === undefined ? {} : { turns: ai.turns }),
+      ...(ai.chat === undefined ? {} : { chat: ai.chat }),
       ...(ai.now === undefined ? {} : { now: ai.now }),
       reportFailure,
     }),

@@ -3,12 +3,30 @@ import type {
   AnalyticsResponse,
   DocumentReviewQueueQuery,
   DocumentReviewQueueResponse,
+  MailboxQuery,
+  MailboxResponse,
+  WebAnalyticsQuery,
+  WebAnalyticsResponse,
   AiAutomationDraft,
   AiAutomationProposal,
   AiAutomationSaveResponse,
   AiAutomationSimulation,
 } from '@canadian-plans/contracts';
 import type { AiAutomationSimulateRequest } from '@canadian-plans/contracts';
+import type {
+  AiAttachmentLinkResponse,
+  AiConversationResponse,
+  AiUsageQueryInput,
+  AiUsageResponse,
+  CreateAiAttachmentIntentRequest,
+  CreateAiAttachmentIntentResponse,
+  DeleteAiAttachmentResponse,
+  DeleteAiConversationResponse,
+  FinalizeAiAttachmentResponse,
+  GetAiConversationResponse,
+  ListAiConversationsQueryInput,
+  ListAiConversationsResponse,
+} from '@canadian-plans/contracts';
 import {
   BackendError,
   createBackendClient,
@@ -73,10 +91,8 @@ import {
   type LeadBoardResponse,
   type LeadsSummaryQuery,
   type LeadsSummaryResponse,
-  type LeadStatsQuery,
   type SourceReportQuery,
   type SourceReportResponse,
-  type LeadStatsResponse,
   type LeadTaskResponse,
   type LeadTrashResponse,
   type MarkLeadOpenedResponse,
@@ -110,6 +126,8 @@ import {
   type StaffWorkspacesResponse,
 } from '@canadian-plans/contracts';
 
+import { trackedFetch } from './activity';
+
 const API_BASE_URL =
   process.env['NEXT_PUBLIC_API_BASE_URL'] ?? process.env['API_BASE_URL'] ?? 'http://localhost:4000';
 
@@ -121,8 +139,14 @@ const API_BASE_URL =
  */
 export { BackendError };
 
-function client(accessToken: string) {
-  return createBackendClient({ baseUrl: API_BASE_URL, credential: accessToken });
+function client(accessToken: string, options: { quiet?: boolean } = {}) {
+  // trackedFetch drives the top loading bar (components/top-loading-bar.tsx).
+  // A quiet client leaves the bar alone: Ask AI shows its own "thinking" line.
+  return createBackendClient({
+    baseUrl: API_BASE_URL,
+    credential: accessToken,
+    ...(options.quiet ? {} : { fetch: trackedFetch }),
+  });
 }
 
 type StaffClient = ReturnType<typeof client>['staff'];
@@ -224,15 +248,6 @@ export async function getLeadsSummary(
   return client(accessToken).staff.leadsSummary(workspaceId, query);
 }
 
-/** The dashboard's counts for one lead type over a window. */
-export async function getLeadStats(
-  accessToken: string,
-  workspaceId: string,
-  query: LeadStatsQuery,
-): Promise<LeadStatsResponse> {
-  return client(accessToken).staff.leadStats(workspaceId, query);
-}
-
 /** The analytics dashboard: one range against a comparison, with filters (money for the owner only). */
 export async function getAnalytics(
   accessToken: string,
@@ -270,7 +285,91 @@ export function askAiAssistant(
   body: AiChatRequest,
   options?: { signal?: AbortSignal },
 ): AsyncGenerator<AiStreamPart, void, undefined> {
-  return client(accessToken).staff.askAi(workspaceId, body, options);
+  return client(accessToken, { quiet: true }).staff.askAi(workspaceId, body, options);
+}
+
+/** Ask AI: the member's own saved conversations on this site, newest first, a page at a time. */
+export async function listAiConversations(
+  accessToken: string,
+  workspaceId: string,
+  query?: ListAiConversationsQueryInput,
+): Promise<ListAiConversationsResponse> {
+  return client(accessToken).staff.listAiConversations(workspaceId, query);
+}
+
+/** Ask AI: one saved conversation with its messages, oldest first. */
+export async function getAiConversation(
+  accessToken: string,
+  workspaceId: string,
+  conversationId: string,
+): Promise<GetAiConversationResponse> {
+  return client(accessToken).staff.getAiConversation(workspaceId, conversationId);
+}
+
+export async function renameAiConversation(
+  accessToken: string,
+  workspaceId: string,
+  conversationId: string,
+  title: string,
+): Promise<AiConversationResponse> {
+  return client(accessToken).staff.renameAiConversation(workspaceId, conversationId, { title });
+}
+
+/** Ask AI: removes the conversation, its messages and its files for good. */
+export async function deleteAiConversation(
+  accessToken: string,
+  workspaceId: string,
+  conversationId: string,
+): Promise<DeleteAiConversationResponse> {
+  return client(accessToken).staff.deleteAiConversation(workspaceId, conversationId);
+}
+
+/** Ask AI: a signed PUT for one file to attach; `uploadId` is the attachment's id. */
+export async function createAiAttachmentIntent(
+  accessToken: string,
+  workspaceId: string,
+  body: CreateAiAttachmentIntentRequest,
+): Promise<CreateAiAttachmentIntentResponse> {
+  return client(accessToken).staff.createAiAttachmentIntent(workspaceId, body);
+}
+
+/** Ask AI: verifies the uploaded file against the SHA-256 of what the browser sent. */
+export async function finalizeAiAttachment(
+  accessToken: string,
+  workspaceId: string,
+  attachmentId: string,
+  checksumSha256: string,
+): Promise<FinalizeAiAttachmentResponse> {
+  return client(accessToken).staff.finalizeAiAttachment(workspaceId, attachmentId, {
+    checksumSha256,
+  });
+}
+
+/** Ask AI: removes a file that has not been sent yet. */
+export async function deleteAiAttachment(
+  accessToken: string,
+  workspaceId: string,
+  attachmentId: string,
+): Promise<DeleteAiAttachmentResponse> {
+  return client(accessToken).staff.deleteAiAttachment(workspaceId, attachmentId);
+}
+
+/** Ask AI: a short-lived signed link to one of the member's own files. */
+export async function getAiAttachmentLink(
+  accessToken: string,
+  workspaceId: string,
+  attachmentId: string,
+): Promise<AiAttachmentLinkResponse> {
+  return client(accessToken).staff.getAiAttachmentLink(workspaceId, attachmentId);
+}
+
+/** Settings → AI usage: turns and tokens per member, never content (owner only). */
+export async function getAiUsage(
+  accessToken: string,
+  workspaceId: string,
+  query?: AiUsageQueryInput,
+): Promise<AiUsageResponse> {
+  return client(accessToken).staff.getAiUsage(workspaceId, query);
 }
 
 export async function getLeadBoard(
@@ -298,14 +397,14 @@ export async function updateStaffLead(
   return client(accessToken).staff.updateLead(workspaceId, leadId, body);
 }
 
-/** Queues a mail to the lead's customer (a SIM order's number), sent within a minute. */
+/** Queues a mail to the lead's customer (a SIM order's number, or a message staff wrote), sent within a minute. */
 export async function emailLeadCustomer(
   accessToken: string,
   workspaceId: string,
   leadId: string,
-  template: QueueCustomerEmailRequest['template'],
+  mail: QueueCustomerEmailRequest,
 ): Promise<QueueCustomerEmailResponse> {
-  return client(accessToken).staff.emailLeadCustomer(workspaceId, leadId, { template });
+  return client(accessToken).staff.emailLeadCustomer(workspaceId, leadId, mail);
 }
 
 /** Clears the lead's "New" badge for the team; idempotent. */
@@ -745,6 +844,24 @@ export async function reviewFile(
   body: ReviewFileRequest,
 ): Promise<ReviewFileResponse> {
   return client(accessToken).staff.reviewFile(workspaceId, fileId, body);
+}
+
+/** Analytics: the site's website traffic from Umami, for the last 7, 30 or 90 days. */
+export async function getWebAnalytics(
+  accessToken: string,
+  workspaceId: string,
+  query?: WebAnalyticsQuery,
+): Promise<WebAnalyticsResponse> {
+  return client(accessToken).staff.getWebAnalytics(workspaceId, query);
+}
+
+/** Mail: one page of the site's sent box, newest first. */
+export async function listMailbox(
+  accessToken: string,
+  workspaceId: string,
+  query?: MailboxQuery,
+): Promise<MailboxResponse> {
+  return client(accessToken).staff.listMailbox(workspaceId, query);
 }
 
 /** Documents → the site's review queue (contact access; review and download recheck their own). */

@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
 
 /**
- * Private-document storage behind the file-access interface named in
- * IMPLEMENTATION_PLAN.md §8: `createUpload`, `verifyUpload`, `issueDownload`,
+ * Private-document storage behind the file-access interface: `createUpload`, `verifyUpload`, `issueDownload`,
  * `copyForExport`. Two implementations live in this package:
  *
  *  - `S3R2DocumentStore` (r2-s3.ts): the real Cloudflare R2 adapter. All
@@ -10,7 +9,7 @@ import { createHash } from 'node:crypto';
  *  - `InMemoryR2DocumentStore` (below): a deterministic fake with no network,
  *    used by every test and by non-production environments.
  *
- * The security-critical guarantee (PLATFORM_CONTEXT.md invariant 8): the
+ * The security-critical guarantee: the
  * uploader writes only to a *staging* object; `verifyUpload` first copies that
  * staging object to a private *candidate* object the uploader can no longer
  * reach, then verifies the candidate's bytes. The exact candidate object is
@@ -21,6 +20,13 @@ import { createHash } from 'node:crypto';
 /** The only stored document media types (recorded decision: PDF/JPG/PNG). */
 export type DocumentMediaType = 'application/pdf' | 'image/jpeg' | 'image/png' | 'image/webp';
 
+/**
+ * What an upload may be declared as: a document type, or one of the plain
+ * text types an Ask AI attachment may be (which have no signature to detect).
+ * A declaration only picks the upload's header; the bytes decide what is kept.
+ */
+export type UploadMediaType = DocumentMediaType | 'text/plain' | 'text/csv' | 'text/markdown';
+
 /** Resolve the logical key stored in the database to its private R2 object. */
 export function documentObjectKey(workspaceId: string, key: string): string {
   return `workspaces/${workspaceId}/${key}`;
@@ -28,7 +34,7 @@ export function documentObjectKey(workspaceId: string, key: string): string {
 
 /**
  * Detects one of the three allowed document types from a file's leading bytes.
- * The declared `Content-Type` is never trusted (invariant 8); only the magic
+ * The declared `Content-Type` is never trusted; only the magic
  * bytes decide. Returns `undefined` for anything else.
  */
 export function detectDocumentType(bytes: Uint8Array): DocumentMediaType | undefined {
@@ -95,7 +101,7 @@ export interface CreateUploadInput {
   /** Backend-generated random staging key the uploader may write to. */
   stagingKey: string;
   /** Declared type — validated up front but never trusted for storage. */
-  declaredContentType: DocumentMediaType;
+  declaredContentType: UploadMediaType;
   /** Exact body length bound into the upload signature, never greater than maxBytes. */
   declaredSizeBytes: number;
   /** Hard byte ceiling advertised to the client (10 MB). */
@@ -134,6 +140,32 @@ export type VerifyUploadResult =
     }
   | { status: 'rejected'; reason: VerifyUploadRejection };
 
+/**
+ * `verifyAttachmentUpload`'s answer: like `verifyUpload`'s, except that bytes
+ * no signature matches are not refused here. `detectedMediaType` is the
+ * signature found, or undefined (a text file has none); the caller decides
+ * whether that is acceptable for what was declared.
+ */
+export type VerifyAttachmentUploadResult =
+  | {
+      status: 'verified';
+      candidateKey: string;
+      detectedMediaType: DocumentMediaType | undefined;
+      sizeBytes: number;
+      checksumSha256: string;
+    }
+  | { status: 'rejected'; reason: 'staging_missing' | 'too_large' | 'checksum_mismatch' };
+
+export interface ReadObjectInput {
+  workspaceId: string;
+  objectKey: string;
+  /** The most bytes the caller accepts; a larger object is refused, never buffered. */
+  maxBytes: number;
+}
+
+export type ReadObjectResult =
+  { status: 'read'; bytes: Uint8Array } | { status: 'missing' } | { status: 'too_large' };
+
 export interface ImportObjectInput {
   workspaceId: string;
   /** A website's own object in the bucket (`isWebsiteObjectKey`); only ever read. */
@@ -160,7 +192,8 @@ export interface IssueDownloadInput {
   objectKey: string;
   /** Sanitized filename for the disposition. */
   fileName: string;
-  contentType: DocumentMediaType;
+  /** The verified type, served only for an `inline` link (an attachment is an octet-stream). */
+  contentType: UploadMediaType;
   expiresInSeconds: number;
   /**
    * `inline` is staff viewing a verified file in a tab of its own: served as
@@ -197,7 +230,7 @@ export interface DeleteFromBucketInput {
 /**
  * Every method is workspace-scoped so an implementation can enforce a
  * per-workspace key prefix. Verification always runs against the immutable
- * candidate copy, never the mutable staging object (invariant 8).
+ * candidate copy, never the mutable staging object.
  */
 export interface R2DocumentStore {
   /** Idempotent private deletion; the caller supplies the persisted bucket. */
@@ -211,6 +244,18 @@ export interface R2DocumentStore {
    * exact object the caller must attach and later serve.
    */
   verifyUpload(input: VerifyUploadInput): Promise<VerifyUploadResult>;
+  /**
+   * `verifyUpload` for an Ask AI attachment: the same copy-first check of
+   * existence, size and checksum on the candidate, with the signature
+   * reported rather than required, since a text file has none. The caller
+   * compares it with what was declared. The candidate is the object to serve.
+   */
+  verifyAttachmentUpload(input: VerifyUploadInput): Promise<VerifyAttachmentUploadResult>;
+  /**
+   * One object's bytes, refused (`too_large`) when it holds more than
+   * `maxBytes`: the body is read with a hard cap, never buffered unbounded.
+   */
+  readObject(input: ReadObjectInput): Promise<ReadObjectResult>;
   /**
    * Copies a website's own object into the workspace's private candidate,
    * then verifies the candidate as `verifyUpload` does: size and signature,
@@ -275,6 +320,11 @@ export class InMemoryR2DocumentStore implements R2DocumentStore {
     return this.objects.has(key);
   }
 
+  /** Test seam: every key held, so a test can assert nothing was left behind. */
+  keys(): string[] {
+    return [...this.objects.keys()];
+  }
+
   async createUpload(input: CreateUploadInput): Promise<PresignedUpload> {
     return {
       stagingKey: input.stagingKey,
@@ -310,6 +360,37 @@ export class InMemoryR2DocumentStore implements R2DocumentStore {
       sizeBytes: candidate.byteLength,
       checksumSha256,
     };
+  }
+
+  async verifyAttachmentUpload(input: VerifyUploadInput): Promise<VerifyAttachmentUploadResult> {
+    const staging = this.objects.get(input.stagingKey);
+    if (!staging) return { status: 'rejected', reason: 'staging_missing' };
+    // Copy first, as `verifyUpload` does; only the candidate is inspected.
+    const candidate = Uint8Array.from(staging);
+    this.objects.set(input.candidateKey, candidate);
+    if (candidate.byteLength > input.maxBytes) return { status: 'rejected', reason: 'too_large' };
+    const checksumSha256 = sha256Hex(candidate);
+    if (checksumSha256 !== input.expectedChecksumSha256) {
+      return { status: 'rejected', reason: 'checksum_mismatch' };
+    }
+    return {
+      status: 'verified',
+      candidateKey: input.candidateKey,
+      detectedMediaType: detectDocumentType(candidate),
+      sizeBytes: candidate.byteLength,
+      checksumSha256,
+    };
+  }
+
+  /** Every `readObject` call, so a test can assert what was read and its bound. */
+  readonly reads: ReadObjectInput[] = [];
+
+  async readObject(input: ReadObjectInput): Promise<ReadObjectResult> {
+    this.reads.push({ ...input });
+    const stored = this.objects.get(input.objectKey);
+    if (!stored) return { status: 'missing' };
+    if (stored.byteLength > input.maxBytes) return { status: 'too_large' };
+    return { status: 'read', bytes: Uint8Array.from(stored) };
   }
 
   async importObject(input: ImportObjectInput): Promise<ImportObjectResult> {

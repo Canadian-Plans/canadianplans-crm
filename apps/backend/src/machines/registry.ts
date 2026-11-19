@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { secretsEqual } from '../website/credential.js';
 
 /**
- * Server-only integration registry (PLATFORM_CONTEXT §4b). It is deployment
+ * Server-only integration registry. It is deployment
  * configuration maintained through the owner's release process — never a
  * cross-tenant DB read and no customer data. URL/selector IDs are untrusted;
  * the mapped signature or scheduler secret is verified before any context is
@@ -156,7 +156,7 @@ function verifySanitySignature(
 /** Resend uses Standard Webhooks/Svix: id.timestamp.rawBody, whsec_ base64 key.
  * Protocol: resend-node/src/webhooks/webhooks.ts and standard-webhooks JS verifier.
  */
-function verifyResendSignature(
+export function verifyResendSignature(
   input: {
     id: string;
     timestamp: string;

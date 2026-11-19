@@ -32,7 +32,7 @@ import {
 import { addLeadNote } from '../../lib/api';
 import { dateTimeLabel, relativeTime } from '../../lib/dates';
 import { actorName, memberName } from '../../lib/people';
-import { errorReason } from '../../lib/use-resource';
+import { describeError } from '../../lib/error-text';
 import { documentTypeLabel } from '../plans/document-types';
 import { documentLabel } from './lead-documents';
 import { fieldLabel } from './lead-fields';
@@ -261,6 +261,15 @@ function describeEntry(
           ),
         };
       }
+      if (activity.event === 'customer_replied') {
+        return {
+          icon: <MailIcon />,
+          actor: null,
+          text: activity.otherSender
+            ? 'a reply came by email from another address'
+            : 'the customer replied by email',
+        };
+      }
       if (activity.event === 'customer_emailed') {
         return {
           icon: <MailIcon />,
@@ -328,7 +337,7 @@ export function LeadTimeline({
       onNoteAdded(result.activity);
       setDraft('');
     } catch (error) {
-      setMessage(`The note was not saved. Reason: ${errorReason(error)}.`);
+      setMessage(describeError(error, 'save the note'));
     } finally {
       setSaving(false);
     }

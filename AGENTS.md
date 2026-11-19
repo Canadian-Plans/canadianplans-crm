@@ -13,7 +13,8 @@ ids, owner steps and dates describe the GT Sales deployment, not this one.
 One backend and one admin for every Canadian Plans website. Websites keep their
 own repositories and send leads to the backend with a per-site key; staff work
 every site from this admin. The code was copied from the GT Sales CRM on
-2026-11-12 (itself a pruned copy of the Canadian Plans platform) and renamed;
+2026-11-12 (itself a pruned copy of the Canadian Plans platform) and renamed,
+and brought up to date with it on 2026-11-19 (docs/CANADIAN_PLANS.md);
 GT Sales' data, imports and deployment were not. Comments that name Get Canada
 Sim or CanadaWide describe where a form or rule was first modelled.
 
@@ -57,9 +58,16 @@ Sim or CanadaWide describe where a form or rule was first modelled.
    resume their own leads and upload documents against them, nothing else.
 6. **Side effects go through the outbox** (`app.outbox_jobs`), never straight
    from a request handler: emails, analytics, alerts. Dedupe on
-   `(workspace, job_type, dedupe_key)`.
+   `(workspace, job_type, dedupe_key)`. A mail the provider refuses outright
+   (Resend's HTTP 429) is retried with backoff under the same idempotency key
+   up to the attempt limit; a timeout or a 5xx may have been sent, so it ends
+   `uncertain` and waits for staff.
 7. **No PII in logs, audit `before`/`after` may be redacted to null and never
    rewritten, email tables store a keyed `contact_hash`, never the address.**
+   A mail to a lead's customer keeps its subject and plain text in its
+   timeline entry's `body` (owner decision, 13 Nov 2026, for the lead's Mail
+   tab; `email/kept-text.ts`). It sits with the notes, so erasing a customer's
+   data nulls it the same way; the address is still never stored.
 8. **No secrets in the repo.** Keys, passwords and customer data live in
    Railway/Vercel/Supabase. Treat the repository as public.
 9. **Demo-proof tests.** Integration suites run against a disposable database
@@ -101,13 +109,14 @@ DATABASE_SSL_MODE=disable EMAIL_CONTACT_HASH_SECRET=<≥16 chars>`. CI
   `src/routes/lead-export.ts` (action `lead.export`); the fields, groups and
   request in `packages/contracts/src/lead-export.ts`; the dialog in
   `apps/admin/src/components/leads/lead-export-dialog.tsx` and the row
-  selection in `leads-table.tsx` (docs/HANDOFF.md §3.19).
+  selection in `leads-table.tsx` (docs/HANDOFF.md §2.3).
 - Staff routes (sites, access, profile, leads, board, tasks, members, jobs,
   credentials, files): `src/routes/staff.ts`.
 - Documents: `src/documents/` (signed upload intent → finalize with
   signature verification → attach; staff review and download links).
 - Scheduler: `src/scheduler.ts` (`outbox`, `document_cleanup`,
-  `data_retention`, `automations`, `intake_check`), identities in
+  `data_retention`, `automations`, and `intake_check` when
+  `INTAKE_CHECK_WORKSPACE_ID` is set), identities in
   `src/machines/registry.ts`.
 - Site properties and record layouts: `apps/backend/src/properties/`
   (`store.ts` for definitions, tombstones and layouts, `catalog.ts` for the
@@ -153,15 +162,15 @@ DATABASE_SSL_MODE=disable EMAIL_CONTACT_HASH_SECRET=<≥16 chars>`. CI
   `src/email/settings-store.ts` and `src/routes/email-settings.ts`; contracts
   in `packages/contracts/src/{automation-keys,automation-flows,automation-api}.ts`
   (the built-ins' labels and phase 4 triggers stay in `automations.ts`).
-- Admin pages: `apps/admin/src/app/w/[workspace]/{leads,leads/[leadId],tasks,documents,reports/sources,automations,automations/[key],settings}`
+- Admin pages: `apps/admin/src/app/w/[workspace]/{dashboard,leads,leads/[leadId],tasks,documents,mail,chat,analytics,automations,automations/[key],settings}`
   (Settings → Properties at `settings/properties`, Settings → Email at
   `settings/email`); lead screens in `src/components/leads/` (the stage-move
-  dialog is `stage-move-dialog.tsx`); the CRM filter chip, menus, side panel and
-  page header in `src/components/crm/` (tokens in `src/app/crm-theme.css`);
-  the Shadcnblocks-inspired admin shell supports light/dark mode via
-  `theme-toggle.tsx`, Ctrl/Cmd K navigation via `quick-navigation.tsx`, and
-  contextual settings links via `settings-navigation.tsx`; design references
-  and the product mapping are in `docs/design/2026-11-01-admin-redesign.md`;
+  dialog is `stage-move-dialog.tsx`); the CRM filter chip, menus and side panel
+  in `src/components/crm/` (tokens in `src/app/crm-theme.css`);
+  the Shadcnblocks-inspired admin shell (docs/PLAN.md §1, reuse note) supports
+  light/dark mode via `theme-toggle.tsx`, Ctrl/Cmd K navigation via
+  `quick-navigation.tsx`, and contextual settings links via
+  `settings-navigation.tsx`;
   property rendering, editing and the settings screens in
   `src/components/properties/`; Settings → Plans in `src/components/plans/`
   (`settings/plans`, with plan properties at `settings/plans/properties`);
@@ -175,28 +184,50 @@ DATABASE_SSL_MODE=disable EMAIL_CONTACT_HASH_SECRET=<≥16 chars>`. CI
   `src/components/automations/` (`flow-words.ts` puts a flow and its step
   outcomes in words); API client
   `apps/admin/src/lib/api.ts`.
+- Error messages in the admin: `apps/admin/src/lib/error-text.ts`.
+  `describeError(error, 'save the change')` turns any failure (a
+  `BackendError`, a dropped connection, a timeout) into a plain sentence that
+  says what to do next; `describeInvalid` names the field and the limit for a
+  form's own zod check. A screen never shows a raw error code; a server
+  failure may end with `(Ref: <8 chars of the request id>)`. `useResource`
+  keeps the original error as `failure` for it. A CRM that does not answer
+  the workspace check shows "The CRM is not responding" with Try again
+  (`protected-workspace-shell.tsx`), never the denied page.
 - Source report: `apps/backend/src/reports/store.ts` (the one SQL statement,
   `sourceLabelSql` and `shapeSourceReport`) with the route in
   `src/routes/reports.ts`; contracts in `packages/contracts/src/reports.ts`;
-  the admin page at `apps/admin/src/app/w/[workspace]/reports/sources` with
-  its screen in `src/components/reports/` (its periods in
-  `src/lib/stats-windows.ts`).
+  in the admin it is the Dashboard's sources card
+  (`src/components/reports/source-report.tsx`, opened by
+  `/dashboard?report=sources`; the old `reports` and `reports/sources`
+  routes redirect there), its periods in `src/lib/stats-windows.ts`.
 - Analytics dashboard: `apps/backend/src/analytics/store.ts` (the one
   aggregate statement) with the route in `src/routes/analytics.ts`; contracts
   in `packages/contracts/src/analytics.ts`; the admin screen
   `apps/admin/src/components/dashboard.tsx` with its filter bar, URL state and
   charts in `src/components/analytics/`. Money figures need `revenue.view`
   (owner only) and are left out of responses for everyone else.
+- Ask AI's saved chat (docs/design/ai-chat.md): `apps/backend/src/ai/`
+  (`conversation-store.ts` a member's conversations and messages,
+  `attachment-store.ts` and `attachments.ts` the files' rows, upload,
+  verification, links and sweep, `attachment-budget.ts` the memory bound,
+  `usage-store.ts` the owner's usage, `chat-schema.ts` whether 0034–0037 are
+  applied, `chat-factory.ts` the wiring) with the routes in
+  `src/routes/ai-conversations.ts`, mounted from `src/routes/ai-assistant.ts`,
+  which runs a stored turn; contracts in
+  `packages/contracts/src/ai-conversations.ts` and `AI_CHAT_LIMITS` in
+  `ai-assistant.ts`; the page `apps/admin/src/app/w/[workspace]/chat/` with
+  `src/components/ai/` (`chat-screen.tsx`, `conversation-list.tsx`,
+  `chat-thread.tsx`, `chat-composer.tsx`, `attachment-*`; state in
+  `assistant-provider.tsx`); Settings → AI usage at `settings/ai-usage` with
+  `src/components/ai-usage/`.
 - Intake check: `apps/backend/src/intake-check/` (`check.ts` the run and its
   steps, `store.ts` the test site's reads and deletes, `alert-rule.ts` when
   the owner hears about it), the manual run in `src/routes/intake-check.ts`;
-  the scheduler's four tasks (`outbox`, `document_cleanup`, `data_retention`,
-  `intake_check`) in `src/scheduler.ts`; the runbook
+  the scheduler's `intake_check` task in `src/scheduler.ts`; the runbook
   `docs/RUNBOOKS/intake-check.md` and its paste file
   `docs/RUNBOOKS/manual/intake-check-site.sql`.
-- Hand-off pages for the remaining merge phases (5 to 8), with the rules,
-  gate, shipping steps and working method they share:
-  `docs/superpowers/phases/` (start with its `README.md`).
+- Decisions, rulings and review findings the code cites by name (D1, R4, O9,
+  P7, L-3, ENG-5, …): `docs/PLAN.md` §11.
 
 ## Vocabulary
 
@@ -321,10 +352,14 @@ lead type (owner decisions O9 and O12): the first staff stage move of an
 incomplete lead marks it submitted, freezes its plan and fires the submitted
 and stage flows; the customer can then no longer finish that checkout
 (O13). A move of such a lead into a closing stage (`isClosingStage` in
-`leads/work-store.ts`: a SIM order's Cancelled, internet Lost and
+`leads/types.ts`: a SIM order's Cancelled, internet Lost and
 Non-serviceable address, mobility Lost, a partner application's Declined, a
 contact message's Closed) is no rescue: the lead stays unsubmitted, nothing is
-frozen and no flow fires (controller ruling, 2026-10-31).
+frozen and no flow fires (controller ruling, 2026-10-31). If the customer then
+submits that draft it is a fresh submission: a SIM order moves to Pending and
+every other type back to its first stage, with the `submitted` timeline entry
+and `stage` in the audit, and the flows of that stage fire, never the closing
+stage's.
 
 **Email settings** are a site's sender and look (`app.workspace_email_settings`,
 Settings → Email): from name and address, reply-to, logo, brand colour, footer,
@@ -421,7 +456,7 @@ their verified sign-in address, recorded when they sign in and never shown;
 a `notify_staff` step mails it. Phase 4's rows keep their `outcome` and read
 as legacy runs. Runs are pruned 90 days after they finish.
 
-The **source report** (Reports → Sources) counts one lead type's leads per
+The **source report** (the Dashboard's sources card) counts one lead type's leads per
 **source** over 7, 30 or 90 days or all time: the source is the label
 `deriveSource` gives a lead's attribution (`partner:<code>`, with
 ` (unmatched)` when no partner application matched the code; else
@@ -434,6 +469,24 @@ leads `GET /leads/stats` counts (the site and type, not archived, not
 restricted, the window); at most `SOURCE_REPORT_MAX_SOURCES` (50) sources and
 `SOURCE_REPORT_MAX_CAMPAIGNS` (20) campaigns per source, the rest summed into
 one "Other" row. Attribution is customer-influenced text, shown as text only.
+
+A **conversation** is one member's saved Ask AI chat on one site
+(`app.ai_conversations`, its messages in `app.ai_messages`, written once and
+never edited): private to that member under an owner policy, the site's owner
+included (anyone else gets `404 conversation_not_found`), and kept until the
+member deletes it. An **attachment** is a file a member adds to a message
+(`app.ai_attachments`): `image`, `pdf` or `text`, of the kinds
+`AI_ATTACHMENT_KINDS` enables (none when unset), its type decided by its
+bytes. It is never a lead's document and never in `app.files`; it goes with
+its conversation, and an unsent one is swept a day later by the scheduler's
+`document_cleanup` task. **AI usage** is turns, tokens, models, outcomes and
+failure codes per member, model and Toronto day from `app.ai_turns`, beside
+the assistant's current configuration (Settings → AI usage, owner only by
+`staff.remove`), never content. An **effort level** is how hard Ask AI works
+on one question, chosen in the composer: `normal`, or `high`
+(`AI_HIGH_EFFORT_ENABLED`) with larger turn limits, its own model and rate
+limits and optional model reasoning, never wider reads or fewer checks;
+recorded in `ai_turns.effort` and on both stored messages (0037).
 
 The **intake check** proves every 15 minutes that a website could still save a
 lead: the scheduler's task `intake_check` first refuses a site with any
