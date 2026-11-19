@@ -103,7 +103,7 @@ confirmation cards and wider read tools (what a member sees in the admin, one
 money rule, cleaned record text), the safeguards against misuse (a customer's
 erasure reaches saved chats, file and chat limits, bounded choices) and the
 browser journeys that test them. It brings **migration `0039_ai_chat_erasure`**,
-which waits for the owner (item 7 below). Ask AI as a whole is still switched
+applied on 2026-11-19 (item 7 below). Ask AI as a whole is still switched
 off here (item 6), so none of this shows until it is switched on.
 
 Kept as they are here: this repository's browser-tab and home-screen icons
@@ -178,18 +178,13 @@ storefront's pre-arrival form sends.
    (Settings → Email).
 6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
    off.
-7. **Migration `0039`** (`0039_ai_chat_erasure`: a customer's erasure reaches
-   Ask AI's saved chats, and the chats of people gone from a site are
-   deleted) is not applied. Apply it in the SQL editor (it holds `ALTER` and
-   creates functions), insert its tracker row (hash
-   `0f3cb50e066d069905a56038a29af01dd32fa20f1ea933747812292ee0209b43`,
-   `created_at` `1795070872298`) and run the verify selects
-   (docs/RUNBOOKS/database.md, 0039). Either deploy order is safe; the backend
-   sees it within 5 minutes. Applied already, each with its tracker row and
-   checked against the runbook's verify queries: migrations `0034` to `0037`
-   (Ask AI's saved chat, its sweep and its effort level, 2026-11-19, through
-   the Supabase SQL connection) and `0038` (plain tasks: a task's lead may be
-   empty). The tracker holds 39 rows.
+7. **Migrations are all applied.** `0034` to `0037` (Ask AI's saved chat,
+   its sweep and its effort level), `0038` (plain tasks: a task's lead may be
+   empty) and `0039` (`0039_ai_chat_erasure`: a customer's erasure reaches Ask
+   AI's saved chats, and the chats of people gone from a site are deleted)
+   were applied on 2026-11-19 through the Supabase SQL connection, each with
+   its tracker row and checked against the runbook's verify queries. The
+   tracker holds 40 rows.
 8. **Features that need configuration before they show** (docs/ENV.md): the
    Analytics page (`UMAMI_API_URL`, `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`;
    check the old platform's `UMAMI_*` variables on the Railway service against

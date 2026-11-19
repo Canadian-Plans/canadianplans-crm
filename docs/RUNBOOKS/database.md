@@ -30,7 +30,7 @@ pg_proc / pg_policies where schemaname = 'app'`.
 On 2026-11-19 the hosted database was checked: migrations 0000 to 0037 are
 all applied, the Drizzle tracker holding rows 1 to 38, each verified against
 its file's SHA-256. 0038 was applied afterwards, with its tracker row (39
-rows). 0039 is the one prepared and waiting.
+rows), then 0039 (40 rows).
 
 ## Runtime role settings (2026-11-13)
 
@@ -1248,7 +1248,7 @@ select pg_get_constraintdef(oid) from pg_constraint
   -- FOREIGN KEY (workspace_id, lead_id) REFERENCES app.leads(workspace_id, id) ON DELETE CASCADE
 ```
 
-## 0039_ai_chat_erasure (2026-11-19, prepared, not applied)
+## 0039_ai_chat_erasure (2026-11-19, applied)
 
 Audit B2 and C13 (docs/design/ai-chat.md §13): a customer's data
 restriction reaches Ask AI's saved chats, and the chats of someone who left a
