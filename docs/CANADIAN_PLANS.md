@@ -187,13 +187,16 @@ storefront's pre-arrival form sends.
    (Settings → Email).
 6. **The intake check** (`INTAKE_CHECK_WORKSPACE_ID`) and the AI assistant are
    off.
-7. **Migrations are all applied.** `0034` to `0037` (Ask AI's saved chat,
+7. **Migrations `0000` to `0039` are applied; `0040` waits.** `0034` to `0037` (Ask AI's saved chat,
    its sweep and its effort level), `0038` (plain tasks: a task's lead may be
    empty) and `0039` (`0039_ai_chat_erasure`: a customer's erasure reaches Ask
    AI's saved chats, and the chats of people gone from a site are deleted)
    were applied on 2026-11-19 through the Supabase SQL connection, each with
    its tracker row and checked against the runbook's verify queries. The
-   tracker holds 40 rows.
+   tracker holds 40 rows. `0040_ai_model_settings` (Ask AI's model choice in
+   Settings → AI models and the chat) is prepared, not applied: until it is,
+   Settings → AI models cannot save and every turn uses `AI_GATEWAY_MODEL`
+   (docs/RUNBOOKS/database.md, 0040).
 8. **Features that need configuration before they show** (docs/ENV.md): the
    Analytics page (`UMAMI_API_URL`, `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`;
    check the old platform's `UMAMI_*` variables on the Railway service against
