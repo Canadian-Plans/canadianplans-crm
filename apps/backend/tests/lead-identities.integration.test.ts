@@ -10,25 +10,10 @@ import { openSensitiveValue } from '../src/crypto/cipher.js';
 import { DatabaseIdentityStore } from '../src/leads/identity-store.js';
 import { DatabaseLeadStore } from '../src/leads/store.js';
 import { claimLegacyTables, releaseLegacyTables } from './support/legacy-canadawide.js';
-
-function getDisposableTestDatabaseUrl(): string | undefined {
-  const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL;
-  const destructiveTestsEnabled = process.env.DB_TEST_ALLOW_DESTRUCTIVE === '1';
-
-  if (!migrationUrl && !destructiveTestsEnabled && !process.env.CI) return undefined;
-  if (!migrationUrl || !destructiveTestsEnabled) {
-    throw new Error(
-      'Database integration tests require TEST_MIGRATION_DATABASE_URL and DB_TEST_ALLOW_DESTRUCTIVE=1 together.',
-    );
-  }
-
-  const databaseName = decodeURIComponent(new URL(migrationUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('TEST_MIGRATION_DATABASE_URL must name a disposable database ending in _test.');
-  }
-
-  return migrationUrl;
-}
+import {
+  getDisposableTestDatabaseUrl,
+  TEST_RUNTIME_PASSWORD,
+} from '@canadian-plans/db/test-helpers';
 
 const migrationUrl = getDisposableTestDatabaseUrl();
 const databaseTest = migrationUrl ? describe : describe.skip;
@@ -41,7 +26,6 @@ const OTHER_WORKSPACE = '12000000-0000-4000-8000-000000000d02';
 const ACTOR = '22000000-0000-4000-8000-000000000d01';
 const OWNER = '22000000-0000-4000-8000-000000000d02';
 const REQUEST_ID = '32000000-0000-4000-8000-000000000d01';
-const TEST_RUNTIME_PASSWORD = 'local_ci_runtime_password';
 const KEY = 'ci-sensitive-fields-key-0123456789abcdef';
 // Made-up numbers that pass the Luhn check, never a real person's.
 const SIN = '046454286';
@@ -121,13 +105,25 @@ databaseTest('lead identities (migrations 0005–0006)', () => {
     overrides: { documentType?: string; status?: string } = {},
   ) => {
     const status = overrides.status ?? 'available';
+    const id = randomUUID();
+    const documentType = overrides.documentType ?? 'drivers_licence';
+    // As an attach does: the earlier current file of the type is superseded
+    // first, one current file per lead and type (#81).
+    if (status === 'available') {
+      await admin`
+        update app.files set superseded_by_file_id = ${id}
+        where workspace_id = ${workspaceId} and record_id = ${leadId}
+          and document_type = ${documentType} and status = 'available'
+          and superseded_by_file_id is null and not held_for_change_request
+      `;
+    }
     const [row] = await admin<{ id: string }[]>`
       insert into app.files (
-        workspace_id, record_type, record_id, document_type, bucket, staging_key, object_key,
+        id, workspace_id, record_type, record_id, document_type, bucket, staging_key, object_key,
         declared_content_type, detected_mime, declared_size_bytes, size_bytes, checksum_sha256,
         status, uploaded_by, expires_at
       ) values (
-        ${workspaceId}, 'lead', ${leadId}, ${overrides.documentType ?? 'drivers_licence'},
+        ${id}, ${workspaceId}, 'lead', ${leadId}, ${documentType},
         'documents', ${`staging/ci/${randomUUID()}`},
         ${status === 'available' ? `candidate/ci/${randomUUID()}` : null},
         'image/jpeg', ${status === 'available' ? 'image/jpeg' : null}, 1000,

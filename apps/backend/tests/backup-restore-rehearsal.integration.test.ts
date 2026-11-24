@@ -7,6 +7,7 @@ import { applyMigrations } from '@canadian-plans/db/migrations';
 import { seedDatabase } from '@canadian-plans/db/seed';
 import {
   assertDisposableDatabaseUrl,
+  getDisposableTestDatabaseUrl,
   setTestBackupReaderPassword,
   setTestRuntimePassword,
   TEST_BACKUP_READER_PASSWORD,
@@ -24,10 +25,10 @@ import {
   createBackupRunId,
   FakeStorageSourceReader,
   PgDumpDatabaseExporter,
-  PsqlReferencedObjectManifestSource,
   PsqlSourceCompletenessGuard,
   runBackup,
   type BackupRunSummary,
+  type StorageSourceReader,
 } from '@canadian-plans/jobs/backup';
 import {
   PsqlAndS3RestoreTarget,
@@ -45,23 +46,6 @@ import {
  * exactly the rows the dump held, with its RLS policies and grants intact.
  * Only the archive, the encryption and the document store are test doubles.
  */
-
-function getDisposableTestDatabaseUrl(): string | undefined {
-  const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL;
-  const destructiveTestsEnabled = process.env.DB_TEST_ALLOW_DESTRUCTIVE === '1';
-  if (!migrationUrl && !destructiveTestsEnabled && !process.env.CI) return undefined;
-  if (!migrationUrl || !destructiveTestsEnabled) {
-    throw new Error(
-      'Database integration tests require TEST_MIGRATION_DATABASE_URL and DB_TEST_ALLOW_DESTRUCTIVE=1 together.',
-    );
-  }
-  const databaseName = decodeURIComponent(new URL(migrationUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('TEST_MIGRATION_DATABASE_URL must name a disposable database ending in _test.');
-  }
-  assertDisposableDatabaseUrl(migrationUrl);
-  return migrationUrl;
-}
 
 /** Every tool reads its connection from PG* variables; the test cluster has no TLS in CI. */
 const toolEnv: NodeJS.ProcessEnv = { ...process.env, PGSSLMODE: 'disable' };
@@ -94,6 +78,7 @@ async function skipReason(migrationUrl: string | undefined): Promise<string | un
 }
 
 const migrationUrl = getDisposableTestDatabaseUrl();
+if (migrationUrl) assertDisposableDatabaseUrl(migrationUrl);
 const reason = await skipReason(migrationUrl);
 // In CI a missing or too-old dump client is a broken pipeline, never a skip;
 // only an unconfigured database (which CI rejects above) skips.
@@ -194,7 +179,10 @@ describe('backup and restore rehearsal on a disposable Postgres', () => {
   }
 
   /** The backup as the workflow runs it, minus auth and history (absent locally). */
-  function backup(id: string): Promise<BackupRunSummary> {
+  function backup(
+    id: string,
+    storage: StorageSourceReader = storageSource(),
+  ): Promise<BackupRunSummary> {
     return runBackup({
       deployment: 'rehearsal',
       runId: id,
@@ -206,8 +194,7 @@ describe('backup and restore rehearsal on a disposable Postgres', () => {
         { authData: 'skip', history: 'skip' },
         toolEnv,
       ),
-      referencedObjects: new PsqlReferencedObjectManifestSource(sourceReaderUrl, nodeRunCommand),
-      storageSource: storageSource(),
+      storageSource: storage,
       guard: new PsqlSourceCompletenessGuard(sourceReaderUrl, nodeRunCommand),
       sourceIds: { database: SOURCE_DATABASE },
       toolVersions: { pgDump: 'rehearsal' },
@@ -217,7 +204,7 @@ describe('backup and restore rehearsal on a disposable Postgres', () => {
 
   beforeAll(async () => {
     if (reason) return;
-    // The psql sources (completeness guard, referenced objects) read PGSSLMODE
+    // The psql completeness guard reads PGSSLMODE
     // from process.env rather than a base environment.
     vi.stubEnv('PGSSLMODE', 'disable');
     cluster = postgres(baseUrl, { max: 1, prepare: false, ssl: false });
@@ -420,5 +407,43 @@ describe('backup and restore rehearsal on a disposable Postgres', () => {
     expect(applyObjects).not.toHaveBeenCalled();
     const empty = await connectDestination();
     expect(await count(empty, "select count(*) from pg_namespace where nspname = 'app'")).toBe(0);
+  }, 120_000);
+
+  test('a document deleted while the backup runs is a warning from the dump, not a purge (#86)', async ({
+    skip,
+  }) => {
+    if (reason) skip(`rehearsal skipped: ${reason}`);
+    if (!source) throw new Error('the source database was not set up');
+    const db = source;
+    // After the dump, staff delete the document: its row is tombstoned and its
+    // object purged before the copy reaches it. Read again from the live
+    // database, the list would say "deleted" and hide the gap as a purge.
+    const deletingStorage: StorageSourceReader = {
+      getObject: async () => {
+        await db`
+          update app.files set status = 'deleted', deleted_at = now() where id = ${FILE_A}
+        `;
+        return undefined;
+      },
+    };
+    try {
+      const summary = await backup(createBackupRunId(new Date()), deletingStorage);
+      expect(summary).toMatchObject({
+        referencedObjectCount: 1,
+        purgedObjectCount: 0,
+        missingObjectCount: 1,
+        missingObjects: [`${BUCKET}/${WORKSPACE_A}/${OBJECT_KEY}`],
+        heartbeatPublished: true,
+      });
+
+      // The next night the dump holds the row as deleted: a purge, no warning.
+      const next = await backup(
+        createBackupRunId(new Date()),
+        new FakeStorageSourceReader(new Map()),
+      );
+      expect(next).toMatchObject({ purgedObjectCount: 1, missingObjectCount: 0 });
+    } finally {
+      await db`update app.files set status = 'available', deleted_at = null where id = ${FILE_A}`;
+    }
   }, 120_000);
 });

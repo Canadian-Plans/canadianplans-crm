@@ -7,40 +7,29 @@ import { z } from 'zod';
 
 import { DatabaseDocumentStore } from '../src/documents/store.js';
 import { customerEmailEnvironmentFromEnv } from '../src/email/senders.js';
-import { DatabaseLeadWorkStore, type LeadUpdateContext } from '../src/leads/work-store.js';
+import { DatabaseLeadWorkStore } from '../src/leads/work-store.js';
+import { type LeadUpdateContext } from '../src/leads/work-writes.js';
 import {
   ChangeRequestService,
   DatabaseChangeRequestStore,
   type DecideInput,
 } from '../src/tracking/change-requests.js';
-
-function getDisposableTestDatabaseUrl(): string | undefined {
-  const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL;
-  const destructiveTestsEnabled = process.env.DB_TEST_ALLOW_DESTRUCTIVE === '1';
-  if (!migrationUrl && !destructiveTestsEnabled && !process.env.CI) return undefined;
-  if (!migrationUrl || !destructiveTestsEnabled) {
-    throw new Error(
-      'Database integration tests require TEST_MIGRATION_DATABASE_URL and DB_TEST_ALLOW_DESTRUCTIVE=1 together.',
-    );
-  }
-  const databaseName = decodeURIComponent(new URL(migrationUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('TEST_MIGRATION_DATABASE_URL must name a disposable database ending in _test.');
-  }
-  return migrationUrl;
-}
+import {
+  getDisposableTestDatabaseUrl,
+  TEST_RUNTIME_PASSWORD,
+} from '@canadian-plans/db/test-helpers';
 
 const migrationUrl = getDisposableTestDatabaseUrl();
 const databaseTest = migrationUrl ? describe : describe.skip;
 
 const SITE = '00000000-0000-4000-8000-000000006801';
+const DEFAULT_EMAIL = 'nadia.decide@example.com';
 const BARE_SITE = '00000000-0000-4000-8000-000000006802'; // no email settings
 const CREDENTIAL = '00000000-0000-4000-8000-000000006811';
 const STAFF = '00000000-0000-4000-8000-000000006812';
 const COLLEAGUE = '00000000-0000-4000-8000-000000006813';
 const OLD_PLAN = '00000000-0000-4000-8000-000000006821';
 const OTHER_PLAN = '00000000-0000-4000-8000-000000006822';
-const TEST_RUNTIME_PASSWORD = 'local_ci_runtime_password';
 const NEW_PHONE = '+1 437 555 0188';
 const STAFF_PHONE = '+1 416 555 0000';
 const REQUESTED = {
@@ -78,7 +67,7 @@ databaseTest('approving and rejecting change requests', () => {
 
   const staff = (actorId = STAFF) => ({ actorId, requestId: crypto.randomUUID() });
 
-  const insertLead = async (site = SITE, email: string | null = 'nadia.decide@example.com') => {
+  const insertLead = async (site = SITE, email: string | null = DEFAULT_EMAIL) => {
     const [row] = await admin<{ id: string }[]>`
       insert into app.leads (workspace_id, lead_type, status, stage, full_name, email, phone,
         payload, order_details, consent_version)
@@ -148,19 +137,30 @@ databaseTest('approving and rejecting change requests', () => {
     email?: string | null,
     fields: Parameters<DatabaseChangeRequestStore['requestChange']>[0]['fields'] = REQUESTED,
   ) => {
-    const leadId = await insertLead(site, email);
+    // The customer's request is made while the order has its email, as the
+    // tracking route requires; a null `email` is the staff's later erasure.
+    const leadId = await insertLead(site, email === null ? DEFAULT_EMAIL : email);
     const oldPassport = await currentPassport(site, leadId);
     const scope = { workspaceId: site, actorId: CREDENTIAL, requestId: crypto.randomUUID() };
-    const saved = await store.requestChange({ ...scope, leadId, fields, now: new Date() });
+    const normalizedEmail = (email ?? DEFAULT_EMAIL).toLowerCase();
+    const saved = await store.requestChange({
+      ...scope,
+      leadId,
+      normalizedEmail,
+      fields,
+      now: new Date(),
+    });
     if (saved.status !== 'saved') throw new Error(`not saved: ${saved.status}`);
     const passport = await heldPassport(site, leadId);
     const attached = await store.attachDocument({
       ...scope,
       leadId,
+      normalizedEmail,
       fileId: passport.fileId,
       now: new Date(),
     });
     if (attached.status !== 'saved') throw new Error(`not attached: ${attached.status}`);
+    if (email === null) await admin`update app.leads set email = null where id = ${leadId}`;
     expect(attached.changeRequest.version).toBe(2);
     return { leadId, oldPassport, passport, request: attached.changeRequest };
   };
@@ -315,6 +315,18 @@ databaseTest('approving and rejecting change requests', () => {
       supersededBy: null,
     });
     expect((await fileRow(oldPassport))?.supersededBy).toBe(passport.fileId);
+    // One approval: the passport is approved too, by the same member, on the timeline.
+    expect(
+      await admin`
+        select decision, actor_id as "actorId" from app.file_review_events
+        where file_id = ${passport.fileId}
+      `,
+    ).toEqual([{ decision: 'approved', actorId: STAFF }]);
+    expect(
+      (await timeline(leadId)).filter(
+        (entry) => entry.kind === 'document' && entry.data['fileId'] === passport.fileId,
+      ),
+    ).toHaveLength(1);
     const page = await work.getLead({
       workspaceId: SITE,
       actorId: STAFF,
@@ -323,7 +335,11 @@ databaseTest('approving and rejecting change requests', () => {
       includeWork: true,
     });
     expect(page?.documents).toEqual([
-      expect.objectContaining({ id: passport.fileId, documentType: 'passport', review: null }),
+      expect.objectContaining({
+        id: passport.fileId,
+        documentType: 'passport',
+        review: expect.objectContaining({ decision: 'approved' }),
+      }),
     ]);
     expect(page?.changeRequest).toBeNull();
 
@@ -355,17 +371,91 @@ databaseTest('approving and rejecting change requests', () => {
     ).toEqual({ status: 'resolved' });
   });
 
+  it('replaces a waiting document before approval, and an approved one only after the next approval', async () => {
+    const leadId = await insertLead(SITE, DEFAULT_EMAIL);
+    const normalizedEmail = DEFAULT_EMAIL.toLowerCase();
+    const scope = { workspaceId: SITE, actorId: CREDENTIAL, requestId: crypto.randomUUID() };
+    const send = async (fileId: string) => {
+      const sent = await store.attachDocument({
+        ...scope,
+        leadId,
+        normalizedEmail,
+        fileId,
+        now: new Date(),
+      });
+      if (sent.status !== 'saved') throw new Error(`not saved: ${sent.status}`);
+      return sent.changeRequest;
+    };
+    const currentDocuments = async () =>
+      (
+        await work.getLead({
+          workspaceId: SITE,
+          actorId: STAFF,
+          catalog: codePropertyCatalog,
+          leadId,
+          includeWork: true,
+        })
+      )?.documents.map((document) => document.id);
+
+    // Before approval: the second upload replaces the first in the waiting request.
+    const first = await heldPassport(SITE, leadId);
+    await send(first.fileId);
+    const second = await heldPassport(SITE, leadId);
+    const waiting = await send(second.fileId);
+    expect(waiting.stagedFiles).toEqual([{ fileId: second.fileId, documentType: 'passport' }]);
+    expect((await fileRow(first.fileId))?.status).toBe('deleted');
+    expect(await currentDocuments()).toEqual([]);
+
+    const approved = await service.approve(
+      decide({ leadId, changeRequestId: waiting.id, expectedVersion: waiting.version }),
+    );
+    expect(approved.status).toBe('approved');
+    expect(await currentDocuments()).toEqual([second.fileId]);
+
+    // After approval: a new upload waits; the approved passport stays current meanwhile.
+    const third = await heldPassport(SITE, leadId);
+    const next = await send(third.fileId);
+    expect(next.id).not.toBe(waiting.id);
+    expect(await currentDocuments()).toEqual([second.fileId]);
+    expect(await fileRow(third.fileId)).toMatchObject({ held: true, status: 'available' });
+
+    // Rejected: the approved passport is kept.
+    const rejected = await service.reject(
+      decide({ leadId, changeRequestId: next.id, expectedVersion: next.version }),
+    );
+    expect(rejected.status).toBe('rejected');
+    expect(await currentDocuments()).toEqual([second.fileId]);
+
+    // Sent again and approved: only now does it replace the approved one.
+    const fourth = await heldPassport(SITE, leadId);
+    const last = await send(fourth.fileId);
+    expect(await currentDocuments()).toEqual([second.fileId]);
+    await service.approve(
+      decide({ leadId, changeRequestId: last.id, expectedVersion: last.version }),
+    );
+    expect(await currentDocuments()).toEqual([fourth.fileId]);
+    expect((await fileRow(second.fileId))?.supersededBy).toBe(fourth.fileId);
+  });
+
   it('refuses the version from before the customer replaced the request, writing nothing', async () => {
     const leadId = await insertLead();
     const scope = { workspaceId: SITE, actorId: CREDENTIAL, requestId: crypto.randomUUID() };
+    const normalizedEmail = DEFAULT_EMAIL;
     const first = await store.requestChange({
       ...scope,
       leadId,
+      normalizedEmail,
       fields: { phone: NEW_PHONE },
       now: new Date(),
     });
     if (first.status !== 'saved') throw new Error('not saved');
-    await store.requestChange({ ...scope, leadId, fields: { fullName: 'Other' }, now: new Date() });
+    await store.requestChange({
+      ...scope,
+      leadId,
+      normalizedEmail,
+      fields: { fullName: 'Other' },
+      now: new Date(),
+    });
     const before = await timeline(leadId);
     expect(
       await service.approve(

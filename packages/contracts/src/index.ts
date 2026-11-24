@@ -32,6 +32,7 @@ export {
 
 // API-surface vocabularies
 export {
+  DEFAULT_DOCUMENT_TYPE_KEYS,
   MAX_DOCUMENT_BYTES,
   documentChecklistKeySchema,
   documentMediaTypeSchema,
@@ -106,8 +107,11 @@ export {
 export {
   createServiceCredentialRequestSchema,
   createServiceCredentialResponseSchema,
+  credentialLeadTypesSchema,
   listServiceCredentialsResponseSchema,
   revokeServiceCredentialResponseSchema,
+  updateServiceCredentialRequestSchema,
+  updateServiceCredentialResponseSchema,
   serviceCredentialSummarySchema,
   websiteAuthErrorCodeSchema,
   websiteScopeSchema,
@@ -116,6 +120,8 @@ export {
   type ListServiceCredentialsResponse,
   type RevokeServiceCredentialResponse,
   type ServiceCredentialSummary,
+  type UpdateServiceCredentialRequest,
+  type UpdateServiceCredentialResponse,
   type WebsiteAuthErrorCode,
 } from './website-auth';
 
@@ -248,6 +254,10 @@ export {
   type ListWorkspaceLeadsQueryInput,
   type ListWorkspaceLeadsResponse,
   type ParsedLeadSort,
+  searchLeadBoardRequestSchema,
+  searchWorkspaceLeadsRequestSchema,
+  type SearchLeadBoardRequest,
+  type SearchWorkspaceLeadsRequest,
 } from './workspace-leads';
 
 export {
@@ -281,8 +291,12 @@ export {
   createPlainTaskRequestSchema,
   emailSkippedSchema,
   getWorkspaceLeadResponseSchema,
+  DRAFT_SAVE_VALUE_MAX,
+  draftSaveValueSchema,
+  type DraftSaveValue,
   leadActivitySchema,
   leadContactEditSchema,
+  leadContactExpectedSchema,
   leadDetailSchema,
   leadTaskResponseSchema,
   leadTaskSchema,
@@ -320,6 +334,7 @@ export {
   type LeadActivity,
   type LeadActivityKind,
   type LeadContactEdit,
+  type LeadContactExpected,
   type LeadDetail,
   type LeadTask,
   type LeadTaskResponse,
@@ -377,8 +392,13 @@ export {
   siteTemplateKeySchema,
   type EmailTemplateKey,
   type SiteTemplateKey,
+  EMAIL_MESSAGE_STATUSES,
   emailBodySchema,
+  emailDeliveryResponseSchema,
+  emailDeliveryRowSchema,
+  emailDeliverySummarySchema,
   emailFillIns,
+  emailMessageStatusSchema,
   emailSettingsResponseSchema,
   emailSettingsSchema,
   emailSubjectSchema,
@@ -398,8 +418,12 @@ export {
   updateEmailTemplateRequestSchema,
   type CustomerEmailJobPayload,
   type CustomerEmailTemplate,
+  type EmailDeliveryResponse,
+  type EmailDeliveryRow,
+  type EmailDeliverySummary,
   type EmailFillIn,
   type EmailFillInKey,
+  type EmailMessageStatus,
   type EmailSettings,
   type EmailSettingsResponse,
   type EmailTemplate,

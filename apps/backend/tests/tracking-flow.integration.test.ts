@@ -54,22 +54,10 @@ import { TrackingService } from '../src/tracking/service.js';
 import { DatabaseTrackingStore } from '../src/tracking/store.js';
 import { generateServiceSecret } from '../src/website/credential.js';
 import { DatabaseWebsiteCredentialStore } from '../src/website/store.js';
-
-function getDisposableTestDatabaseUrl(): string | undefined {
-  const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL;
-  const destructiveTestsEnabled = process.env.DB_TEST_ALLOW_DESTRUCTIVE === '1';
-  if (!migrationUrl && !destructiveTestsEnabled && !process.env.CI) return undefined;
-  if (!migrationUrl || !destructiveTestsEnabled) {
-    throw new Error(
-      'Database integration tests require TEST_MIGRATION_DATABASE_URL and DB_TEST_ALLOW_DESTRUCTIVE=1 together.',
-    );
-  }
-  const databaseName = decodeURIComponent(new URL(migrationUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('TEST_MIGRATION_DATABASE_URL must name a disposable database ending in _test.');
-  }
-  return migrationUrl;
-}
+import {
+  getDisposableTestDatabaseUrl,
+  TEST_RUNTIME_PASSWORD,
+} from '@canadian-plans/db/test-helpers';
 
 const migrationUrl = getDisposableTestDatabaseUrl();
 const databaseTest = migrationUrl ? describe : describe.skip;
@@ -83,7 +71,6 @@ const ORDERS_MEMBER = '00000000-0000-4000-8000-000000007212';
 const CREDENTIAL = '00000000-0000-4000-8000-000000007221';
 /** The scheduler's identity for the outbox runs. */
 const OUTBOX_ACTOR = '00000000-0000-4000-8000-000000007231';
-const TEST_RUNTIME_PASSWORD = 'local_ci_runtime_password';
 const CONTACT_SECRET = 'tracking-flow-contact-hash-secret-0123';
 const TRACKING_SECRET = 'tracking-flow-tracking-hash-secret-0123456789';
 const NADIA = 'nadia@example.com';
@@ -545,20 +532,20 @@ databaseTest('a customer change request, from the tracking code to approval on t
     });
     expect(email.deliveries[1]?.rendered?.text).toContain('Hi Nadia');
 
-    // The customer's list: nothing pending, the passport received.
+    // The customer's list: nothing pending, the passport approved by that one decision.
     expect(await listOrders()).toEqual([
       expect.objectContaining({
         reference,
         pendingChange: null,
         details: expect.objectContaining({ phone: NEW_PHONE, arrivalDate: NEW_ARRIVAL }),
         documents: [
-          { documentType: 'passport', state: 'received' },
+          { documentType: 'passport', state: 'approved' },
           { documentType: 'visa', state: 'missing' },
         ],
       }),
     ]);
 
-    // The Orders member approves the passport; the customer sees it approved.
+    // An Orders member can still review it again later (here: approve once more).
     const reviewed = await call(
       'POST',
       `/api/v1/staff/workspaces/${SITE}/files/${upload.uploadId}/review`,
@@ -566,14 +553,6 @@ databaseTest('a customer change request, from the tracking code to approval on t
       { decision: 'approved' },
     );
     expect(reviewed.status).toBe(200);
-    expect(await listOrders()).toEqual([
-      expect.objectContaining({
-        documents: [
-          { documentType: 'passport', state: 'approved' },
-          { documentType: 'visa', state: 'missing' },
-        ],
-      }),
-    ]);
 
     // The code job kept only the challenge id once it ended.
     const codeJobs = await jobs(TRACKING_CODE_JOB_TYPE);

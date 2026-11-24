@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   allowedStageMoves,
   defaultPropertyLayout,
@@ -15,7 +15,6 @@ import {
   type EmailSkipped,
   type GetWorkspaceLeadResponse,
   type LeadActivity,
-  type LeadContactEdit,
   type LeadTask,
   type ResolveChangeRequestResponse,
   type StaffChangeRequest,
@@ -27,7 +26,6 @@ import {
   Card,
   CardContent,
   cn,
-  Input,
   NativeSelect,
   Tabs,
   TabsList,
@@ -48,7 +46,6 @@ import {
   StickyNoteIcon,
   RotateCcwIcon,
 } from 'lucide-react';
-
 import {
   approveChangeRequest,
   createFileDownloadLink,
@@ -83,6 +80,7 @@ import { LoadingSkeleton } from '../crm/loading-skeleton';
 import { LEAD_WORK_SAVED } from '../../lib/lead-work-events';
 import { countryName } from '../../lib/countries';
 import { readableSource } from '../../lib/source-label';
+import { ContactEditor, contactConflictText } from './lead-contact-editor';
 
 const ATTRIBUTION_LABELS: Record<string, string> = {
   utmSource: 'UTM source',
@@ -134,22 +132,20 @@ export interface KeyFact {
  */
 export function KeyFacts({ facts }: { facts: readonly KeyFact[] }) {
   return (
-    <dl
-      role="group"
-      aria-label="Key facts"
-      className="flex flex-wrap gap-px overflow-hidden rounded-lg border bg-border text-sm"
-    >
-      {facts.map((fact) => (
-        <div
-          key={fact.label}
-          data-slot="key-fact"
-          className="min-w-0 flex-[1_1_9rem] bg-card px-3 py-2"
-        >
-          <dt className="text-xs text-muted-foreground">{fact.label}</dt>
-          <dd className="truncate font-medium">{fact.value}</dd>
-        </div>
-      ))}
-    </dl>
+    <div role="group" aria-label="Key facts">
+      <dl className="flex flex-wrap gap-px overflow-hidden rounded-lg border bg-border text-sm">
+        {facts.map((fact) => (
+          <div
+            key={fact.label}
+            data-slot="key-fact"
+            className="min-w-0 flex-[1_1_9rem] bg-card px-3 py-2"
+          >
+            <dt className="text-xs text-muted-foreground">{fact.label}</dt>
+            <dd className="truncate font-medium">{fact.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   );
 }
 
@@ -159,71 +155,6 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <dt className="text-muted-foreground">{label}</dt>
       <dd className="min-w-0 break-words">{children}</dd>
     </div>
-  );
-}
-
-function ContactEditor({
-  contact,
-  saving,
-  onSave,
-  onCancel,
-}: {
-  contact: GetWorkspaceLeadResponse['lead']['contact'];
-  saving: boolean;
-  onSave(edit: LeadContactEdit): void;
-  onCancel(): void;
-}) {
-  const [fullName, setFullName] = useState(contact.fullName ?? '');
-  const [email, setEmail] = useState(contact.email ?? '');
-  const [phone, setPhone] = useState(contact.phone ?? '');
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    const edit: LeadContactEdit = {};
-    if (fullName.trim() && fullName.trim() !== contact.fullName) edit.fullName = fullName.trim();
-    if (email.trim() && email.trim() !== contact.email) edit.email = email.trim();
-    if (phone.trim() && phone.trim() !== contact.phone) edit.phone = phone.trim();
-    if (Object.keys(edit).length === 0) onCancel();
-    else onSave(edit);
-  }
-
-  return (
-    <form onSubmit={submit} className="flex flex-col gap-2">
-      <label className="text-xs text-muted-foreground">
-        Name
-        <Input
-          value={fullName}
-          onChange={(event) => setFullName(event.target.value)}
-          maxLength={160}
-        />
-      </label>
-      <label className="text-xs text-muted-foreground">
-        Email
-        <Input
-          type="email"
-          value={email}
-          onChange={(event) => setEmail(event.target.value)}
-          maxLength={254}
-        />
-      </label>
-      <label className="text-xs text-muted-foreground">
-        Phone
-        <Input
-          type="tel"
-          value={phone}
-          onChange={(event) => setPhone(event.target.value)}
-          maxLength={40}
-        />
-      </label>
-      <div className="flex gap-2 pt-1">
-        <Button type="submit" size="sm" disabled={saving}>
-          {saving ? 'Saving…' : 'Save'}
-        </Button>
-        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-    </form>
   );
 }
 
@@ -431,6 +362,12 @@ export function LeadRecord({
       return result;
     } catch (error) {
       const code = errorReason(error);
+      if (code === 'version_conflict' && body.contact) {
+        // #89: the editor stays open with the typing; the reload shows what is saved now.
+        setMessage(contactConflictText(errorDetailList(error, 'fields')));
+        void record.reload();
+        return undefined;
+      }
       const refusal =
         body.stage === undefined ? undefined : stageMoveRefusal(code, lead.leadType, lead.stage);
       setMessage(refusal ?? describeError(error, 'save the change'));
@@ -727,7 +664,13 @@ export function LeadRecord({
   // once that tab has rendered. Focus moves to the card for keyboard users.
   function jumpTo(target: LeadAttentionTarget) {
     if (inPanel)
-      setPanelTab(target === 'documents' ? 'files' : target === 'tasks' ? 'tasks' : 'home');
+      setPanelTab(
+        target === 'documents' || (target === 'change-request' && requestOnFilesOnly)
+          ? 'files'
+          : target === 'tasks'
+            ? 'tasks'
+            : 'home',
+      );
     requestAnimationFrame(() => {
       const element = document.getElementById(anchorId(target));
       if (!element) return;
@@ -1027,7 +970,7 @@ export function LeadRecord({
           <ContactEditor
             contact={lead.contact}
             saving={saving}
-            onSave={(contact) => void update({ contact })}
+            onSave={(contact, expectedContact) => void update({ contact, expectedContact })}
             onCancel={() => setEditingContact(false)}
           />
         ) : (
@@ -1230,6 +1173,13 @@ export function LeadRecord({
     />
   ) : null;
 
+  // A request that brings documents is decided from the Files tab too, where
+  // staff look for an order's files; one that only sends documents lives there.
+  const requestHasDocuments = (shownRequest?.documents.length ?? 0) > 0;
+  const requestHasFields = shownRequest ? Object.keys(shownRequest.fields).length > 0 : false;
+  const requestOnFilesOnly = requestHasDocuments && !requestHasFields;
+  const waitingDocuments = shownRequest?.status === 'pending' ? shownRequest.documents.length : 0;
+
   const customerEmail = lead.contact.email?.trim() || undefined;
   const mailSection = (
     <Card>
@@ -1307,6 +1257,14 @@ export function LeadRecord({
           <TabsTrigger value="files" className="gap-1.5 px-2 text-xs">
             <FilesIcon className="size-3.5" aria-hidden="true" />
             Files
+            {access.contacts && waitingDocuments > 0 ? (
+              <span
+                className="rounded-full bg-amber-500/15 px-1.5 text-[10px] font-medium text-amber-700 tabular-nums dark:text-amber-300"
+                aria-label={`${String(waitingDocuments)} waiting for approval`}
+              >
+                {waitingDocuments}
+              </span>
+            ) : null}
           </TabsTrigger>
           {access.contacts ? (
             <TabsTrigger value="activity" className="gap-1.5 px-2 text-xs">
@@ -1322,7 +1280,9 @@ export function LeadRecord({
           forceMount
           className="flex flex-col gap-3 p-4"
         >
-          {access.contacts ? anchored('change-request', changeRequestSection) : null}
+          {access.contacts && !requestOnFilesOnly
+            ? anchored('change-request', changeRequestSection)
+            : null}
           <div className={DETAILS_SIDEBAR}>
             {contactSection}
             {anchored('order', propertiesSection)}
@@ -1356,10 +1316,21 @@ export function LeadRecord({
             </TabsContent>
           </>
         ) : null}
-        <TabsContent value="files" hidden={activeTab !== 'files'} forceMount className="p-4">
+        <TabsContent
+          value="files"
+          hidden={activeTab !== 'files'}
+          forceMount
+          className="flex flex-col gap-3 p-4"
+        >
+          {/* The customer's uploads waiting for a decision come first, with Approve and Reject. */}
+          {access.contacts && requestHasDocuments
+            ? requestOnFilesOnly
+              ? anchored('change-request', changeRequestSection)
+              : changeRequestSection
+            : null}
           {documents.length > 0 ? (
             anchored('documents', documentsSection)
-          ) : (
+          ) : access.contacts && requestHasDocuments ? null : (
             <Card>
               <CardContent className="flex flex-col items-center gap-2 py-8 text-center">
                 <FilesIcon className="size-6 text-muted-foreground" aria-hidden="true" />

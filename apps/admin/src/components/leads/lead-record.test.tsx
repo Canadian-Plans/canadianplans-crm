@@ -655,6 +655,88 @@ describe('LeadRecord documents', () => {
     });
   });
 
+  describe('the contact editor (#89)', () => {
+    async function openEditor() {
+      mocks.getStaffLead.mockResolvedValue(response());
+      render(<LeadRecord workspaceSlug="canadawide" leadId={LEAD} />);
+      await screen.findByRole('heading', { level: 1, name: 'Avery Example' });
+      const contact = screen.getByRole('heading', { name: 'Contact' }).parentElement;
+      if (!contact) throw new Error('The contact section is missing');
+      fireEvent.click(within(contact).getByRole('button', { name: 'Edit' }));
+    }
+    const corrected = response({
+      lead: { ...lead, contact: { ...lead.contact, fullName: 'Avery Corrected' } },
+    });
+
+    it('sends only the field staff changed, with its opened value, after the record reloads', async () => {
+      await openEditor();
+      fireEvent.change(screen.getByLabelText('Phone'), { target: { value: '403 555 0199' } });
+      // A colleague's saved name correction arrives while the editor is open.
+      mocks.getStaffLead.mockResolvedValue(corrected);
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent('crm:lead-work-saved', {
+            detail: { workspaceId: WORKSPACE, leadId: LEAD },
+          }),
+        );
+      });
+      await waitFor(() =>
+        expect(screen.getByLabelText<HTMLInputElement>('Name').value).toBe('Avery Corrected'),
+      );
+      expect(screen.getByLabelText<HTMLInputElement>('Phone').value).toBe('403 555 0199');
+      mocks.updateStaffLead.mockResolvedValue({
+        lead: { ...corrected.lead, contact: { ...corrected.lead.contact, phone: '403 555 0199' } },
+        activities: [],
+        allowedMoves: [],
+        requestId: NOW,
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(mocks.updateStaffLead).toHaveBeenCalledTimes(1));
+      expect(mocks.updateStaffLead).toHaveBeenCalledWith('staff-token', WORKSPACE, LEAD, {
+        contact: { phone: '403 555 0199' },
+        expectedContact: { phone: '403 555 0101' },
+      });
+    });
+
+    it('keeps what staff typed when the save is refused as stale, and says to reload', async () => {
+      const { BackendError } = await import('../../lib/api');
+      await openEditor();
+      fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Avery Mine' } });
+      mocks.updateStaffLead.mockRejectedValue(
+        new BackendError('version_conflict', 409, NOW, { fields: ['fullName'] }),
+      );
+      mocks.getStaffLead.mockResolvedValue(corrected);
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      expect(
+        await screen.findByText(/Someone else changed the name while you were editing/, undefined, {
+          timeout: 3000,
+        }),
+      ).toBeTruthy();
+      expect(mocks.updateStaffLead).toHaveBeenCalledWith('staff-token', WORKSPACE, LEAD, {
+        contact: { fullName: 'Avery Mine' },
+        expectedContact: { fullName: 'Avery Example' },
+      });
+      // The record was read again; the typed name stays, now saved over the new one on purpose.
+      expect(screen.getByLabelText<HTMLInputElement>('Name').value).toBe('Avery Mine');
+      expect(
+        await screen.findByText('Now saved as: Avery Corrected', undefined, { timeout: 3000 }),
+      ).toBeTruthy();
+      mocks.updateStaffLead.mockResolvedValue({
+        lead: { ...lead, contact: { ...lead.contact, fullName: 'Avery Mine' } },
+        activities: [],
+        allowedMoves: [],
+        requestId: NOW,
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() =>
+        expect(mocks.updateStaffLead).toHaveBeenLastCalledWith('staff-token', WORKSPACE, LEAD, {
+          contact: { fullName: 'Avery Mine' },
+          expectedContact: { fullName: 'Avery Corrected' },
+        }),
+      );
+    });
+  });
+
   it('offers no View or Download without the permission, and says who can grant it', async () => {
     mocks.getStaffLead.mockResolvedValue(response({ documents: [passport] }));
     render(<LeadRecord workspaceSlug="canadawide" leadId={LEAD} />);
@@ -799,6 +881,35 @@ describe('LeadRecord order details', () => {
       });
     }
 
+    it('puts documents sent on their own on the Files tab, with the count and Approve', async () => {
+      mocks.getStaffLead.mockResolvedValue(
+        loaded({ changeRequest: { ...pending, fields: {} }, documents: [] }),
+      );
+      render(<LeadRecord workspaceSlug="canadawide" leadId={LEAD} variant="panel" />);
+      const files = await screen.findByRole('tab', { name: /Files/ });
+      expect(within(files).getByLabelText('1 waiting for approval')).toBeTruthy();
+      // Not on Home: staff look for an order's files on the Files tab.
+      expect(screen.queryByRole('heading', { name: /request #70/ })).toBeNull();
+      fireEvent.mouseDown(files, { button: 0 });
+      expect(
+        screen.getByRole('heading', { name: 'Documents waiting for approval (request #70)' }),
+      ).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve documents' })).toBeTruthy();
+      expect(screen.queryByRole('heading', { name: 'No files yet' })).toBeNull();
+    });
+
+    it('shows a request with changes and documents on both Home and Files', async () => {
+      mocks.getStaffLead.mockResolvedValue(loaded());
+      render(<LeadRecord workspaceSlug="canadawide" leadId={LEAD} variant="panel" />);
+      expect(await screen.findAllByRole('heading', { name: 'Change request #70' })).toHaveLength(1);
+      fireEvent.mouseDown(screen.getByRole('tab', { name: /Files/ }), { button: 0 });
+      const visible = screen
+        .getAllByRole('heading', { name: 'Change request #70' })
+        .filter((heading) => heading.closest('[hidden]') === null);
+      expect(visible).toHaveLength(1);
+      expect(screen.getAllByRole('button', { name: 'Approve changes' }).length).toBeGreaterThan(0);
+    });
+
     it('shows the card above the timeline, not the old admin banner', async () => {
       mocks.getStaffLead.mockResolvedValue(loaded());
       render(<LeadRecord workspaceSlug="canadawide" leadId={LEAD} />);
@@ -860,7 +971,7 @@ describe('LeadRecord order details', () => {
         ),
       );
       expect(
-        await screen.findByText('Approved. The documents now wait for an Orders review.'),
+        await screen.findByText('Approved. The documents are now the order’s, approved.'),
       ).toBeTruthy();
       // The record is read again so the approved document lands on the Documents card.
       await waitFor(() => expect(mocks.getStaffLead).toHaveBeenCalledTimes(2));
@@ -869,7 +980,7 @@ describe('LeadRecord order details', () => {
         "You approved the customer's change request #70",
       );
       // The outcome stays on screen after the reload, with the focus on it; the decision buttons do not.
-      const outcome = screen.getByText(/Approved\. The documents now wait/);
+      const outcome = screen.getByText(/Approved\. The documents are now the order/);
       expect(document.activeElement).toBe(outcome);
       expect(screen.queryByRole('button', { name: 'Approve changes' })).toBeNull();
       expect(mocks.rejectChangeRequest).not.toHaveBeenCalled();
@@ -2042,7 +2153,10 @@ describe('KeyFacts', () => {
     'lays out %i facts as wrapping cells that grow to fill their row, never a fixed grid',
     (count) => {
       render(<KeyFacts facts={Array.from({ length: count }, (_, index) => fact(index + 1))} />);
-      const strip = screen.getByRole('group', { name: 'Key facts' });
+      const group = screen.getByRole('group', { name: 'Key facts' });
+      // The group is a wrapper; the facts stay a native description list.
+      const strip = group.querySelector('dl');
+      if (!strip) throw new Error('Key facts has no description list');
       // A fixed column count left the gap colour showing as a grey block in empty cells.
       expect(strip.className).not.toMatch(/grid/);
       expect(strip.className).toContain('flex-wrap');

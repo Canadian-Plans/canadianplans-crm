@@ -2,7 +2,11 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { websiteScopeNames, type WebsiteScopeName } from '@canadian-plans/types';
-import type { ServiceCredentialSummary } from '@canadian-plans/contracts';
+import {
+  leadTypeCatalog,
+  leadTypeLabel,
+  type ServiceCredentialSummary,
+} from '@canadian-plans/contracts';
 import {
   Badge,
   Button,
@@ -19,8 +23,10 @@ import {
   createServiceCredential,
   listServiceCredentials,
   revokeServiceCredential,
+  updateServiceCredential,
 } from '../lib/api';
 import { describeError } from '../lib/error-text';
+import { errorReason } from '../lib/use-resource';
 import { useStaffSession } from './staff-session-provider';
 
 /** What a scope lets the website do, for the scopes whose name alone does not say. */
@@ -30,6 +36,123 @@ const SCOPE_LABELS: Partial<Record<WebsiteScopeName, string>> = {
 
 const DEFAULT_SCOPES: readonly WebsiteScopeName[] = ['leads:write', 'uploads:customer'];
 
+/** Every registered lead type, in catalogue order: what a key may be permitted to send. */
+const LEAD_TYPES: readonly string[] = Object.keys(leadTypeCatalog);
+
+/** A key's lead types in words; a key without a list (made before they existed) is not limited. */
+function leadTypesLine(credential: ServiceCredentialSummary): string {
+  return credential.leadTypes
+    ? `Lead types: ${credential.leadTypes.map(leadTypeLabel).join(', ')}`
+    : 'Lead types: not limited (any type)';
+}
+
+/** Why a key's lead types cannot be changed yet: the database does not hold them (migration 0043). */
+const LEAD_TYPES_NOT_STORED =
+  'A key’s lead types cannot be changed until a database update is applied (migration 0043). Ask whoever looks after the CRM to apply it, then try again.';
+
+/** The lead types in catalogue order, whatever order they were ticked in. */
+function inCatalogueOrder(leadTypes: readonly string[]): string[] {
+  return LEAD_TYPES.filter((leadType) => leadTypes.includes(leadType));
+}
+
+function sameLeadTypes(a: readonly string[], b: readonly string[] | null | undefined): boolean {
+  return b != null && a.length === b.length && a.every((leadType) => b.includes(leadType));
+}
+
+/**
+ * The lead types of one existing key, as checkboxes with Save and Cancel. A
+ * key that is not limited starts with every type ticked, since that is what it
+ * accepts today; saving then limits it to the ticked ones.
+ */
+function LeadTypesEditor({
+  credential,
+  onSave,
+  onCancel,
+}: {
+  credential: ServiceCredentialSummary;
+  /** Saves the list; resolves to an error sentence when it could not be saved. */
+  onSave(leadTypes: string[]): Promise<string | undefined>;
+  onCancel(): void;
+}) {
+  const [selected, setSelected] = useState<readonly string[]>(
+    credential.leadTypes ? inCatalogueOrder(credential.leadTypes) : LEAD_TYPES,
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const none = selected.length === 0;
+  const unchanged = sameLeadTypes(selected, credential.leadTypes);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (none || unchanged || saving) return;
+    setSaving(true);
+    setError(undefined);
+    const failure = await onSave([...selected]);
+    // On success the row replaces this editor, so there is nothing left to update.
+    if (failure === undefined) return;
+    setError(failure);
+    setSaving(false);
+  }
+
+  return (
+    <form onSubmit={save} className="flex w-full flex-col gap-2.5 pt-1">
+      <fieldset className="space-y-2">
+        <legend className="text-xs font-medium text-muted-foreground">
+          Lead types key {credential.id} may send
+        </legend>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {LEAD_TYPES.map((leadType) => {
+            const checked = selected.includes(leadType);
+            return (
+              <label
+                key={leadType}
+                className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 text-xs transition-colors ${
+                  checked
+                    ? 'border-foreground/30 bg-muted/60 text-foreground'
+                    : 'border-border/70 bg-background/40 text-muted-foreground hover:bg-muted/30 hover:text-foreground'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="size-3.5 rounded border-border accent-primary"
+                  checked={checked}
+                  disabled={saving}
+                  onChange={() =>
+                    setSelected((current) =>
+                      current.includes(leadType)
+                        ? current.filter((item) => item !== leadType)
+                        : inCatalogueOrder([...current, leadType]),
+                    )
+                  }
+                />
+                <span className="font-medium text-foreground">{leadTypeLabel(leadType)}</span>
+              </label>
+            );
+          })}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {none
+            ? 'Choose at least one lead type.'
+            : 'A lead of any other type is refused and nothing is saved. The key’s secret stays the same.'}
+        </p>
+      </fieldset>
+      {error === undefined ? null : (
+        <p role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
+      )}
+      <div className="flex gap-2">
+        <Button type="submit" size="sm" disabled={none || unchanged || saving}>
+          {saving ? 'Saving…' : 'Save lead types'}
+        </Button>
+        <Button type="button" size="sm" variant="outline" disabled={saving} onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: string }) {
   const staff = useStaffSession();
   const workspace = staff.workspaces.find((item) => item.slug === workspaceSlug);
@@ -38,10 +161,14 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
 
   const [credentials, setCredentials] = useState<ServiceCredentialSummary[]>([]);
   const [selectedScopes, setSelectedScopes] = useState<readonly WebsiteScopeName[]>(DEFAULT_SCOPES);
+  // None chosen to start with: a key is permitted only what the owner ticks (#84).
+  const [selectedLeadTypes, setSelectedLeadTypes] = useState<readonly string[]>([]);
   const [issuedSecret, setIssuedSecret] = useState<string>();
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<ServiceCredentialSummary>();
+  /** The key whose lead types are being changed, if any. */
+  const [editingId, setEditingId] = useState<string>();
 
   const accessToken = staff.accessToken;
 
@@ -67,15 +194,26 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
     );
   }
 
+  function toggleLeadType(leadType: string) {
+    setSelectedLeadTypes((current) =>
+      current.includes(leadType)
+        ? current.filter((item) => item !== leadType)
+        : LEAD_TYPES.filter((item) => item === leadType || current.includes(item)),
+    );
+  }
+
+  const incomplete = selectedScopes.length === 0 || selectedLeadTypes.length === 0;
+
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!accessToken || !workspaceId || selectedScopes.length === 0 || busy) return;
+    if (!accessToken || !workspaceId || incomplete || busy) return;
     setBusy(true);
     setMessage(undefined);
     setIssuedSecret(undefined);
     try {
       const result = await createServiceCredential(accessToken, workspaceId, {
         scopes: [...selectedScopes],
+        leadTypes: [...selectedLeadTypes],
       });
       setIssuedSecret(result.secret);
       setMessage('Store this secret now — it is shown once and cannot be retrieved again.');
@@ -101,6 +239,26 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
     }
   }
 
+  /** Saves a key's lead types; the error sentence when it could not be saved. */
+  async function saveLeadTypes(credentialId: string, leadTypes: string[]) {
+    if (!accessToken || !workspaceId) return undefined;
+    try {
+      const result = await updateServiceCredential(accessToken, workspaceId, credentialId, {
+        leadTypes,
+      });
+      setCredentials((current) =>
+        current.map((item) => (item.id === credentialId ? result.credential : item)),
+      );
+      setEditingId(undefined);
+      return undefined;
+    } catch (error) {
+      // The shared sentence for this code is about issuing a key.
+      return errorReason(error) === 'credential_lead_types_unavailable'
+        ? LEAD_TYPES_NOT_STORED
+        : describeError(error, 'change the key’s lead types');
+    }
+  }
+
   const activeCount = credentials.filter((c) => !c.revokedAt).length;
 
   return (
@@ -117,7 +275,7 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
               workspace is derived from the credential, never from the request.
             </p>
           </div>
-          <Button type="submit" size="sm" disabled={busy || selectedScopes.length === 0}>
+          <Button type="submit" size="sm" disabled={busy || incomplete}>
             {busy ? 'Working…' : 'Issue credential'}
           </Button>
         </div>
@@ -149,6 +307,37 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
                       ) : null}
                       <code className="font-mono text-[11px]">{scope}</code>
                     </span>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+          <fieldset className="mt-5 space-y-2.5">
+            <legend className="text-xs font-medium text-muted-foreground">
+              Lead types this key may send
+            </legend>
+            <p className="text-xs text-muted-foreground">
+              A lead of any other type is refused and nothing is saved. Choose at least one.
+            </p>
+            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+              {LEAD_TYPES.map((leadType) => {
+                const checked = selectedLeadTypes.includes(leadType);
+                return (
+                  <label
+                    key={leadType}
+                    className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3.5 py-2.5 text-xs transition-colors ${
+                      checked
+                        ? 'border-foreground/30 bg-muted/60 text-foreground'
+                        : 'border-border/70 bg-background/40 text-muted-foreground hover:bg-muted/30 hover:text-foreground'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="size-3.5 rounded border-border accent-primary"
+                      checked={checked}
+                      onChange={() => toggleLeadType(leadType)}
+                    />
+                    <span className="font-medium text-foreground">{leadTypeLabel(leadType)}</span>
                   </label>
                 );
               })}
@@ -218,6 +407,7 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
                   <span className="text-xs text-muted-foreground">
                     {credential.scopes.join(', ')}
                   </span>
+                  <span className="text-xs text-muted-foreground">{leadTypesLine(credential)}</span>
                   {credential.revokedAt ? (
                     <span className="text-xs text-muted-foreground">
                       Revoked {new Date(credential.revokedAt).toISOString()}
@@ -225,16 +415,38 @@ export function ServiceCredentialsManager({ workspaceSlug }: { workspaceSlug: st
                   ) : null}
                 </span>
                 {credential.revokedAt ? null : (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => setRevokeTarget(credential)}
-                  >
-                    Revoke
-                  </Button>
+                  <span className="flex flex-wrap gap-2">
+                    {editingId === credential.id ? null : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={busy}
+                        aria-label={`Edit lead types of key ${credential.id}`}
+                        onClick={() => setEditingId(credential.id)}
+                      >
+                        Edit lead types
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => setRevokeTarget(credential)}
+                    >
+                      Revoke
+                    </Button>
+                  </span>
                 )}
+                {editingId === credential.id && !credential.revokedAt ? (
+                  <LeadTypesEditor
+                    key={credential.id}
+                    credential={credential}
+                    onSave={(leadTypes) => saveLeadTypes(credential.id, leadTypes)}
+                    onCancel={() => setEditingId(undefined)}
+                  />
+                ) : null}
               </li>
             ))}
           </ul>

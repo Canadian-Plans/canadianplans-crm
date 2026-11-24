@@ -7,15 +7,14 @@
 > state: [CANADIAN_PLANS.md](CANADIAN_PLANS.md).
 
 The current state, for whoever (person or AI session) picks this up next:
-where everything runs, how it fits together, what is live, what is merged but
-waits for an owner step, and what comes next. When something below stops being
-true, change it here; `git log` holds the history.
+where it runs, what is live, what waits for an owner step, and what comes
+next. When something below stops being true, change it here; `git log` holds
+the history.
 
-Reading order for a new session: [AGENTS.md](../AGENTS.md) (rules, commands,
-where things live) → this file → [PLAN.md](PLAN.md) (decisions, phases,
-why) → [ENV.md](ENV.md) (every variable) → [RUNBOOKS/database.md](RUNBOOKS/database.md)
-(migrations, trackers, passwords, adding a site) → [RUNBOOKS/legacy-import.md](RUNBOOKS/legacy-import.md)
-(the history imports and the switch day).
+Reading order: [AGENTS.md](../AGENTS.md) (rules, commands, where things
+live) → this file → [ARCHITECTURE.md](ARCHITECTURE.md) (how it works) →
+[PLAN.md](PLAN.md) (decisions) → [ENV.md](ENV.md) (every variable) →
+[RUNBOOKS/](RUNBOOKS/) (database, backups, imports, intake check, Ask AI).
 
 ## 1. Where everything is
 
@@ -33,13 +32,11 @@ why) → [ENV.md](ENV.md) (every variable) → [RUNBOOKS/database.md](RUNBOOKS/d
 | **Owner**    | Md Takibuddin, gamertakib@gmail.com — GitHub org owner, Railway workspace, Vercel team, Supabase org. First `owner` of both sites in the CRM (Auth user `b8fbfaea-a3a8-4cfd-b609-d9d422fa7b7e`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | **Websites** | Get Canada Sim (`Md-Takibuddin/Get-Canada-Sim`, Next.js on Vercel, its own admin and tables in `public`): its checkout writes every order to the CRM since about 2026-11-12 (`CRM_ORDERS` on, its PR #28; `CRM_TRACKING`'s state is not recorded here), and its old admin, which reads `public.orders`, is kept in step by the 0041 mirror once that is applied (§2.4, §3.2 item 18) until the owner retires it. CanadaWide (`Md-Takibuddin/Canadawide-Sales-website`, Next.js on Vercel in the owner's personal team, which this session's Vercel token cannot see): its internet and mobility forms send to the CRM since 2026-10-27 (`CRM_API_URL`, `CRM_SITE_KEY`; reference client `lib/crm.ts`); its ID-upload step still writes Supabase directly until `CRM_ID_STEP=on` (§5.1). Both send lead attribution (Get Canada Sim PR #32, CanadaWide PR #9). |
 
-Secrets never live in this repository. The `app_runtime` password exists only
-in Railway's `DATABASE_URL`; every other secret is listed by name in ENV.md and
-set on Railway, Vercel or GitHub. Several were generated during the build
-session and should be rotated once the owner has a password manager for them
-(§5.1).
+Secrets never live in this repository. The `app_runtime` password exists
+only in Railway's `DATABASE_URL`; every other secret is listed by name in
+ENV.md and set on Railway, Vercel or GitHub.
 
-## 2. Architecture map
+## 2. What is live
 
 ### 2.1 System
 
@@ -602,28 +599,104 @@ Reference client: `lib/crm.ts` in the CanadaWide repository.
   (design/ai-chat.md §8; the check after them is §3.2 item 13); attachments
   wait for `AI_ATTACHMENT_KINDS` (§3.2 item 14).
 - **Customer email** goes through Resend from each site's saved Settings →
-  Email (CanadaWide has saved settings; a site without them sends no customer
-  mail, `no_sender`). A message a person writes goes out as a plain letter,
-  template mails in the site's classic or hero card. Since 2026-11-14 a
-  customer's reply to a CRM mail lands on the lead (the Mail tab, the Mail page
-  and the timeline); mail sent before that replies to the sites' own
-  mailboxes. The CRM keeps each sent mail's subject and plain text on the
-  lead's timeline entry (owner decision, 13 Nov 2026).
-- **Lead sources.** Both websites send attribution since 2026-11-14; older
-  leads stay "Direct", and a CanadaWide lead that comes in through the intake
-  fallback would arrive without a source.
-- **Automations.** Every site's six built-in flows are seeded off; a flow
-  sends nothing until someone with `integration.manage` switches it on. This
+  Email; a site without them sends no customer mail (`no_sender`). CanadaWide
+  has saved settings. A customer's reply to a CRM mail lands on the lead
+  since 2026-11-14.
+- **Automations.** Every site's six built-in flows are seeded off. The
   repository records no flow switched on in production.
-- **Backups** run every night (RUNBOOKS/backup.md). A tombstoned file's purged
-  object failed the run from 14 to 16 Nov 2026 (no restore point for those
-  days); fixed on 16 Nov.
+- **Ask AI** is on for both sites since 2026-11-04
+  (`AI_ASSISTANT_WORKSPACE_IDS` and `AI_AUTOMATION_WORKSPACE_IDS` list both):
+  reads, confirmed cards, automation drafts that staff save explicitly, and
+  saved conversations. Attachments, High effort and the model menu wait for
+  owner steps (§3).
+- **The intake check** runs every 15 minutes since 2026-11-06 on the test
+  site `intake-check`.
+- **Backups** run every night. A document the snapshot holds as available
+  but storage no longer has leaves the run green with a warning and one owner
+  alert (`backup_objects_missing`).
 
-### 3.2 Merged but not applied or switched on
+## 3. Waiting for the owner
 
-Everything here is in the code on `main` but waits for a deliberate step. Apply
-migrations as RUNBOOKS/database.md says (in the SQL editor when the Supabase
-tool holds the statement), add the tracker rows, verify against the catalog.
+- **Migration 0048**. Not applied: the tool asked for the owner's confirmation
+  and got no answer. Nothing breaks without it; a rescued Get Canada Sim order
+  whose name or email is completed later is still not copied to the old admin.
+  On 2026-11-21 no existing order needed the backfill. _How:_
+  [RUNBOOKS/database.md](RUNBOOKS/database.md#0048-not-applied-yet): paste in
+  the SQL editor, with its tracker row (49 rows).
+- **Migration 0049** (an index for the new-leads count). Not applied; it
+  follows 0048 so the tracker stays in order. Nothing depends on it. _How:_
+  [RUNBOOKS/database.md](RUNBOOKS/database.md#0049-not-applied-yet).
+- **Does either site have a contact form?** `contact_message` is on all four
+  active keys as a precaution. _How:_ Confirm; remove the type from a key that
+  does not need it.
+- **Get Canada Sim's Settings → Email**. Not confirmed as saved. Without it
+  the site sends no customer mail (SIM numbers, tracking codes, decision
+  mails). _How:_ Settings → Email on `getcanadasim`, a test of each template.
+  Check:
+  `select w.slug, s.from_address from app.workspaces w left join app.workspace_email_settings s on s.workspace_id = w.id;`
+- **Get Canada Sim's `/track` through the CRM**. Whether `CRM_TRACKING` is on
+  is not recorded, nor whether `TRACKING_HASH_SECRET` is set on Railway.
+  _How:_ ENV.md, "Customer tracking". Turning only `CRM_TRACKING` off is
+  always safe
+  ([RUNBOOKS/legacy-import.md](RUNBOOKS/legacy-import.md#rollback)).
+- **CanadaWide's ID step through the CRM**. Built and smoke-tested;
+  `CRM_ID_STEP` is not set on CanadaWide, so the step still writes Supabase
+  directly. _How:_ Vercel → CanadaWide → Environment Variables:
+  `CRM_ID_STEP=on` for Production, redeploy. Then drop the last two anonymous
+  policies (§5).
+- **CanadaWide's staff cutover**. Staff still use the old admin. _How:_ On a
+  day the owner picks: re-run the import
+  ([RUNBOOKS/legacy-import.md](RUNBOOKS/legacy-import.md)), then staff work
+  only in the CRM; then the cutover clean-up (§4).
+- **CanadaWide's email style**. Not recorded as set. _How:_ Settings → Email →
+  Style "Website hero", brand colour `#0966ff`, accent `#c0ff72`.
+- **CanadaWide intake fallback**. Prepared, not applied. CanadaWide's side is
+  on its branch `claude/crm-intake-fallback`. _How:_
+  [RUNBOOKS/intake-fallback.md](RUNBOOKS/intake-fallback.md), "Switching it
+  on".
+- **`AI_ACTION_SIGNING_SECRET`**. Not confirmed as set. Until it is, the
+  Gateway key signs AI cards and the startup log warns. _How:_ ENV.md,
+  Railway.
+- **Ask AI attachments, High effort, model menu**. Off until
+  `AI_ATTACHMENT_KINDS`, `AI_HIGH_EFFORT_ENABLED` are set and an owner saves
+  more than one model. _How:_
+  [RUNBOOKS/ai-assistant.md](RUNBOOKS/ai-assistant.md) §12 to §14.
+- **`OPERATIONAL_RETENTION_ENABLED`**. Off: old operational rows are not
+  pruned. _How:_ The owner's call after a verified backup; ENV.md lists what
+  it prunes.
+- **Resend delivery events**. The Resend account has no delivery webhooks, so
+  Delivered and Bounced never reach the CRM and mails stay "Sent". _How:_ A
+  Resend webhook per site with its entry in `MACHINE_REGISTRY_JSON.webhooks`
+  (ENV.md).
+- **The Analytics page's Umami connection**. Not confirmed as configured.
+  _How:_ `UMAMI_API_URL`, `UMAMI_API_KEY`, `UMAMI_WORKSPACE_WEBSITES`
+  (ENV.md).
+- **One-off scrub of customer mails sent before the fix**. Prepared; not
+  confirmed as run. New ones are scrubbed when their job completes. _How:_
+  Paste
+  [manual/scrub-sent-customer-email-jobs.sql](RUNBOOKS/manual/scrub-sent-customer-email-jobs.sql)
+  in the SQL editor.
+- **Restore drill and the monitor's alert**. Neither is recorded as done.
+  _How:_ [RUNBOOKS/restore.md](RUNBOOKS/restore.md), "Drill";
+  [RUNBOOKS/backup.md](RUNBOOKS/backup.md) step 7.3.
+- **The intake check's controlled failure**. Not done. _How:_
+  [RUNBOOKS/intake-check.md](RUNBOOKS/intake-check.md), "The controlled
+  failure". Record the result here.
+- **Automations**. No flow is on. _How:_ Switch a built-in flow on only after
+  checking the website does not send the same email. Decide whether the Orders
+  role alone may override the documents check (today it also needs
+  `lead.manage`).
+- **Team**. The other admins are not invited. _How:_ Settings → Team; each
+  sets their own name. An invitation older than 14 days no longer works and
+  needs a new one.
+- **Accounts and secrets**. The Railway project is in a personal workspace;
+  several secrets were generated during the build. _How:_ Move the project to
+  a Canadian Plans workspace; rotate the `app_runtime` password, `CRON_SECRET` (32+
+  characters), `EMAIL_CONTACT_HASH_SECRET` and the registry secrets; remove
+  `EMAIL_SENDERS_JSON` (nothing reads it).
+- **Supabase Auth settings**. To confirm. _How:_ "Confirm email" on;
+  anonymous, phone and unverified-OAuth sign-ins off; leaked-password
+  protection on.
 
 | #   | Item                                                                                                                   | State                                                                                                                                                                                                                                                                                                                                                                                                            | How                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | --- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -646,7 +719,7 @@ tool holds the statement), add the tracker rows, verify against the catalog.
 | 17  | Migration `0040_ai_model_settings` (Ask AI's model choice: Settings → AI models and the composer's model menu)         | Applied on Canadian Plans on 2026-11-20 by the owner in the SQL editor (41 tracker rows). Settings → AI models can save; until an owner saves more than one model the composer shows no model menu and every turn uses `AI_GATEWAY_MODEL` (and High's own model) as before.                                                                                                                                      | RUNBOOKS/database.md, 0040: the verify selects. Then the owner allows models in Settings → AI models (RUNBOOKS/ai-assistant.md §14).                                                                                                                                                                                                                                                                                          |
 | 18  | Migration `0041_getcanadasim_legacy_mirror` (the old Get Canada Sim admin receives every submitted CRM order again)    | Prepared, not applied. On Canadian Plans it does nothing: the database has no Get Canada Sim site (the trigger and the backfill are no-ops without `public.orders` and the `getcanadasim` site). Apply it to keep the migration history the same as GT Sales'.                                                                                                                                                   | RUNBOOKS/database.md, 0041: run the owner's apply script (guard, statements, tracker row) in the SQL editor, then the verify selects.                                                                                                                                                                                                                                                                                         |
 
-## 4. What is verified, and how
+## 4. What comes next
 
 | Claim                                       | Evidence                                                                                                                                                                                     |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -660,9 +733,34 @@ tool holds the statement), add the tracker rows, verify against the catalog.
 | Imports complete and idempotent             | The reconciliation in RUNBOOKS/legacy-import.md (0 legacy rows missing, 0 stage or trash mismatches); the nightly sync's past runs are in `cron.job_run_details`                             |
 | Ask AI                                      | Deterministic and real-backend tests in CI; what has not been verified live is listed in RUNBOOKS/ai-assistant.md §10                                                                        |
 
-## 5. What comes next
+- **Cross-site inbox, contact page, split and merge of contacts** (not
+  started): one query per site the member belongs to, a page with one
+  person's leads across sites, audited split/merge.
+- **Cutover clean-up**, once CanadaWide's staff are on the CRM: a migration
+  dropping the 0002 mirror and the 0005/0006 identity mirror functions, and
+  removing the Internet and Mobility Leads pages from the Get Canada Sim
+  admin. The same for the 0041 mirror when the old Get Canada Sim admin is
+  retired.
+- **Model `partner_application` and `contact_message`**; until then they take
+  any payload as resumable drafts.
+- **Documents**: staff upload and replace on the lead page.
+- **The quality and testing plan**: [TESTING-PLAN.md](TESTING-PLAN.md).
+- **Ask AI, deferred**: the writes that stay with a person
+  (design/ai-actions.md), documents and knowledge retrieval, cross-site
+  analysis, and publishing or switching a flow on from chat. The real-model
+  evaluation of automation authoring ([evals](evals/automation-authoring.md))
+  is not recorded as run.
+- **Ask AI model comparison** ([evals/model-test](evals/model-test/README.md)):
+  built and tried locally only; waits for the owner to create the two test
+  users, run its seed, allow the Model test site and set up the `model-test`
+  GitHub Environment before a first real run.
+- **Not built**: Export on the board's own selection and exports over 5,000
+  leads; attachments on a customer reply, an unread count and staff
+  notification of a reply, branded reply domains; a `List-Unsubscribe`
+  header; a pending-invitations list with revoke; visitors per source beside
+  the source report.
 
-### 5.1 Owner actions
+**Open follow-ups**
 
 **Migrations and prepared changes.** The items of §3.2, in that order where
 it matters (item 13 before item 14).
@@ -879,129 +977,50 @@ submission so a retry never makes a second order (§2.6 item 9).
   limit; (3) the access read and the data in one transaction. The query plans
   are not the problem (the list page runs in 14 ms).
 - **Turnstile is off by design** (`WEBSITE_BOT_CHECK=delegated`). If a site
-  shows abuse its own screening misses, add Turnstile to its forms, forward
-  the token as `x-turnstile-token`, set the `TURNSTILE_*` variables and switch
-  the mode back to `turnstile`.
-- **Error tracking unset.** `SENTRY_DSN`/`NEXT_PUBLIC_SENTRY_DSN` empty; the
-  adapters are inert until set.
-- **Vercel deployment protection** gates everything except the production
-  domain; preview deployments need a Vercel login.
-- **`.next/types` after deleting a route**: `apps/admin` typecheck reads stale
-  generated types; delete `apps/admin/.next` and run again.
-- **Local Postgres in the cloud dev container** is a Postgres 16 cluster that
-  stops on worker restarts: `pg_ctlcluster 16 main start`; the `postgres`
-  password there is `postgres` (local only). Integration suites need the CI
-  values from `.github/workflows/ci.yml`.
-- **Properties** (none blocking): `app.guard_restricted_lead()` (0001) does
-  not cover `custom_values` (the work store already refuses edits on a
-  restricted lead); `customFilterCondition` duplicates the per-kind switch of
-  `formFilterCondition` in `leads/staff-queries.ts`;
-  `components/leads/leads-inbox.tsx` has grown past 1200 lines; the archive and
-  restore responses return the raw stored custom values instead of the shaped
-  ones; `property.manage` cannot be granted per member; a built-in label
-  override cannot be cleared back to the code label from the UI.
-- **Plans** (none blocking): an `empty` filter on an order property across all
-  lead types also matches types that take no order; a combined contact and
-  order `PATCH` that the order part refuses still refreshes the contact; a
-  plan property can be both `staffOnly` and `websiteVisible` (the website then
-  sees it); a plan saved at the moment its property is deleted can keep a value
-  for it.
-- **Order tools and email** (none blocking): `[button: ](url)` with an empty
-  label reads as an ordinary link, and a `**` can close inside a link label; a
-  staff "email the customer this number" send of a template that no longer
-  parses is a 500 rather than a clear message; a sender name with non-ASCII
+  shows abuse, add Turnstile to its forms and switch the mode back.
+- **Small, none blocking.** Properties: the restriction guard does not cover
+  `custom_values`; `property.manage` cannot be granted per member; a built-in
+  label override cannot be cleared from the UI. Plans: a plan property can be
+  both `staffOnly` and `websiteVisible`. Email: a sender name with non-ASCII
   characters is quoted, not RFC 2047 encoded; a replayed draft create returns
-  a fresh draft grant each time; the documents check reads files and reviews
-  without locking them (a later move re-checks); the concurrency test of two
-  simultaneous submits does not force them to overlap.
-- **Automation flows**: a timer whose item keeps throwing is rolled back,
-  logged and retried by every tick (no attempts column, P17); a flow's version
-  list shows the newest 500; the lock order of `restore()` and `create()`
-  differs (ENG-L8; no deadlock was constructible).
-- **Backups** (none blocking): a CLI smoke step in CI (each CLI with an empty
-  environment exits 1); scrub inherited `PGHOSTADDR`, `PGSERVICE` and
-  `PGOPTIONS` in `pgConnectionEnv` (`jobs/src/backup/pg-dump.ts`); a guard for
-  tables in schemas the dump does not list; `--no-psqlrc` and
-  `ON_ERROR_STOP=1` on the sources' `psql` calls (`jobs/src/backup/sources.ts`);
-  a `baseEnv` parameter on the guard and the referenced-objects sources;
-  retention reports the `deleted` count so far when it fails mid-run; a SIGINT
-  handler in the restore CLI that removes the decrypted temporary folder;
-  `requiredEnv` returns the trimmed value; one lost-key sentence, the same in
-  backup.md §4, restore.md and the alert response; validate `BACKUP_RUN_ID`
-  against the `run-<id>` shape.
-- **Intake check**: a check through `POST /api/v1/website/leads` with a real
-  site key would also catch a broken route or credential; each run leaves one
-  `lead.created` audit row on the test site (about 96 a day, never pruned);
-  runs are only in the logs and the alert state only in memory (a small table
-  would keep it across restarts).
-- **Ask AI's saved chat** (docs/design/ai-chat.md §12): attachment objects
-  are in no backup (the nightly backup copies what `files` and
-  `file_revisions` reference), so a restore brings back conversations without
-  their files; a customer's data erasure empties only the turns that link the
-  lead or hold its order number, so an answer that named a customer in other
-  words stays until the member deletes the conversation; a finalize cut short
-  by a process exit can leave one unreferenced copy of an upload in storage.
-- **Umami**: the Analytics page's endpoint shapes were read from Umami's own
-  source at tag v3.4.1; recheck them after an Umami upgrade.
+  a fresh draft grant. Automations: a timer whose item keeps throwing is
+  retried by every tick (no attempts column). Backups: a CLI smoke step in
+  CI; a SIGINT handler in the restore CLI. Intake check: runs are only in
+  the logs and each leaves one `lead.created` audit row on the test site.
+  Ask AI: attachment objects are in no backup; an answer that named a
+  customer in other words survives that customer's erasure until the member
+  deletes the conversation. Umami: recheck the endpoint shapes after an
+  upgrade (read at v3.4.1).
 
-### 5.4 Open security items
+## 5. Open security items
 
 - **CanadaWide's anonymous write paths.** Two policies remain until its ID
-  step moves to the CRM (§5.1):
+  step moves to the CRM: `public.mobility_id_uploads` "anon can insert
+  mobility id uploads" and `storage.objects` "anon can upload mobility ids"
+  (bucket `mobility-ids`). Until then CanadaWide's licence photos are only in
+  that bucket, outside the CRM and outside the nightly backup.
+- **Supabase Auth settings**, **`AI_ACTION_SIGNING_SECRET`**, **`CRON_SECRET`
+  length** and **secret rotation**: §3.
 
-  | Policy (production)                                                      | Status                                                                           |
-  | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
-  | `public.internet_leads` "anon can submit leads"                          | Dropped 2026-10-27, after every new `internet_leads` row had its `app.leads` id. |
-  | `public.mobility_leads` "anon can insert mobility leads"                 | Dropped 2026-10-27, the same check against `mobility_leads`.                     |
-  | `public.mobility_id_uploads` "anon can insert mobility id uploads"       | Stays until the ID step moves.                                                   |
-  | `storage.objects` "anon can upload mobility ids" (bucket `mobility-ids`) | Stays until the ID step moves.                                                   |
+## 6. How it is verified
 
-  The first two were dropped with
-  [manual/close-canadawide-lead-inserts.sql](RUNBOOKS/manual/close-canadawide-lead-inserts.sql),
-  which checks inside its transaction that every legacy row since the switch
-  came through intake. CanadaWide's licence photos (20 files, 12.5 MB on
-  2026-11-08) are only in the `mobility-ids` bucket, outside the CRM and
-  outside the nightly backup, until the ID step moves.
+- **Backend serves, scheduler runs**: `GET /api/v1/health` and `/api/v1/ready`
+  200; no `scheduler_task_failed` in the deploy logs
+- **Admin is reachable and wired**: `/login` 200 on `canadian-plans-crm-admin.vercel.app`
+- **Code gates**: CI on every PR and on `main`
+- **Tenant isolation**: `apps/backend/tests/isolation.spec.ts` and the RLS
+  integration suites; every migration verified against the catalogue
+- **Website intake**: One `intake_check` log line every 15 minutes with
+  `status` `ok`; an owner alert on failure
+- **Backups**: The nightly `backup_completed` line and the hourly monitor
+  (alerts when the last copy is over 26 hours old)
 
-- **Supabase Auth**: confirm "Confirm email" is on and anonymous, phone and
-  unverified-OAuth sign-ins are off (the invitation check is only as strong as
-  the provider's email confirmation, L-16); enable leaked-password protection
-  (Authentication → Policies; the security advisor flags it).
-- **`AI_ACTION_SIGNING_SECRET`** (§3.2 item 8).
-- **`CRON_SECRET`**: the registry's 16-character floor was not raised (a
-  shorter production secret would stop the API booting); use 32+ random
-  characters.
-- **Secrets generated during the build** to rotate (§5.1, Accounts and
-  secrets).
+## Sync with GT Sales (PRs 72 to 120)
 
-## 6. How to work in this repository
-
-The rules, commands and where things live are in [AGENTS.md](../AGENTS.md).
-In short:
-
-- **Branches and deploys.** `main` is production for both apps; push there only
-  with the owner's say-so. Work on feature branches, PR into `main`; CI runs on
-  PRs and on `main`. Railway and Vercel skip builds when only docs change
-  (`watchPatterns`, `affected-builds.mjs`).
-- **Gate before every commit**: `pnpm run typecheck && pnpm run lint && pnpm run format && pnpm test && pnpm run build`,
-  with the integration variables set so the database suites run. Browser
-  checks: `pnpm run test:e2e` after an admin build, and
-  `pnpm --filter admin test:e2e:leads` (needs local Postgres with a
-  `canadian_plans_crm_e2e_test` database; it builds its own admin into `.next-e2e`
-  and puts `next-env.d.ts` back afterwards).
-- **Contracts change → regenerate** `docs/api/openapi.json` with
-  `pnpm --filter @canadian-plans/contracts build`; CI diffs it.
-- **Schema change**: edit `packages/db/src/schema.ts`, generate a migration
-  (`drizzle-kit generate`, `--custom` for hand-written SQL), apply it to the
-  hosted project deliberately (never from a deploy), record it in both
-  trackers, verify the objects, and add a seed/test touching it. Statements the
-  Supabase tool refuses (`REVOKE`, `ALTER`, `DELETE`, `DROP`) go to
-  `docs/RUNBOOKS/manual/` for the owner to paste into the SQL editor. Until
-  it is applied, list it in §3.2.
-- **Docs to keep current**: this file, PLAN.md, ENV.md on any variable,
-  RUNBOOKS/database.md on any database procedure.
-- **No secrets, ever**, in code, docs, commits or chat transcripts; the Get
-  Canada Sim repository once leaked a service-role key this way and had to
-  rotate it.
-- Commit messages explain the why; one change per commit; the attribution
-  trailer the session requires.
+Brought up to date with the GT Sales CRM through GT commit `e1083ec`
+(GT PRs #81–#120: the audit fixes, the split lead and staff modules, a key's
+lead types, customer documents on the Files tab, approving a change request's
+documents). How the system works now lives in
+[ARCHITECTURE.md](ARCHITECTURE.md). **Migrations 0042 to 0049 are prepared,
+not applied** on the Canadian Plans database: the owner applies them in order
+([RUNBOOKS/database.md](RUNBOOKS/database.md)); 0048 is a no-op here, like 0041. 0046 goes in before the deploy (GT note in the runbook).

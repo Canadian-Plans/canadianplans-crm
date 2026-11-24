@@ -18,7 +18,7 @@ import type {
 import { createApp } from '../src/app.js';
 import type { StaffSessionVerifier } from '../src/auth/session.js';
 import type { DocumentService } from '../src/documents/service.js';
-import type { LeadUpdateContext } from '../src/leads/work-store.js';
+import type { LeadUpdateContext } from '../src/leads/work-writes.js';
 import type { StaffStore } from '../src/staff/store.js';
 import {
   ChangeRequestService,
@@ -576,7 +576,12 @@ describe('change requests', () => {
       expect.objectContaining({ normalizedEmail: JANE, reference: 'MS-901' }),
     );
     expect(changeStore.requestChange).toHaveBeenCalledWith(
-      expect.objectContaining({ workspaceId: WORKSPACE, actorId: CREDENTIAL, leadId: LEAD }),
+      expect.objectContaining({
+        workspaceId: WORKSPACE,
+        actorId: CREDENTIAL,
+        leadId: LEAD,
+        normalizedEmail: JANE,
+      }),
     );
   });
 
