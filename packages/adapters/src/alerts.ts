@@ -15,9 +15,10 @@ import { z } from 'zod';
 export const ownerAlertKinds = [
   'synthetic_check_failed',
   'backup_stale',
+  'backup_objects_missing',
+  'document_cleanup_stuck',
   'job_queue_stuck',
   'error_rate_spike',
-  'catalogue_sync_failed',
   'scheduler_not_started',
   'synthetic_check_recovered',
   'automation_backlog',
@@ -65,12 +66,14 @@ function alertSubject(kind: OwnerAlertKind): string {
       return 'Canadian Plans CRM: intake check passing again';
     case 'backup_stale':
       return 'Canadian Plans CRM: backup snapshot is stale';
+    case 'backup_objects_missing':
+      return 'Canadian Plans CRM: backup completed without some documents';
+    case 'document_cleanup_stuck':
+      return 'Canadian Plans CRM: document files are not being deleted from storage';
     case 'job_queue_stuck':
       return 'Canadian Plans CRM: failed job queue is not draining';
     case 'error_rate_spike':
       return 'Canadian Plans CRM: error rate spike detected';
-    case 'catalogue_sync_failed':
-      return 'Canadian Plans CRM: catalogue sync is failing';
     case 'scheduler_not_started':
       return 'Canadian Plans CRM: background scheduler did not start';
     case 'automation_backlog':

@@ -2,15 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type FormEvent,
-  type ReactNode,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   CUSTOM_PROPERTY_KEY_PREFIX,
   DEFAULT_LEAD_VIEW_STATE,
@@ -22,10 +14,7 @@ import {
   leadTypeEntry,
   leadTypeLabel,
   SAVED_VIEW_LIMIT,
-  type AssignableMember,
-  type FilterableLeadProperty,
   type LeadExportFilter,
-  type LeadFieldOption,
   type LeadPropertyFilter,
   type LeadPropertyOperator,
   type LeadTableColumn,
@@ -61,7 +50,6 @@ import {
   TableIcon,
   XIcon,
 } from 'lucide-react';
-
 import {
   createSavedView,
   deleteSavedView,
@@ -81,10 +69,11 @@ import { usePropertyModel } from '../properties/use-property-model';
 import {
   filterQueryForLeadType,
   inboxSearch,
-  parseHiddenColumns,
+  legacySearchParam,
   parseInboxQuery,
   type InboxQuery,
 } from './inbox-query';
+import { LEAD_SEARCH_OPENED, peekLeadSearch, takeLeadSearch } from '../../lib/lead-search-handoff';
 import { propertyFilterParts, propertyOperatorLabel } from './lead-fields';
 import { LeadExportDialog } from './lead-export-dialog';
 import { LeadRecord } from './lead-record';
@@ -109,108 +98,32 @@ import {
   isViewDirty,
   viewStateToInboxQuery,
 } from './view-state';
+import {
+  ActiveFilterChip,
+  CheckRow,
+  Count,
+  TOOLBAR_BUTTON,
+  TOOLBAR_ICON,
+  TOOLBAR_LABEL,
+  TabButton,
+  assigneeFilterWords,
+  defaultDraftMultiFor,
+  defaultDraftValueFor,
+  optionLabel,
+} from './inbox-controls';
+import {
+  SORT_FIELDS,
+  keepUnreadProperties,
+  splitSort,
+  takeLegacyHiddenColumns,
+  useStableValue,
+} from './inbox-url';
 
 const SEARCH_DELAY_MS = 300;
 
-/** Compact icon controls in the inbox header; their panels hold all view settings. */
-// An icon on narrow screens; from `xl` the button says what it is.
-const TOOLBAR_BUTTON = 'relative h-8 w-8 shrink-0 gap-1.5 rounded-full p-0 xl:w-auto xl:px-3';
-const TOOLBAR_LABEL = 'hidden text-xs font-normal xl:inline';
-const TOOLBAR_ICON = 'size-3.5 text-muted-foreground';
 const countFormat = new Intl.NumberFormat('en-CA');
 /** The most leads one bulk archive or restore changes. */
 const BULK_ARCHIVE_MAX = 100;
-
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick(): void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={cn(
-        'inline-flex items-center gap-2 border-b-2 px-3 py-2 text-sm whitespace-nowrap transition-colors',
-        active
-          ? 'border-primary font-medium text-foreground'
-          : 'border-transparent text-muted-foreground hover:text-foreground',
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
-function Count({ value }: { value: number | undefined }) {
-  if (value === undefined) return null;
-  return (
-    <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground tabular-nums">
-      {value}
-    </span>
-  );
-}
-
-/** A choice option the site no longer offers for new values (it still finds old leads). */
-function isRetired(option: LeadFieldOption): boolean {
-  return 'hidden' in option && option.hidden === true;
-}
-
-/** The option a new filter starts on: the first one still offered. */
-function firstOfferedOption(prop: FilterableLeadProperty): LeadFieldOption | undefined {
-  return prop.options?.find((option) => !isRetired(option)) ?? prop.options?.[0];
-}
-
-function defaultDraftValueFor(prop: FilterableLeadProperty | undefined): string {
-  if (!prop) return '';
-  if (prop.kind === 'choice') return firstOfferedOption(prop)?.value ?? '';
-  if (prop.kind === 'yesNo') return 'true';
-  return '';
-}
-
-function defaultDraftMultiFor(prop: FilterableLeadProperty): string[] {
-  const first = firstOfferedOption(prop);
-  return first ? [first.value] : [];
-}
-
-/** A choice option as the filter offers it, a retired one marked. */
-function optionLabel(option: LeadFieldOption): string {
-  return isRetired(option) ? `${option.label} (retired)` : option.label;
-}
-
-/** The URL params that name properties, with the `InboxQuery` field each one carries. */
-const PROPERTY_PARAMS = [
-  ['where', 'where'],
-  ['cols', 'columns'],
-  ['sort', 'sort'],
-] as const;
-
-/**
- * While the site's catalogue cannot be read, the built-in one cannot parse a
- * custom property's filter, column or sort; a change that does not touch
- * them keeps them as the URL had them, so a shared link loses nothing.
- */
-function keepUnreadProperties(
-  search: string,
-  currentUrl: string,
-  patch: Partial<InboxQuery>,
-): string {
-  const params = new URLSearchParams(search.slice(1));
-  const current = new URLSearchParams(currentUrl);
-  for (const [param, field] of PROPERTY_PARAMS) {
-    if (field in patch) continue;
-    const raw = current.get(param) ?? (param === 'cols' ? current.get('columns') : null);
-    if (raw !== null) params.set(param, raw);
-  }
-  const kept = params.toString();
-  return kept ? `?${kept}` : '';
-}
 
 /** What a failed saved-view call says to the person who made it. */
 function savedViewFailure(error: unknown): string {
@@ -230,135 +143,11 @@ function savedViewFailure(error: unknown): string {
   return describeError(error, 'save the view');
 }
 
-const LEGACY_HIDDEN_COLUMNS_KEY = 'gt-table-hidden-cols:';
-
-/**
- * The hidden table columns this browser kept before they moved into the URL
- * (`?hide=`), read once and forgotten. Returns undefined when there were none.
- */
-function takeLegacyHiddenColumns(workspaceId: string): LeadTableColumn[] | undefined {
-  try {
-    const key = `${LEGACY_HIDDEN_COLUMNS_KEY}${workspaceId}`;
-    const raw = window.localStorage.getItem(key);
-    if (raw === null) return undefined;
-    window.localStorage.removeItem(key);
-    const saved: unknown = JSON.parse(raw);
-    if (!Array.isArray(saved)) return undefined;
-    const hide = parseHiddenColumns(
-      saved.filter((entry): entry is string => typeof entry === 'string'),
-    );
-    return hide.length > 0 ? hide : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * One applied filter, "Field: value ×", in the CRM chip style. Its button
- * names the filter whole ("Remove filter Stage: New"), so two filters on one
- * property are told apart.
- */
-function ActiveFilterChip({
-  label,
-  value,
-  onRemove,
-}: {
-  label: string;
-  value: string;
-  onRemove(): void;
-}) {
-  return (
-    <span className="inline-flex h-6 max-w-full items-center gap-1 rounded-[4px] border border-crm-chip-border bg-crm-chip pr-0.5 pl-2 text-[12px] text-crm-chip-foreground">
-      <span className="shrink-0 font-medium">{label}:</span>
-      <span className="min-w-0 truncate">{value}</span>
-      <button
-        type="button"
-        aria-label={`Remove filter ${label}: ${value}`}
-        title={`Remove filter ${label}: ${value}`}
-        className="grid size-5 shrink-0 place-items-center rounded-[3px] outline-none hover:bg-crm-chip-border/50 focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={onRemove}
-      >
-        <XIcon aria-hidden="true" className="size-3" />
-      </button>
-    </span>
-  );
-}
-
-/** An assignee filter as the chip names it: `Me`, `Unassigned` or the member. */
-function assigneeFilterWords(value: string, members: readonly AssignableMember[]): string {
-  if (value === 'me') return 'Me';
-  if (value === 'none') return 'Unassigned';
-  const member = members.find((entry) => entry.actorId === value);
-  return member ? memberName(member) : 'A teammate';
-}
-
-/** One checkbox row of a menu panel, labelled by its text. */
-function CheckRow({
-  id,
-  label,
-  checked,
-  disabled,
-  onToggle,
-}: {
-  id: string;
-  label: string;
-  checked: boolean;
-  disabled?: boolean;
-  onToggle(): void;
-}) {
-  return (
-    <button
-      type="button"
-      id={id}
-      role="checkbox"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={onToggle}
-      className={cn(
-        'inline-flex min-h-7 max-w-full items-center rounded-full border px-2.5 py-1 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
-        checked
-          ? 'border-border bg-muted text-foreground'
-          : 'border-border/50 text-muted-foreground hover:bg-accent',
-      )}
-    >
-      <span className="truncate">{label}</span>
-    </button>
-  );
-}
-
-const SORT_FIELDS: readonly { field: string; label: string; first: 'asc' | 'desc' }[] = [
-  { field: 'fullName', label: 'Name', first: 'asc' },
-  { field: 'createdAt', label: 'Created', first: 'desc' },
-  { field: 'updatedAt', label: 'Last activity', first: 'desc' },
-];
-
-function splitSort(sort: string | undefined): { field?: string; direction?: 'asc' | 'desc' } {
-  if (!sort) return {};
-  const colon = sort.lastIndexOf(':');
-  const direction = sort.slice(colon + 1);
-  return {
-    field: sort.slice(0, colon),
-    direction: direction === 'asc' || direction === 'desc' ? direction : undefined,
-  };
-}
-
-/**
- * The previous reference while `value` serializes the same (`undefined`
- * included), so a re-parse of the URL does not hand consumers a new array.
- */
-function useStableValue<T>(value: T): T {
-  const key = JSON.stringify(value) ?? 'undefined';
-  const [held, setHeld] = useState({ key, value });
-  if (held.key === key) return held.value;
-  setHeld({ key, value });
-  return value;
-}
-
 /**
  * The leads inbox: a tab per lead type the site has and the archive, with the
  * search and compact Filters, View options and Saved views menus at the end
  * of that row; the active filters as chips under it while
- * there are any; and a table or (for one type) a board. Every choice is in
+ * there are any; and a table or (for one type) a board. Every choice but the search text (page state, #83) is in
  * the URL.
  */
 /** Each site's one lead type (or none), as last seen this session: see `soleType`. */
@@ -380,9 +169,24 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
   // their content is the same, so opening a panel does not reload the list.
   const where = useStableValue(parsedQuery.where);
   const columns = useStableValue(parsedQuery.columns);
+  // The search is page state, never in the address (#83). It starts from a
+  // search handed over by Ctrl/Cmd K, or from an old link's `?q=`, which the
+  // effect below takes out of the address.
+  const [searchTerm, setSearchTerm] = useState<string | undefined>(
+    () => peekLeadSearch() ?? legacySearchParam(searchParams),
+  );
+  useEffect(() => {
+    const opened = () => {
+      const term = takeLeadSearch();
+      if (term !== undefined) setSearchTerm(term.trim().slice(0, 100) || undefined);
+    };
+    opened();
+    window.addEventListener(LEAD_SEARCH_OPENED, opened);
+    return () => window.removeEventListener(LEAD_SEARCH_OPENED, opened);
+  }, []);
   const query = useMemo<InboxQuery>(
-    () => ({ ...parsedQuery, where, columns }),
-    [parsedQuery, where, columns],
+    () => ({ ...parsedQuery, where, columns, ...(searchTerm ? { q: searchTerm } : {}) }),
+    [parsedQuery, where, columns, searchTerm],
   );
   // A link naming a custom property can only be read once the site's
   // catalogue is here; until then the list waits rather than load without it.
@@ -478,6 +282,7 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
           ? undefined
           : base.view;
     const next: InboxQuery = { ...base, page: 1, ...patch, view };
+    if ('q' in patch) setSearchTerm(patch.q);
     openQuery(
       next,
       catalogFailed && !next.archived
@@ -543,11 +348,12 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
     return catalogFailed ? {} : filterQueryForLeadType(latestQuery.current, nextType, catalog);
   }
 
-  // Two old addresses are rewritten once, in one change so neither undoes the
-  // other: hidden table columns used to live in this browser and move into
-  // the URL (`?hide=`) the first time the site's inbox opens without one, and
-  // links from before Archive replaced Trash said `?trash=1`; they open the
-  // archive, and the address is rewritten to say `?archived=1`.
+  // Three old addresses are rewritten, in one change so none undoes another:
+  // hidden table columns used to live in this browser and move into the URL
+  // (`?hide=`) the first time the site's inbox opens without one; links from
+  // before Archive replaced Trash said `?trash=1`, which opens the archive
+  // and is rewritten to `?archived=1`; and links from before #83 carried the
+  // search (`?q=`), which is taken out of the address.
   const migratedFor = useRef<string | undefined>(undefined);
   const rewrittenUrl = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -569,6 +375,15 @@ export function LeadsInbox({ workspaceSlug }: { workspaceSlug: string }) {
       archivedFirst = params.get('trash') === '1' || params.get('archived') === '1';
       params.delete('trash');
       params.delete('archived');
+      changed = true;
+    }
+    // A link from before #83 carried the search (`?q=`): it is page state
+    // now (taken above, or here when the link arrives while the inbox is
+    // open), and the address is rewritten without it.
+    if (params.has('q')) {
+      const legacy = legacySearchParam(params);
+      if (legacy !== undefined) setSearchTerm(legacy);
+      params.delete('q');
       changed = true;
     }
     if (!changed) return;

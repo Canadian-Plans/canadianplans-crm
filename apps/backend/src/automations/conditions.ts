@@ -2,7 +2,7 @@ import { sql, type SQL } from 'drizzle-orm';
 import type { TenantTransaction } from '@canadian-plans/db';
 import type { Condition, ConditionGroup, PropertyCatalog } from '@canadian-plans/contracts';
 
-import { propertyFilterCondition, resolvePropertyFor } from '../leads/staff-queries.js';
+import { propertyFilterCondition, resolvePropertyFor } from '../leads/lead-filters.js';
 
 /**
  * A flow's conditions (spec §5 "Conditions") as one SQL expression on lead

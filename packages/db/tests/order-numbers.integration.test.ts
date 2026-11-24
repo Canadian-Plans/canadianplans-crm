@@ -4,26 +4,11 @@ import postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { applyMigrations, migrationsFolder } from '../src/migrations.js';
-import { setTestRuntimePassword, TEST_RUNTIME_PASSWORD } from '../src/test-helpers.js';
-
-function getDisposableTestDatabaseUrl(): string | undefined {
-  const migrationUrl = process.env.TEST_MIGRATION_DATABASE_URL;
-  const destructiveTestsEnabled = process.env.DB_TEST_ALLOW_DESTRUCTIVE === '1';
-
-  if (!migrationUrl && !destructiveTestsEnabled && !process.env.CI) return undefined;
-  if (!migrationUrl || !destructiveTestsEnabled) {
-    throw new Error(
-      'Database integration tests require TEST_MIGRATION_DATABASE_URL and DB_TEST_ALLOW_DESTRUCTIVE=1 together.',
-    );
-  }
-
-  const databaseName = decodeURIComponent(new URL(migrationUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('TEST_MIGRATION_DATABASE_URL must name a disposable database ending in _test.');
-  }
-
-  return migrationUrl;
-}
+import {
+  getDisposableTestDatabaseUrl,
+  setTestRuntimePassword,
+  TEST_RUNTIME_PASSWORD,
+} from '../src/test-helpers.js';
 
 const migrationUrl = getDisposableTestDatabaseUrl();
 const databaseTest = migrationUrl ? describe : describe.skip;
@@ -117,7 +102,7 @@ databaseTest('per-site counters (app.site_counters, migrations 0015 and 0016)', 
     }
   });
 
-  it('has RLS enabled and forced, its tenant and backup read policies, and 49 read policies in all', async () => {
+  it('has RLS enabled and forced, its tenant and backup read policies, and 50 read policies in all', async () => {
     const [table] = await admin<{ rowSecurity: boolean; forced: boolean }[]>`
       select c.relrowsecurity as "rowSecurity", c.relforcerowsecurity as forced
       from pg_class c
@@ -140,7 +125,7 @@ databaseTest('per-site counters (app.site_counters, migrations 0015 and 0016)', 
       where schemaname = 'app' and policyname like '%\\_backup\\_reader\\_read'
         and 'backup_reader' = any (roles)
     `;
-    expect(backupPolicies?.count).toBe(49);
+    expect(backupPolicies?.count).toBe(50);
   });
 
   it('app_runtime may select, insert and update but never delete; backup_reader reads it', async () => {

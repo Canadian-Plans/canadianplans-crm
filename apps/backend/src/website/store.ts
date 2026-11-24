@@ -8,9 +8,16 @@ import {
 import { websiteScopeSchema } from '@canadian-plans/contracts';
 import type { WebsiteScopeName } from '@canadian-plans/types';
 
+import {
+  credentialLeadTypesSchema,
+  type CredentialLeadTypesSchemaProbe,
+} from './credential-schema.js';
+
 export interface ServiceCredentialRecord {
   id: string;
   scopes: WebsiteScopeName[];
+  /** The lead types the key may send; null when it is not limited (see `credential-schema.ts`). */
+  leadTypes: string[] | null;
   createdAt: string;
   revokedAt: string | null;
 }
@@ -19,8 +26,19 @@ export interface CreateCredentialInput {
   actorId: string;
   workspaceId: string;
   scopes: readonly WebsiteScopeName[];
+  /** The lead types the key may create and save (issue #84). */
+  leadTypes: readonly string[];
   secretHash: string;
   requestId: string;
+}
+
+/** The database has no `lead_types` column yet (migration 0043): the key is not created. */
+export class CredentialLeadTypesUnavailableError extends Error {
+  readonly code = 'credential_lead_types_unavailable';
+  constructor() {
+    super('service credential lead types are not available yet');
+    this.name = 'CredentialLeadTypesUnavailableError';
+  }
 }
 
 export interface RevokeCredentialInput {
@@ -35,6 +53,20 @@ export type RevokeCredentialResult =
   | { status: 'already_revoked'; revokedAt: string }
   | { status: 'not_found' };
 
+export interface UpdateCredentialLeadTypesInput {
+  actorId: string;
+  workspaceId: string;
+  credentialId: string;
+  /** The lead types the key may create and save from now on. */
+  leadTypes: readonly string[];
+  requestId: string;
+}
+
+export type UpdateCredentialLeadTypesResult =
+  | { status: 'updated'; credential: ServiceCredentialRecord }
+  | { status: 'revoked' }
+  | { status: 'not_found' };
+
 export interface WebsiteCredentialStore {
   createCredential(input: CreateCredentialInput): Promise<ServiceCredentialRecord>;
   listCredentials(input: {
@@ -42,6 +74,11 @@ export interface WebsiteCredentialStore {
     workspaceId: string;
   }): Promise<ServiceCredentialRecord[]>;
   revokeCredential(input: RevokeCredentialInput): Promise<RevokeCredentialResult>;
+  /**
+   * Sets the lead types of a key that is not revoked. Optional so the many
+   * route tests that never reach it need no stand-in; the database store has it.
+   */
+  updateLeadTypes?(input: UpdateCredentialLeadTypesInput): Promise<UpdateCredentialLeadTypesResult>;
 }
 
 type CredentialDatabase = Pick<DatabaseClient, 'withTenantTx'>;
@@ -51,6 +88,7 @@ const defaultCredentialDatabase: CredentialDatabase = { withTenantTx };
 function toRecord(row: {
   id: string;
   scopes: string[];
+  leadTypes?: string[] | null;
   createdAt: Date;
   revokedAt: Date | null;
 }): ServiceCredentialRecord {
@@ -58,28 +96,40 @@ function toRecord(row: {
     id: row.id,
     // Persisted scopes are validated back to the known scope union, never trusted blindly.
     scopes: websiteScopeSchema.array().parse(row.scopes),
+    leadTypes: row.leadTypes ?? null,
     createdAt: row.createdAt.toISOString(),
     revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
   };
 }
 
 export class DatabaseWebsiteCredentialStore implements WebsiteCredentialStore {
-  constructor(private readonly database: CredentialDatabase = defaultCredentialDatabase) {}
+  constructor(
+    private readonly database: CredentialDatabase = defaultCredentialDatabase,
+    /** Whether the database holds the lead types yet (migration 0043). */
+    private readonly leadTypesSchema: CredentialLeadTypesSchemaProbe = credentialLeadTypesSchema,
+  ) {}
 
   async createCredential(input: CreateCredentialInput): Promise<ServiceCredentialRecord> {
     return this.database.withTenantTx(
       { actorId: input.actorId, workspaceId: input.workspaceId },
       async (tx) => {
+        // Without the column the chosen lead types could not be kept: refuse
+        // rather than issue a key that looks limited and is not.
+        if (!(await this.leadTypesSchema.ready(tx))) {
+          throw new CredentialLeadTypesUnavailableError();
+        }
         const [row] = await tx
           .insert(serviceCredentials)
           .values({
             workspaceId: input.workspaceId,
             secretHash: input.secretHash,
             scopes: [...input.scopes],
+            leadTypes: [...input.leadTypes],
           })
           .returning({
             id: serviceCredentials.id,
             scopes: serviceCredentials.scopes,
+            leadTypes: serviceCredentials.leadTypes,
             createdAt: serviceCredentials.createdAt,
             revokedAt: serviceCredentials.revokedAt,
           });
@@ -93,7 +143,7 @@ export class DatabaseWebsiteCredentialStore implements WebsiteCredentialStore {
           entity: 'service_credential',
           entityId: row.id,
           requestId: input.requestId,
-          after: { scopes: [...input.scopes] },
+          after: { scopes: [...input.scopes], leadTypes: [...input.leadTypes] },
         });
 
         return toRecord(row);
@@ -108,10 +158,13 @@ export class DatabaseWebsiteCredentialStore implements WebsiteCredentialStore {
     return this.database.withTenantTx(
       { actorId: input.actorId, workspaceId: input.workspaceId },
       async (tx) => {
+        // Before migration 0043 there is no column to read: every key is "not limited".
+        const withLeadTypes = await this.leadTypesSchema.ready(tx);
         const rows = await tx
           .select({
             id: serviceCredentials.id,
             scopes: serviceCredentials.scopes,
+            ...(withLeadTypes ? { leadTypes: serviceCredentials.leadTypes } : {}),
             createdAt: serviceCredentials.createdAt,
             revokedAt: serviceCredentials.revokedAt,
           })
@@ -163,6 +216,66 @@ export class DatabaseWebsiteCredentialStore implements WebsiteCredentialStore {
           after: { revokedAt: revokedAt.toISOString() },
         });
         return { status: 'revoked', revokedAt: revokedAt.toISOString() };
+      },
+    );
+  }
+
+  async updateLeadTypes(
+    input: UpdateCredentialLeadTypesInput,
+  ): Promise<UpdateCredentialLeadTypesResult> {
+    return this.database.withTenantTx(
+      { actorId: input.actorId, workspaceId: input.workspaceId },
+      async (tx) => {
+        // Without the column there is nothing to change (migration 0043).
+        if (!(await this.leadTypesSchema.ready(tx))) {
+          throw new CredentialLeadTypesUnavailableError();
+        }
+        const ofThisSite = and(
+          eq(serviceCredentials.workspaceId, input.workspaceId),
+          eq(serviceCredentials.id, input.credentialId),
+        );
+        const columns = {
+          id: serviceCredentials.id,
+          scopes: serviceCredentials.scopes,
+          leadTypes: serviceCredentials.leadTypes,
+          createdAt: serviceCredentials.createdAt,
+          revokedAt: serviceCredentials.revokedAt,
+        };
+        // Locked, so a concurrent revoke or change is seen before this one writes.
+        const [existing] = await tx
+          .select(columns)
+          .from(serviceCredentials)
+          .where(ofThisSite)
+          .limit(1)
+          .for('update');
+        if (!existing) return { status: 'not_found' };
+        if (existing.revokedAt) return { status: 'revoked' };
+
+        const leadTypes = [...input.leadTypes];
+        const unchanged =
+          existing.leadTypes !== null &&
+          existing.leadTypes.length === leadTypes.length &&
+          existing.leadTypes.every((leadType, index) => leadType === leadTypes[index]);
+        if (unchanged) return { status: 'updated', credential: toRecord(existing) };
+
+        const [row] = await tx
+          .update(serviceCredentials)
+          .set({ leadTypes })
+          .where(ofThisSite)
+          .returning(columns);
+        if (!row) throw new Error('service credential update did not return a row');
+        await tx.insert(auditEvents).values({
+          workspaceId: input.workspaceId,
+          actorId: input.actorId,
+          actorLabel: 'staff actor',
+          action: 'service_credential.lead_types_updated',
+          entity: 'service_credential',
+          entityId: input.credentialId,
+          requestId: input.requestId,
+          before: { leadTypes: existing.leadTypes },
+          after: { leadTypes },
+        });
+        return { status: 'updated', credential: toRecord(row) };
       },
     );
   }

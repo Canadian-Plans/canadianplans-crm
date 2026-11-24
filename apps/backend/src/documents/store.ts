@@ -20,6 +20,13 @@ import {
   type FileStatus,
 } from '@canadian-plans/contracts';
 
+import {
+  enqueueObjectDeletions,
+  fileObjectKeys,
+  isRetiredObjectKey,
+  STAGING_DELETE_MARGIN_MS,
+} from './object-deletions.js';
+
 /**
  * Persistence for T17 documents. The interface is store-agnostic so the
  * security logic in `service.ts` can be exercised against an in-memory
@@ -394,7 +401,23 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           )
           .limit(1);
         if (!lead) return { status: 'lead_not_found' };
+        // A key that was ever queued for deletion is retired (#82): a retried
+        // import of a file erased since must not point a live row at it again.
+        if (await isRetiredObjectKey(tx, input.workspaceId, input.bucket, input.objectKey)) {
+          return { status: 'lead_not_found' };
+        }
 
+        const slot = {
+          workspaceId: input.workspaceId,
+          recordType: 'lead' as const,
+          recordId: input.leadId,
+          documentType: input.documentType,
+        };
+        // #81: one current file per slot. Under the slot's lock the earlier
+        // current file is superseded before this one is inserted current.
+        await lockDocumentSlot(tx, slot);
+        const raced = await selectFile(tx, input.workspaceId, input.fileId);
+        if (raced) return { status: 'exists', file: raced };
         const revision = await nextRevision(
           tx,
           input.workspaceId,
@@ -402,6 +425,7 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           input.leadId,
           input.documentType,
         );
+        await supersedeEarlier(tx, { ...slot, id: input.fileId });
         const now = new Date();
         // Never uploaded here, so no staging object: its keys are all the
         // verified copy, which the import alone wrote.
@@ -449,7 +473,6 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           checksumSha256: input.checksumSha256,
           createdBy: input.uploadedBy,
         });
-        await supersedeEarlier(tx, file);
         await writeAudit(tx, {
           workspaceId: input.workspaceId,
           actorId: input.actorId,
@@ -504,6 +527,43 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
     return this.database.withTenantTx(
       { workspaceId: input.workspaceId, actorId: input.actorId },
       async (tx) => {
+        // #81: the slot is serialized first (always before a file row lock,
+        // so two attaches cannot wait on each other), the file then locked
+        // and checked, the earlier current file superseded, and only then is
+        // this one made current: the one-current index is never violated, and
+        // two overlapping attaches of a slot leave exactly one current file.
+        const [target] = await tx
+          .select({
+            recordType: files.recordType,
+            recordId: files.recordId,
+            documentType: files.documentType,
+            held: files.heldForChangeRequest,
+          })
+          .from(files)
+          .where(and(eq(files.workspaceId, input.workspaceId), eq(files.id, input.fileId)));
+        if (!target) return { status: 'lost' };
+        const slot = {
+          workspaceId: input.workspaceId,
+          recordType: target.recordType,
+          recordId: target.recordId,
+          documentType: target.documentType,
+        };
+        // A held file waits for staff: it replaces the current one only on approval.
+        if (!target.held) await lockDocumentSlot(tx, slot);
+        const [claimed] = await tx
+          .select({ id: files.id })
+          .from(files)
+          .where(
+            and(
+              eq(files.workspaceId, input.workspaceId),
+              eq(files.id, input.fileId),
+              eq(files.status, 'verifying'),
+              eq(files.candidateKey, input.candidateKey),
+            ),
+          )
+          .for('update');
+        if (!claimed) return { status: 'lost' };
+        if (!target.held) await supersedeEarlier(tx, { ...slot, id: input.fileId });
         const [attached] = await tx
           .update(files)
           .set({
@@ -526,7 +586,7 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           )
           .returning({ ...fileColumns, held: files.heldForChangeRequest });
         if (!attached) return { status: 'lost' };
-        const { held, ...attachedRow } = attached;
+        const { held: _held, ...attachedRow } = attached;
         const row = toFileRow(attachedRow);
 
         await tx.insert(fileRevisions).values({
@@ -540,8 +600,19 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           createdBy: input.actorId,
         });
 
-        // A held file waits for staff: it replaces the current one only on approval.
-        if (!held) await supersedeEarlier(tx, row);
+        // The uploader's staging copy is disposable now that the verified
+        // candidate is attached; it goes once its upload link has expired (#108).
+        if (row.stagingKey !== input.objectKey) {
+          await enqueueObjectDeletions(tx, input.workspaceId, [
+            {
+              bucket: row.bucket,
+              objectKey: row.stagingKey,
+              fileId: row.id,
+              reason: 'staging_after_attach',
+              notBefore: new Date(row.expiresAt.getTime() + STAGING_DELETE_MARGIN_MS),
+            },
+          ]);
+        }
 
         await writeAudit(tx, {
           workspaceId: input.workspaceId,
@@ -571,8 +642,35 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
               eq(files.candidateKey, input.candidateKey),
             ),
           )
-          .returning({ id: files.id });
+          .returning({
+            id: files.id,
+            bucket: files.bucket,
+            stagingKey: files.stagingKey,
+            candidateKey: files.candidateKey,
+            expiresAt: files.expiresAt,
+          });
         if (row) {
+          // A rejected upload is never retried: both copies are disposable,
+          // the staging one once its upload link has expired (#108).
+          await enqueueObjectDeletions(tx, input.workspaceId, [
+            {
+              bucket: row.bucket,
+              objectKey: row.stagingKey,
+              fileId: row.id,
+              reason: 'upload_rejected',
+              notBefore: new Date(row.expiresAt.getTime() + STAGING_DELETE_MARGIN_MS),
+            },
+            ...(row.candidateKey
+              ? [
+                  {
+                    bucket: row.bucket,
+                    objectKey: row.candidateKey,
+                    fileId: row.id,
+                    reason: 'upload_rejected' as const,
+                  },
+                ]
+              : []),
+          ]);
           await writeAudit(tx, {
             workspaceId: input.workspaceId,
             actorId: input.actorId,
@@ -672,57 +770,11 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           .where(and(eq(files.workspaceId, input.workspaceId), eq(files.id, input.fileId)))
           .limit(1);
         if (!file) return { status: 'not_found' };
-        const [review] = await tx
-          .insert(fileReviewEvents)
-          .values({
-            workspaceId: input.workspaceId,
-            fileId: input.fileId,
-            actorId: input.actorId,
-            decision: input.decision,
-            note: input.note ?? null,
-          })
-          .returning({
-            id: fileReviewEvents.id,
-            decision: fileReviewEvents.decision,
-            note: fileReviewEvents.note,
-            actorId: fileReviewEvents.actorId,
-            createdAt: fileReviewEvents.createdAt,
-          });
-        if (!review) throw new Error('review insert did not return a row');
-        if (file.recordType === 'lead') {
-          // The decision goes on the lead's timeline too; the note stays on the review.
-          const [lead] = await tx
-            .select({ id: leads.id })
-            .from(leads)
-            .where(
-              and(
-                eq(leads.workspaceId, input.workspaceId),
-                eq(leads.id, file.recordId),
-                isNull(leads.customerDataRestrictedAt),
-              ),
-            )
-            .limit(1);
-          if (lead) {
-            await tx.insert(leadActivities).values({
-              workspaceId: input.workspaceId,
-              leadId: lead.id,
-              actorId: input.actorId,
-              kind: 'document',
-              data: {
-                fileId: input.fileId,
-                documentType: file.documentType,
-                decision: input.decision,
-              },
-            });
-          }
-        }
-        await writeAudit(tx, {
-          workspaceId: input.workspaceId,
-          actorId: input.actorId,
-          requestId: input.requestId,
-          action: 'file.reviewed',
-          fileId: input.fileId,
-          after: { decision: input.decision },
+        const review = await insertFileReview(tx, {
+          ...input,
+          recordType: file.recordType,
+          recordId: file.recordId,
+          documentType: file.documentType,
         });
         return {
           status: 'recorded',
@@ -785,6 +837,8 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
           )
           .returning(fileColumns);
         if (!row) return { status: 'not_found' };
+        // Every copy goes with the file, by the cleanup sweep (#82).
+        await enqueueDeletedFile(tx, input.workspaceId, toFileRow(row));
         await writeAudit(tx, {
           workspaceId: input.workspaceId,
           actorId: input.actorId,
@@ -821,9 +875,28 @@ export class DatabaseDocumentStore implements DocumentRecordStore {
               lt(files.expiresAt, cutoff),
             ),
           )
-          .returning({ stagingKey: files.stagingKey, candidateKey: files.candidateKey });
+          .returning({
+            id: files.id,
+            bucket: files.bucket,
+            stagingKey: files.stagingKey,
+            candidateKey: files.candidateKey,
+          });
         const cleanedObjects = expired.flatMap((row) =>
           [row.stagingKey, row.candidateKey].filter((key): key is string => key !== null),
+        );
+        // Recorded in this transaction, so a failed or interrupted delete is retried (#82).
+        await enqueueObjectDeletions(
+          tx,
+          input.workspaceId,
+          expired.flatMap((row) =>
+            fileObjectKeys({ ...row, objectKey: null }).map((objectKey) => ({
+              bucket: row.bucket,
+              objectKey,
+              fileId: row.id,
+              reason: 'upload_expired' as const,
+            })),
+          ),
+          input.now,
         );
         return { expiredIntents: expired.length, cleanedObjects };
       },
@@ -840,6 +913,85 @@ export interface HeldFilesInput {
 }
 
 /**
+ * One review of a file: the review row, the lead's timeline entry (unless the
+ * customer's data is restricted) and the audit, in the caller's transaction.
+ */
+export async function insertFileReview(
+  tx: TenantTransaction,
+  input: {
+    workspaceId: string;
+    actorId: string;
+    requestId: string;
+    fileId: string;
+    recordType: string;
+    recordId: string;
+    documentType: string;
+    decision: FileReviewDecision;
+    note?: string;
+  },
+): Promise<{
+  id: string;
+  decision: string;
+  note: string | null;
+  actorId: string;
+  createdAt: Date;
+}> {
+  const [review] = await tx
+    .insert(fileReviewEvents)
+    .values({
+      workspaceId: input.workspaceId,
+      fileId: input.fileId,
+      actorId: input.actorId,
+      decision: input.decision,
+      note: input.note ?? null,
+    })
+    .returning({
+      id: fileReviewEvents.id,
+      decision: fileReviewEvents.decision,
+      note: fileReviewEvents.note,
+      actorId: fileReviewEvents.actorId,
+      createdAt: fileReviewEvents.createdAt,
+    });
+  if (!review) throw new Error('review insert did not return a row');
+  if (input.recordType === 'lead') {
+    // The decision goes on the lead's timeline too; the note stays on the review.
+    const [lead] = await tx
+      .select({ id: leads.id })
+      .from(leads)
+      .where(
+        and(
+          eq(leads.workspaceId, input.workspaceId),
+          eq(leads.id, input.recordId),
+          isNull(leads.customerDataRestrictedAt),
+        ),
+      )
+      .limit(1);
+    if (lead) {
+      await tx.insert(leadActivities).values({
+        workspaceId: input.workspaceId,
+        leadId: lead.id,
+        actorId: input.actorId,
+        kind: 'document',
+        data: {
+          fileId: input.fileId,
+          documentType: input.documentType,
+          decision: input.decision,
+        },
+      });
+    }
+  }
+  await writeAudit(tx, {
+    workspaceId: input.workspaceId,
+    actorId: input.actorId,
+    requestId: input.requestId,
+    action: 'file.reviewed',
+    fileId: input.fileId,
+    after: { decision: input.decision },
+  });
+  return review;
+}
+
+/**
  * Makes a change request's held files current (on approval): the flag is
  * cleared, the earlier current file of each type is superseded, and each is
  * audited `file.released`. In the caller's transaction, so it commits with
@@ -851,6 +1003,28 @@ export async function releaseHeldFiles(
 ): Promise<FileRow[]> {
   const released: FileRow[] = [];
   for (const fileId of input.fileIds) {
+    // #81: the earlier current file is superseded, under the slot's lock
+    // (taken before the row's), before this one stops being held and so
+    // becomes current.
+    const [held] = await tx
+      .select({
+        recordType: files.recordType,
+        recordId: files.recordId,
+        documentType: files.documentType,
+      })
+      .from(files)
+      .where(
+        and(
+          eq(files.workspaceId, input.workspaceId),
+          eq(files.id, fileId),
+          eq(files.heldForChangeRequest, true),
+          eq(files.status, 'available'),
+        ),
+      );
+    if (!held) continue;
+    const slot = { workspaceId: input.workspaceId, ...held };
+    await lockDocumentSlot(tx, slot);
+    await supersedeEarlier(tx, { ...slot, id: fileId });
     const [row] = await tx
       .update(files)
       .set({ heldForChangeRequest: false, updatedAt: new Date() })
@@ -865,7 +1039,6 @@ export async function releaseHeldFiles(
       .returning(fileColumns);
     if (!row) continue;
     const file = toFileRow(row);
-    await supersedeEarlier(tx, file);
     await writeAudit(tx, {
       workspaceId: input.workspaceId,
       actorId: input.actorId,
@@ -881,8 +1054,9 @@ export async function releaseHeldFiles(
 
 /**
  * Tombstones a change request's held files (on rejection), audited
- * `file.deleted`, in the caller's transaction; returns their object keys for
- * the caller to delete once the transaction has committed.
+ * `file.deleted`, in the caller's transaction, and records every copy for the
+ * cleanup sweep; returns their object keys for the caller to delete at once
+ * after commit (best effort; the sweep confirms).
  */
 export async function tombstoneHeldFiles(
   tx: TenantTransaction,
@@ -901,9 +1075,11 @@ export async function tombstoneHeldFiles(
           sql`${files.status} <> 'deleted'`,
         ),
       )
-      .returning({ objectKey: files.objectKey });
+      .returning(fileColumns);
     if (!row) continue;
     if (row.objectKey) objectKeys.push(row.objectKey);
+    // Every copy, staging and candidate too, by the cleanup sweep (#108).
+    await enqueueDeletedFile(tx, input.workspaceId, toFileRow(row));
     await writeAudit(tx, {
       workspaceId: input.workspaceId,
       actorId: input.actorId,
@@ -914,6 +1090,38 @@ export async function tombstoneHeldFiles(
     });
   }
   return objectKeys;
+}
+
+/**
+ * Records every storage copy of a file just tombstoned for deletion, in the
+ * caller's transaction: its staging, candidate and served objects (#82, #108).
+ */
+export async function enqueueDeletedFile(
+  tx: TenantTransaction,
+  workspaceId: string,
+  file: Pick<FileRow, 'id' | 'bucket' | 'stagingKey' | 'candidateKey' | 'objectKey'> & {
+    expiresAt?: Date;
+  },
+): Promise<void> {
+  // A staging copy still waits out its upload link, so a late PUT cannot recreate it.
+  const stagingNotBefore = file.expiresAt
+    ? new Date(file.expiresAt.getTime() + STAGING_DELETE_MARGIN_MS)
+    : undefined;
+  await enqueueObjectDeletions(
+    tx,
+    workspaceId,
+    fileObjectKeys(file).map((objectKey) => ({
+      bucket: file.bucket,
+      objectKey,
+      fileId: file.id,
+      reason: 'file_deleted' as const,
+      ...(objectKey === file.stagingKey &&
+      objectKey !== file.objectKey &&
+      stagingNotBefore !== undefined
+        ? { notBefore: stagingNotBefore }
+        : {}),
+    })),
+  );
 }
 
 async function selectFile(
@@ -929,12 +1137,37 @@ async function selectFile(
   return row ? toFileRow(row) : undefined;
 }
 
+/** One record's document type: the slot that holds at most one current file (#81). */
+export interface DocumentSlot {
+  workspaceId: string;
+  recordType: string;
+  recordId: string;
+  documentType: string;
+}
+
 /**
- * Marks any earlier available object for the same logical slot superseded by
- * `file`, so exactly one current object exists per (record, documentType). A
- * file held for a change request is not in the slot until it is released.
+ * Serializes every write that makes a file current in one slot (attach,
+ * release, import) until the transaction ends (#81). Under READ COMMITTED two
+ * overlapping attaches would each supersede only what they saw and both stay
+ * current; with the lock the second sees the first and supersedes it.
  */
-export async function supersedeEarlier(tx: TenantTransaction, file: FileRow): Promise<void> {
+export async function lockDocumentSlot(tx: TenantTransaction, slot: DocumentSlot): Promise<void> {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`document_slot:${slot.workspaceId}:${slot.recordType}:${slot.recordId}:${slot.documentType}`}, 0))`,
+  );
+}
+
+/**
+ * Marks the current file of `file`'s slot superseded by `file`, so exactly
+ * one current object exists per (record, documentType): called under the
+ * slot's lock, before `file` itself becomes current, so the one-current index
+ * (migration 0047) never sees two. A file held for a change request is not in
+ * the slot until it is released.
+ */
+export async function supersedeEarlier(
+  tx: TenantTransaction,
+  file: DocumentSlot & { id: string },
+): Promise<void> {
   await tx
     .update(files)
     .set({ supersededByFileId: file.id, updatedAt: new Date() })

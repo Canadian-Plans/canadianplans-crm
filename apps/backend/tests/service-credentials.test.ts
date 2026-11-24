@@ -5,6 +5,7 @@ import {
   createServiceCredentialResponseSchema,
   listServiceCredentialsResponseSchema,
   revokeServiceCredentialResponseSchema,
+  updateServiceCredentialResponseSchema,
 } from '@canadian-plans/contracts';
 
 import { createApp } from '../src/app.js';
@@ -12,10 +13,13 @@ import type { StaffSessionVerifier, VerifiedStaffSession } from '../src/auth/ses
 import type { StaffAccessSnapshot } from '../src/staff/authorization.js';
 import type { StaffStore } from '../src/staff/store.js';
 import type { LeadStore } from '../src/leads/store.js';
-import type {
-  CreateCredentialInput,
-  ServiceCredentialRecord,
-  WebsiteCredentialStore,
+import {
+  CredentialLeadTypesUnavailableError,
+  type CreateCredentialInput,
+  type ServiceCredentialRecord,
+  type UpdateCredentialLeadTypesInput,
+  type UpdateCredentialLeadTypesResult,
+  type WebsiteCredentialStore,
 } from '../src/website/store.js';
 import { hashServiceSecret } from '../src/website/credential.js';
 
@@ -61,11 +65,16 @@ class MemoryCredentialStore implements WebsiteCredentialStore {
   records: ServiceCredentialRecord[] = [];
   lastSecretHash?: string;
 
+  /** False while migration 0043 is not applied: no key can keep its lead types. */
+  ready = true;
+
   async createCredential(input: CreateCredentialInput): Promise<ServiceCredentialRecord> {
+    if (!this.ready) throw new CredentialLeadTypesUnavailableError();
     this.lastSecretHash = input.secretHash;
     const record: ServiceCredentialRecord = {
       id: CREDENTIAL,
       scopes: [...input.scopes],
+      leadTypes: [...input.leadTypes],
       createdAt: '2026-09-14T00:00:00.000Z',
       revokedAt: null,
     };
@@ -78,6 +87,18 @@ class MemoryCredentialStore implements WebsiteCredentialStore {
   async revokeCredential(input: { credentialId: string }) {
     if (input.credentialId !== CREDENTIAL) return { status: 'not_found' as const };
     return { status: 'revoked' as const, revokedAt: '2026-09-14T01:00:00.000Z' };
+  }
+  updates: UpdateCredentialLeadTypesInput[] = [];
+  async updateLeadTypes(
+    input: UpdateCredentialLeadTypesInput,
+  ): Promise<UpdateCredentialLeadTypesResult> {
+    if (!this.ready) throw new CredentialLeadTypesUnavailableError();
+    const record = this.records.find((entry) => entry.id === input.credentialId);
+    if (!record) return { status: 'not_found' };
+    if (record.revokedAt) return { status: 'revoked' };
+    this.updates.push(input);
+    record.leadTypes = [...input.leadTypes];
+    return { status: 'updated', credential: record };
   }
 }
 
@@ -118,6 +139,14 @@ afterEach(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
+function setLeadTypes(token: string, credentialId: string, body: unknown) {
+  return fetch(`${baseUrl}${credentialsPath}/${credentialId}`, {
+    method: 'PATCH',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 function create(token: string, body: unknown) {
   return fetch(`${baseUrl}${credentialsPath}`, {
     method: 'POST',
@@ -128,18 +157,22 @@ function create(token: string, body: unknown) {
 
 describe('service credential management', () => {
   it('issues a credential once for an owner and stores only its hash', async () => {
-    const response = await create('token', { scopes: ['leads:write', 'uploads:customer'] });
+    const response = await create('token', {
+      scopes: ['leads:write', 'uploads:customer'],
+      leadTypes: ['internet', 'mobility'],
+    });
     expect(response.status).toBe(201);
     const body = createServiceCredentialResponseSchema.parse(await response.json());
     expect(body.secret.startsWith('cpsk_')).toBe(true);
     expect(body.credential.scopes).toEqual(['leads:write', 'uploads:customer']);
+    expect(body.credential.leadTypes).toEqual(['internet', 'mobility']);
     // The persisted value is the hash of the shown secret, never the secret itself.
     expect(credentialStore.lastSecretHash).toBe(hashServiceSecret(body.secret));
   });
 
   it('refuses a role without integration management', async () => {
     store.access = { ...store.access, roles: ['viewer'] };
-    const response = await create('token', { scopes: ['leads:write'] });
+    const response = await create('token', { scopes: ['leads:write'], leadTypes: ['internet'] });
     expect(response.status).toBe(403);
     expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
       'permission_denied',
@@ -147,12 +180,60 @@ describe('service credential management', () => {
   });
 
   it('rejects an empty or unknown scope set', async () => {
-    expect((await create('token', { scopes: [] })).status).toBe(400);
-    expect((await create('token', { scopes: ['staff:everything'] })).status).toBe(400);
+    expect((await create('token', { scopes: [], leadTypes: ['internet'] })).status).toBe(400);
+    expect(
+      (await create('token', { scopes: ['staff:everything'], leadTypes: ['internet'] })).status,
+    ).toBe(400);
+  });
+
+  // Issue #84: a key says which lead types it may send.
+  it('rejects a key with no lead types, an unregistered type or a type named twice', async () => {
+    for (const leadTypes of [undefined, [], ['fax_order'], ['internet', 'internet']]) {
+      const response = await create('token', { scopes: ['leads:write'], leadTypes });
+      expect(response.status).toBe(400);
+    }
+    expect(credentialStore.records).toHaveLength(0);
+  });
+
+  it('refuses to issue a key until the database holds lead types, with a clear code', async () => {
+    credentialStore.ready = false;
+    const response = await create('token', { scopes: ['leads:write'], leadTypes: ['internet'] });
+    expect(response.status).toBe(503);
+    expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+      'credential_lead_types_unavailable',
+    );
+    expect(credentialStore.records).toHaveLength(0);
+  });
+
+  it('lists each key with its lead types, null for a key that is not limited', async () => {
+    credentialStore.records = [
+      {
+        id: CREDENTIAL,
+        scopes: ['leads:write'],
+        leadTypes: ['sim_order'],
+        createdAt: '2026-09-14T00:00:00.000Z',
+        revokedAt: null,
+      },
+      {
+        id: '90000000-0000-4000-8000-000000000998',
+        scopes: ['leads:write'],
+        leadTypes: null,
+        createdAt: '2026-09-13T00:00:00.000Z',
+        revokedAt: null,
+      },
+    ];
+    const list = await fetch(`${baseUrl}${credentialsPath}`, {
+      headers: { authorization: 'Bearer token' },
+    });
+    const body = listServiceCredentialsResponseSchema.parse(await list.json());
+    expect(body.credentials.map((credential) => credential.leadTypes)).toEqual([
+      ['sim_order'],
+      null,
+    ]);
   });
 
   it('lists and revokes credentials', async () => {
-    await create('token', { scopes: ['leads:write'] });
+    await create('token', { scopes: ['leads:write'], leadTypes: ['internet'] });
     const list = await fetch(`${baseUrl}${credentialsPath}`, {
       headers: { authorization: 'Bearer token' },
     });
@@ -176,6 +257,91 @@ describe('service credential management', () => {
     expect(response.status).toBe(404);
     expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
       'credential_not_found',
+    );
+  });
+});
+
+describe('changing the lead types of an existing key', () => {
+  const existing = (revokedAt: string | null = null): ServiceCredentialRecord => ({
+    id: CREDENTIAL,
+    scopes: ['leads:write'],
+    leadTypes: ['internet'],
+    createdAt: '2026-09-14T00:00:00.000Z',
+    revokedAt,
+  });
+
+  it('sets the lead types of a key for an owner and answers with the key', async () => {
+    credentialStore.records = [existing()];
+    const response = await setLeadTypes('token', CREDENTIAL, {
+      leadTypes: ['internet', 'sim_order'],
+    });
+    expect(response.status).toBe(200);
+    const body = updateServiceCredentialResponseSchema.parse(await response.json());
+    expect(body.credential.id).toBe(CREDENTIAL);
+    expect(body.credential.leadTypes).toEqual(['internet', 'sim_order']);
+    expect(credentialStore.updates).toEqual([
+      expect.objectContaining({
+        actorId: ACTOR,
+        workspaceId: WORKSPACE,
+        credentialId: CREDENTIAL,
+        leadTypes: ['internet', 'sim_order'],
+      }),
+    ]);
+  });
+
+  it('refuses a role without integration management, and changes nothing', async () => {
+    credentialStore.records = [existing()];
+    store.access = { ...store.access, roles: ['leads'] };
+    const response = await setLeadTypes('token', CREDENTIAL, { leadTypes: ['sim_order'] });
+    expect(response.status).toBe(403);
+    expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+      'permission_denied',
+    );
+    expect(credentialStore.updates).toHaveLength(0);
+  });
+
+  it('needs at least one registered lead type, each named once', async () => {
+    credentialStore.records = [existing()];
+    for (const leadTypes of [undefined, [], ['fax_order'], ['internet', 'internet']]) {
+      const response = await setLeadTypes('token', CREDENTIAL, { leadTypes });
+      expect(response.status).toBe(400);
+      expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+        'invalid_request',
+      );
+    }
+    expect((await setLeadTypes('token', 'not-a-uuid', { leadTypes: ['internet'] })).status).toBe(
+      400,
+    );
+    expect(credentialStore.updates).toHaveLength(0);
+  });
+
+  it('answers credential_not_found for a key that is not this site’s', async () => {
+    const response = await setLeadTypes('token', '90000000-0000-4000-8000-000000000999', {
+      leadTypes: ['internet'],
+    });
+    expect(response.status).toBe(404);
+    expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+      'credential_not_found',
+    );
+  });
+
+  it('refuses a revoked key', async () => {
+    credentialStore.records = [existing('2026-09-15T00:00:00.000Z')];
+    const response = await setLeadTypes('token', CREDENTIAL, { leadTypes: ['sim_order'] });
+    expect(response.status).toBe(409);
+    expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+      'credential_revoked',
+    );
+    expect(credentialStore.records[0]?.leadTypes).toEqual(['internet']);
+  });
+
+  it('answers 503 until the database holds lead types', async () => {
+    credentialStore.records = [existing()];
+    credentialStore.ready = false;
+    const response = await setLeadTypes('token', CREDENTIAL, { leadTypes: ['sim_order'] });
+    expect(response.status).toBe(503);
+    expect(apiErrorResponseSchema.parse(await response.json()).error.code).toBe(
+      'credential_lead_types_unavailable',
     );
   });
 });
