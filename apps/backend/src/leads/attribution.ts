@@ -54,6 +54,10 @@ const LANDING_ROUTE_TEMPLATES: readonly RegExp[] = [
   /^\/$/,
   /^\/(?:order|plans|privacy|terms|track|mobility|plan)$/,
   /^\/plans\/[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/,
+  // Canadian Plans storefront pages a campaign link can land on (its
+  // INDEXABLE_PATHS and guides), each optionally one slug deep.
+  /^\/(?:about|contact|faq|accessibility|mobile-plans)$/,
+  /^\/(?:guides|home-internet|pre-arrival-sim)(?:\/[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?)?$/,
 ];
 
 function boundedString(value: unknown, maxLength: number): string | undefined {

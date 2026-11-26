@@ -88,6 +88,22 @@ describe('sanitizeAttribution', () => {
     });
   });
 
+  it('keeps the storefront pages a campaign link can land on', () => {
+    for (const landingPath of [
+      '/about',
+      '/faq',
+      '/mobile-plans',
+      '/guides',
+      '/guides/rogers-vs-fido-vs-chatr-for-newcomers',
+      '/home-internet/british-columbia',
+      '/pre-arrival-sim/students',
+    ]) {
+      expect(sanitizeAttribution({ landingPath })).toEqual({ landingPath });
+    }
+    expect(sanitizeAttribution({ landingPath: '/guides/a/b' })).toEqual({});
+    expect(sanitizeAttribution({ landingPath: '/guides/Not_A_Slug' })).toEqual({});
+  });
+
   it('strips a query string, fragment and any token from the landing path before storing it', () => {
     expect(sanitizeAttribution({ landingPath: '/plans?utm_source=x&token=secret' })).toEqual({
       landingPath: '/plans',
